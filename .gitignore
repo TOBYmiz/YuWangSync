@@ -1,0 +1,27 @@
+# === 测试用文件===
+**/appsettings.json
+**/cookies.json
+**/state.json
+**/logs/
+*.log
+*.db
+*.sqlite
+*.sqlite3
+*.html
+_backup/
+_buildtmp/
+
+# === 构建产物 ===
+bin/
+obj/
+
+# === IDE ===
+.vscode/
+.idea/
+*.swp
+*~
+
+# === OS ===
+Thumbs.db
+.DS_Store
+desktop.ini

@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="..\..\src\YuWangCloudSync\Updates\GitHubReleaseClient.cs" Link="GitHubReleaseClient.cs" />
+    <Compile Include="..\..\src\YuWangCloudSync\Updates\UpdateSchedule.cs" Link="UpdateSchedule.cs" />
+    <Compile Include="..\..\src\YuWangCloudSync\Updates\UpdateStateStore.cs" Link="UpdateStateStore.cs" />
+  </ItemGroup>
+</Project>

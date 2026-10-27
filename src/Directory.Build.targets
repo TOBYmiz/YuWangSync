@@ -1,0 +1,49 @@
+<Project>
+  <Target Name="GenerateProductIdentityConstants"
+          BeforeTargets="CoreCompile"
+          Condition="'$(MSBuildProjectName)' == 'YuWangCloudSync.Core'">
+    <ItemGroup>
+      <_ProductIdentitySourceLine Include="namespace YuWangCloudSync.Core%3B" />
+      <_ProductIdentitySourceLine Include="public static class ProductIdentity" />
+      <_ProductIdentitySourceLine Include="{" />
+      <_ProductIdentitySourceLine Include="    public const string DisplayNameZh = &quot;$(ProductDisplayNameZh)&quot;%3B" />
+      <_ProductIdentitySourceLine Include="    public const string DisplayNameEn = &quot;$(ProductDisplayNameEn)&quot;%3B" />
+      <_ProductIdentitySourceLine Include="    public const string Identifier = &quot;$(ProductIdentifier)&quot;%3B" />
+      <_ProductIdentitySourceLine Include="    public const string SyncRootDefaultName = &quot;$(SyncRootDefaultName)&quot;%3B" />
+      <_ProductIdentitySourceLine Include="    public const string ExecutableFileName = Identifier + &quot;.exe&quot;%3B" />
+      <_ProductIdentitySourceLine Include="    public const string UserDataDirectoryName = Identifier%3B" />
+      <_ProductIdentitySourceLine Include="    public const string SingleInstanceMutexName = @&quot;Local\&quot; + Identifier + &quot;_SingleInstance&quot;%3B" />
+      <_ProductIdentitySourceLine Include="    public const string ShutdownPipePrefix = Identifier + &quot;.Stop.&quot;%3B" />
+      <_ProductIdentitySourceLine Include="    public const string SyncRootRegistrationPrefix = Identifier + &quot;!&quot;%3B" />
+      <_ProductIdentitySourceLine Include="    public const string ShutdownWindowClassName = Identifier + &quot;ShutdownWnd&quot;%3B" />
+      <_ProductIdentitySourceLine Include="}" />
+    </ItemGroup>
+    <MakeDir Directories="$(IntermediateOutputPath)" />
+    <WriteLinesToFile File="$(IntermediateOutputPath)ProductIdentity.g.cs"
+                      Lines="@(_ProductIdentitySourceLine)"
+                      Overwrite="true" />
+    <ItemGroup>
+      <Compile Include="$(IntermediateOutputPath)ProductIdentity.g.cs" />
+    </ItemGroup>
+  </Target>
+
+  <Target Name="RemoveUnusedWinFormsBuildAssemblies" AfterTargets="Build"
+          Condition="'$(OS)' == 'Windows_NT'">
+    <ItemGroup>
+      <_UnusedWinFormsBuildAssembly Include="$(TargetDir)Microsoft.VisualBasic.Forms.dll;$(TargetDir)System.Drawing.Design.dll;$(TargetDir)System.Windows.Forms.Design.dll;$(TargetDir)System.Windows.Forms.Design.Editors.dll;$(TargetDir)System.Windows.Forms.Primitives.dll;$(TargetDir)System.Windows.Forms.dll;$(TargetDir)WindowsFormsIntegration.dll" />
+      <_UnusedWinFormsBuildAssembly Include="$(TargetDir)zh-Hans\Microsoft.VisualBasic.Forms.resources.dll;$(TargetDir)zh-Hans\System.Windows.Forms.Design.resources.dll;$(TargetDir)zh-Hans\System.Windows.Forms.Design.Editors.resources.dll;$(TargetDir)zh-Hans\System.Windows.Forms.Primitives.resources.dll;$(TargetDir)zh-Hans\System.Windows.Forms.resources.dll;$(TargetDir)zh-Hans\WindowsFormsIntegration.resources.dll" />
+    </ItemGroup>
+    <Delete Files="@(_UnusedWinFormsBuildAssembly)" />
+  </Target>
+
+  <Target Name="RemoveUnusedWinFormsPublishAssemblies" AfterTargets="ComputeResolvedFilesToPublishList"
+          Condition="'$(OS)' == 'Windows_NT'">
+    <ItemGroup>
+      <_UnusedWinFormsPublishAssembly Include="@(ResolvedFileToPublish)"
+                                      Condition="'%(Filename)%(Extension)' == 'Microsoft.VisualBasic.Forms.dll' or '%(Filename)%(Extension)' == 'System.Drawing.Design.dll' or '%(Filename)%(Extension)' == 'System.Windows.Forms.Design.dll' or '%(Filename)%(Extension)' == 'System.Windows.Forms.Design.Editors.dll' or '%(Filename)%(Extension)' == 'System.Windows.Forms.Primitives.dll' or '%(Filename)%(Extension)' == 'System.Windows.Forms.dll' or '%(Filename)%(Extension)' == 'WindowsFormsIntegration.dll'" />
+      <_UnusedWinFormsPublishSatellite Include="@(ResolvedFileToPublish)"
+                                       Condition="'%(Filename)%(Extension)' == 'Microsoft.VisualBasic.Forms.resources.dll' or '%(Filename)%(Extension)' == 'System.Windows.Forms.Design.resources.dll' or '%(Filename)%(Extension)' == 'System.Windows.Forms.Design.Editors.resources.dll' or '%(Filename)%(Extension)' == 'System.Windows.Forms.Primitives.resources.dll' or '%(Filename)%(Extension)' == 'System.Windows.Forms.resources.dll' or '%(Filename)%(Extension)' == 'WindowsFormsIntegration.resources.dll'" />
+      <ResolvedFileToPublish Remove="@(_UnusedWinFormsPublishAssembly);@(_UnusedWinFormsPublishSatellite)" />
+    </ItemGroup>
+  </Target>
+</Project>

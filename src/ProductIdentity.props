@@ -1,0 +1,9 @@
+<Project>
+  <PropertyGroup>
+    <!-- Keep localized display names separate from the stable machine identifier. -->
+    <ProductDisplayNameZh>育网云同步</ProductDisplayNameZh>
+    <ProductDisplayNameEn>YuWangCloudSync</ProductDisplayNameEn>
+    <ProductIdentifier>YuWangCloudSync</ProductIdentifier>
+    <SyncRootDefaultName>YuWang</SyncRootDefaultName>
+  </PropertyGroup>
+</Project>

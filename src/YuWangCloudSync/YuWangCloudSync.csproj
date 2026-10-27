@@ -1,0 +1,137 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <!-- 19041 = Win10 2004，满足 Cloud Files API 和 WinUI 3 的目标平台要求。
+         双模收口：OutputType 改为 WinExe（默认无控制台窗口）。
+           - 默认 GUI：无控制台，日志仅写文件，验证码走 WinUI 弹窗；
+           - console 模式：显式 AllocConsole 重新启用调试控制台（控制台日志 + 控制台读验证码）；
+           - 无头 quiet 模式：无 UI、无控制台，仅写文件日志，无会话直接退出。 -->
+    <TargetFramework>net10.0-windows10.0.19041.0</TargetFramework>
+    <!-- unpackaged：免 MSIX 打包。 -->
+    <WindowsPackageType>None</WindowsPackageType>
+    <UseWinUI>true</UseWinUI>
+    <!-- WinUI's unpackaged ms-appx resource lookup expects the root application index as resources.pri. -->
+    <EnableMsixTooling>true</EnableMsixTooling>
+    <ProjectPriFileName>resources.pri</ProjectPriFileName>
+    <!-- Program owns the app entry point so the existing engine can retain its class name. -->
+    <DefineConstants>$(DefineConstants);DISABLE_XAML_GENERATED_MAIN</DefineConstants>
+    <!-- .NET 仍使用 framework-dependent；Windows App Runtime 随应用本地部署。 -->
+    <WindowsAppSDKSelfContained>true</WindowsAppSDKSelfContained>
+    <!-- RuntimeIdentifier=win-x64 已锁定 x64 目标（输出在 .../win-x64/ 下）。
+         不再设置 <Platforms>、也不在构建命令里传 -p:Platform=x64，否则会多生成一层 bin/x64/ 段，
+         与默认 dotnet build 的 bin/{Config}/ 布局并存，造成多版本混乱。统一用 `dotnet build -c Release`。 -->
+    <PlatformTarget>x64</PlatformTarget>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <SelfContained>false</SelfContained>
+    <RootNamespace>$(ProductIdentifier)</RootNamespace>
+    <AssemblyName>$(ProductIdentifier)</AssemblyName>
+    <!-- 发布只保留中文卫星资源，避免复制其他语言目录。 -->
+    <SatelliteResourceLanguages>zh-Hans</SatelliteResourceLanguages>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <!-- 主程序（exe）内嵌与托盘相同的多帧 ICO：文件管理器/任务管理器/控制台窗口标题栏
+         均显示该图标，与托盘视觉一致。路径相对本 csproj。 -->
+    <ApplicationIcon>Assets\yw_tray.ico</ApplicationIcon>
+    <Company>$(ProductDisplayNameEn)</Company>
+    <Product>$(ProductDisplayNameZh)</Product>
+    <Description>$(ProductDisplayNameZh) Cloud Files API 同步引擎（路径 E 实现）</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\YuWangCloudSync.Core\YuWangCloudSync.Core.csproj" />
+    <Compile Remove="CloudFiles\SyncRootProbe.cs;Models\FileIdentity.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.WindowsAppSDK" Version="2.5.1" />
+    <!-- Cloud Files API 绑定（按 cldapi.dll 命名，最新稳定版 5.0.7）-->
+    <PackageReference Include="Vanara.PInvoke.CldApi" Version="5.0.7" />
+    <!-- SQLite 元数据缓存 -->
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="8.0.8" />
+    <!-- 日志 -->
+    <PackageReference Include="Serilog" Version="4.0.1" />
+    <PackageReference Include="Serilog.Sinks.Console" Version="6.0.0" />
+    <PackageReference Include="Serilog.Sinks.File" Version="6.0.0" />
+    <!-- 原生 Win32 托盘和 PopupMenu，继续与 WinUI STA 消息泵共用线程。 -->
+    <PackageReference Include="H.NotifyIcon" Version="2.3.2" />
+    <!-- 本程序只使用原生托盘和 PopupMenu，不使用 H.NotifyIcon 的图标生成 API。
+         该传递包会带入 System.Drawing.Common；完全排除其传递资产，避免引入未使用的依赖。 -->
+    <PackageReference Include="H.GeneratedIcons.System.Drawing" Version="2.3.2"
+                      ExcludeAssets="all" PrivateAssets="all" />
+  </ItemGroup>
+  <!-- TestRsa（RSA 加密验证用的临时子项目）已删除：结论已并入 Crypto/，无需保留 -->
+
+  <ItemGroup>
+    <!-- 配置文件复制到输出目录 -->
+    <None Update="appsettings.json">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>Never</CopyToPublishDirectory>
+    </None>
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- 托盘图标：多帧 ICO（16/20/24/32/48/64/128/256），Shell_NotifyIcon 按 DPI 取帧 -->
+    <Content Include="Assets\yw_tray.ico">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <Content Include="Assets\yw_tray_update.ico">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <!-- The 256 px image is the displayable raster rendition of the application ICO for WinUI. -->
+    <Content Include="Assets\yw_tray_256.png">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+  </ItemGroup>
+
+  <!-- Only language subdirectories contain satellite assemblies. Native Windows App SDK
+       implementations such as Microsoft.Windows.ApplicationModel.Resources.dll live at
+       the root and also match *.resources.dll on Windows; never delete those. -->
+  <Target Name="PruneBuildSatelliteResources" AfterTargets="Build"
+          Condition="'$(OS)' == 'Windows_NT'">
+    <ItemGroup>
+      <_BuildSatelliteCandidate Include="$(TargetDir)**\*.resources.dll" />
+      <_UnselectedBuildSatellite Include="@(_BuildSatelliteCandidate)"
+                                 Condition="'%(_BuildSatelliteCandidate.RecursiveDir)' != '' and '%(_BuildSatelliteCandidate.RecursiveDir)' != 'zh-Hans\'" />
+    </ItemGroup>
+    <Delete Files="@(_UnselectedBuildSatellite)" />
+    <Error Condition="'$(WindowsAppSDKSelfContained)' == 'true' and !Exists('$(TargetDir)Microsoft.Windows.ApplicationModel.Resources.dll')"
+           Text="MRT Core native implementation is missing: Microsoft.Windows.ApplicationModel.Resources.dll. WinUI cannot resolve theme resources." />
+  </Target>
+
+  <!-- Unpackaged WinUI publish omits compiled XAML and its project PRI by default. -->
+  <Target Name="CopyUnpackagedWinUiResourcesToPublish" AfterTargets="Publish"
+          Condition="'$(UseWinUI)' == 'true' and '$(WindowsPackageType)' == 'None' and '$(PublishDir)' != ''">
+    <ItemGroup>
+      <_WinUiCompiledXaml Include="$(XamlGeneratedOutputPath)*.xbf" />
+      <_WinUiProjectPri Include="$(ProjectPriFullPath)"
+                        Condition="'$(ProjectPriFullPath)' != '' and Exists('$(ProjectPriFullPath)')" />
+    </ItemGroup>
+    <Error Condition="'@(_WinUiCompiledXaml)' == ''"
+           Text="WinUI XBF output is missing; unpackaged publish cannot load compiled XAML resources." />
+    <Error Condition="'@(_WinUiProjectPri)' == ''"
+           Text="WinUI project PRI output is missing; unpackaged publish cannot resolve ms-appx resources." />
+    <Copy SourceFiles="@(_WinUiCompiledXaml)"
+          DestinationFiles="@(_WinUiCompiledXaml->'$(PublishDir)%(Filename)%(Extension)')" />
+    <Copy SourceFiles="@(_WinUiProjectPri)"
+          DestinationFiles="@(_WinUiProjectPri->'$(PublishDir)%(Filename)%(Extension)')"
+          SkipUnchangedFiles="true" />
+    <Error Condition="!Exists('$(PublishDir)$(ProjectPriFileName)')"
+           Text="Published unpackaged WinUI resource index is missing: $(ProjectPriFileName)" />
+  </Target>
+
+  <Target Name="PrunePublishSatelliteResources" AfterTargets="Publish"
+          Condition="'$(OS)' == 'Windows_NT'">
+    <ItemGroup>
+      <_PublishSatelliteCandidate Include="$(PublishDir)**\*.resources.dll" />
+      <_UnselectedPublishSatellite Include="@(_PublishSatelliteCandidate)"
+                                   Condition="'%(_PublishSatelliteCandidate.RecursiveDir)' != '' and '%(_PublishSatelliteCandidate.RecursiveDir)' != 'zh-Hans\'" />
+    </ItemGroup>
+    <Delete Files="@(_UnselectedPublishSatellite)" />
+    <Error Condition="'$(WindowsAppSDKSelfContained)' == 'true' and !Exists('$(PublishDir)Microsoft.Windows.ApplicationModel.Resources.dll')"
+           Text="Published MRT Core native implementation is missing: Microsoft.Windows.ApplicationModel.Resources.dll. WinUI cannot resolve theme resources." />
+  </Target>
+
+</Project>

@@ -1,0 +1,12 @@
+<Project>
+  <PropertyGroup>
+    <!-- Shared release version for managed/native components and installer metadata. -->
+    <ProductVersion>1.0.0.0</ProductVersion>
+    <ProductVersionResource>$([System.String]::Copy('$(ProductVersion)').Replace('.', ','))</ProductVersionResource>
+    <Version>$(ProductVersion)</Version>
+    <AssemblyVersion>$(ProductVersion)</AssemblyVersion>
+    <FileVersion>$(ProductVersion)</FileVersion>
+    <InformationalVersion>$(ProductVersion)</InformationalVersion>
+  </PropertyGroup>
+  <Import Project="$(MSBuildThisFileDirectory)ProductIdentity.props" />
+</Project>
