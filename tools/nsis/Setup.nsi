@@ -1454,6 +1454,102 @@ remove_legacy_file_list:
 remove_legacy_artifacts_done:
 FunctionEnd
 
+Function RefreshDesktopShortcutIcons
+  Push $0
+  Push $1
+  Push $2
+  Push $3
+  Push $4
+  Push $5
+  Push $6
+  Push $7
+  Push $8
+  Push $9
+
+  StrCpy $2 0
+  StrCpy $3 0
+  !insertmacro ComHlpr_CreateInProcInstance ${CLSID_ShellLink} ${IID_IShellLink} r2 .r4
+  ${If} $4 == 0
+  ${AndIf} $2 P<> 0
+    ${IUnknown::QueryInterface} $2 '("${IID_IPersistFile}",.r3).r4'
+    ${If} $4 == 0
+    ${AndIf} $3 P<> 0
+      GetFullPathName $7 "$INSTDIR\${PRODUCT_IDENTIFIER}.exe"
+      System::Call 'shell32::SHChangeNotify(i 0x00002000, i 0x0005, w "$7", p 0)'
+      ClearErrors
+      FindFirst $0 $1 "$DESKTOP\*.lnk"
+      IfErrors refresh_shortcuts_done
+      ${Do}
+        ${IPersistFile::Load} $3 '("$DESKTOP\$1",${STGM_READ}).r4'
+        ${If} $4 == 0
+          StrCpy $5 ""
+          ${IShellLink::GetPath} $2 '(.r5,${NSIS_MAX_STRLEN},0,0).r4'
+          ${If} $4 == 0
+            ExpandEnvStrings $5 $5
+            ClearErrors
+            GetFullPathName $5 "$5"
+            ${IfNot} ${Errors}
+            ${AndIf} $5 == $7
+              StrCpy $6 ""
+              StrCpy $8 0
+              ${IShellLink::GetIconLocation} $2 '(.r6,${NSIS_MAX_STRLEN},.r8).r4'
+              ${If} $4 == 0
+                StrCmp $6 "" refresh_shortcut_use_app_icon
+                StrCpy $9 $6
+                ExpandEnvStrings $9 $9
+                ClearErrors
+                GetFullPathName $9 "$9"
+                ${IfNot} ${Errors}
+                ${AndIf} $9 == $7
+                  StrCpy $6 "$7"
+                  StrCpy $8 0
+                  Goto refresh_shortcut_set_icon
+                ${EndIf}
+                IfFileExists "$9" refresh_shortcut_set_icon refresh_shortcut_use_app_icon
+              ${Else}
+                Goto refresh_shortcut_use_app_icon
+              ${EndIf}
+
+refresh_shortcut_use_app_icon:
+              StrCpy $6 "$7"
+              StrCpy $8 0
+refresh_shortcut_set_icon:
+              ${IShellLink::SetIconLocation} $2 '("$6",$8).r4'
+              ${If} $4 == 0
+                ${IPersistFile::Save} $3 '("$DESKTOP\$1",1).r4'
+                ${If} $4 == 0
+                  System::Call 'shell32::SHChangeNotify(i 0x00002000, i 0x0005, w "$DESKTOP\$1", p 0)'
+                ${Else}
+                  DetailPrint "刷新桌面快捷方式失败：$DESKTOP\$1"
+                ${EndIf}
+              ${Else}
+                DetailPrint "设置桌面快捷方式图标失败：$DESKTOP\$1"
+              ${EndIf}
+            ${EndIf}
+          ${EndIf}
+        ${EndIf}
+        ClearErrors
+        FindNext $0 $1
+      ${LoopUntil} ${Errors}
+      FindClose $0
+    ${EndIf}
+  ${EndIf}
+refresh_shortcuts_done:
+  !insertmacro ComHlpr_SafeRelease $3
+  !insertmacro ComHlpr_SafeRelease $2
+
+  Pop $9
+  Pop $8
+  Pop $7
+  Pop $6
+  Pop $5
+  Pop $4
+  Pop $3
+  Pop $2
+  Pop $1
+  Pop $0
+FunctionEnd
+
 Section "Install"
   InitPluginsDir
   SetOutPath "$PLUGINSDIR"
@@ -1569,6 +1665,7 @@ install_shell_file_done:
   ${AndIf} $CreateDesktopShortcut == "1"
     CreateShortCut "$DESKTOP\${PRODUCT_NAME_ZH}.lnk" "$INSTDIR\${PRODUCT_IDENTIFIER}.exe" "-open-folder" "$INSTDIR\${PRODUCT_IDENTIFIER}.exe" 0 SW_SHOWNORMAL "" "启动${PRODUCT_NAME_ZH}并打开同步目录"
   ${EndIf}
+  Call RefreshDesktopShortcutIcons
 
   SetRegView 64
   WriteRegStr HKLM "${UNINSTALL_KEY}" "DisplayName" "${PRODUCT_NAME_ZH}"

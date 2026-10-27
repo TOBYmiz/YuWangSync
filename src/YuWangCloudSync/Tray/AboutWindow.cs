@@ -32,11 +32,7 @@ internal sealed class AboutWindow : Window
 
     private readonly Grid _root;
     private readonly Button _updateButton;
-    private readonly UpdateButtonVisual _updateVisual;
     private readonly TextBlock _updateLabel;
-    private readonly ProgressRing _updateProgress;
-    private readonly TextBlock _updatePercent;
-    private UpdateActivity _displayedActivity = UpdateActivity.Idle;
     private UpdateActivity _dialogDisplayedActivity = UpdateActivity.Idle;
     private ContentDialog? _releaseDialog;
     private Button? _releaseDialogUpdateButton;
@@ -79,13 +75,15 @@ internal sealed class AboutWindow : Window
             Spacing = 12,
             HorizontalAlignment = HorizontalAlignment.Right,
         };
-        _updateVisual = CreateUpdateButtonVisual("检查更新");
-        _updateLabel = _updateVisual.Label;
-        _updateProgress = _updateVisual.Progress;
-        _updatePercent = _updateVisual.Percent;
+        _updateLabel = new TextBlock
+        {
+            Text = "检查更新",
+            HorizontalAlignment = HorizontalAlignment.Center,
+            VerticalAlignment = VerticalAlignment.Center,
+        };
         _updateButton = new Button
         {
-            Content = _updateVisual.Content,
+            Content = _updateLabel,
             Style = (Style)Application.Current.Resources["DefaultButtonStyle"],
             MinWidth = 88,
             HorizontalAlignment = HorizontalAlignment.Right,
@@ -329,12 +327,16 @@ internal sealed class AboutWindow : Window
         var current = UpdateService.CurrentState;
         if (current.IsAvailable)
         {
-            await UpdateService.DownloadAndLaunchAsync(Program.ApplicationCancellationToken);
+            await ShowAvailableReleaseDialogAsync(current, force: true);
         }
         else
         {
             var outcome = await UpdateService.CheckNowAsync(Program.ApplicationCancellationToken);
-            if (!_isClosed && outcome == UpdateCheckOutcome.NoUpdate)
+            if (!_isClosed && outcome == UpdateCheckOutcome.UpdateAvailable)
+            {
+                await ShowAvailableReleaseDialogAsync(UpdateService.CurrentState, force: true);
+            }
+            else if (!_isClosed && outcome == UpdateCheckOutcome.NoUpdate)
             {
                 await ShowUpdateMessageAsync("检查更新", "已是最新版本");
             }
@@ -381,28 +383,19 @@ internal sealed class AboutWindow : Window
         _updateLabel.Text = state.Activity switch
         {
             UpdateActivity.Checking => "检查中…",
+            UpdateActivity.Connecting => "连接中…",
+            UpdateActivity.Downloading => "下载中…",
             UpdateActivity.Launching => "启动中…",
             _ => state.IsAvailable ? "更新" : "检查更新",
         };
-        _updatePercent.Text = state.DownloadPercent.ToString(System.Globalization.CultureInfo.InvariantCulture) + "%";
         AutomationProperties.SetName(_updateButton, state.Activity switch
         {
             UpdateActivity.Checking => "正在检查更新",
             UpdateActivity.Connecting => "正在连接更新服务器",
-            UpdateActivity.Downloading => "正在下载更新 " + _updatePercent.Text,
+            UpdateActivity.Downloading => "正在下载更新",
             UpdateActivity.Launching => "正在启动更新安装器",
             _ => state.IsAvailable ? "更新到 " + (state.Release?.TagName ?? "最新版本") : "检查更新",
         });
-
-        if (_displayedActivity != state.Activity)
-        {
-            _displayedActivity = state.Activity;
-            var isChecking = state.Activity is UpdateActivity.Checking or UpdateActivity.Connecting;
-            _updateProgress.IsActive = isChecking;
-            AnimateOpacity(_updateLabel, state.Activity is UpdateActivity.Idle or UpdateActivity.Launching ? 1 : 0);
-            AnimateOpacity(_updateProgress, isChecking ? 1 : 0);
-            AnimateOpacity(_updatePercent, state.Activity == UpdateActivity.Downloading ? 1 : 0);
-        }
 
         if (state.ErrorMessage is null)
         {
@@ -417,11 +410,11 @@ internal sealed class AboutWindow : Window
         _ = ShowUpdateMessageAsync(title, state.ErrorMessage);
     }
 
-    private async Task ShowAvailableReleaseDialogAsync(UpdateUiState state)
+    private async Task ShowAvailableReleaseDialogAsync(UpdateUiState state, bool force = false)
     {
         if (_isClosed || !_isAboutVisible || !state.IsAvailable || state.Release is null
             || _releaseDialog is not null
-            || string.Equals(_promptedReleaseTag, state.Release.TagName, StringComparison.Ordinal))
+            || (!force && string.Equals(_promptedReleaseTag, state.Release.TagName, StringComparison.Ordinal)))
             return;
 
         var release = state.Release;
@@ -454,7 +447,7 @@ internal sealed class AboutWindow : Window
 
         var dialog = new ContentDialog
         {
-            Title = "更新",
+            Title = "发现新版本",
             Content = content,
             PrimaryButtonText = "更新",
             PrimaryButtonStyle = (Style)Application.Current.Resources["AccentButtonStyle"],
