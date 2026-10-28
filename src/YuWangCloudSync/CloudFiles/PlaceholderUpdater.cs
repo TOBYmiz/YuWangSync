@@ -167,8 +167,11 @@ public static class PlaceholderUpdater
             var metadata = new CF_FS_METADATA { FileSize = realSize };
             // UpdateUsn 是 ref：入参 0 表示不做 USN 校验，出参接收更新后的 USN
             long usn = 0;
+            var flags = CF_UPDATE_FLAGS.CF_UPDATE_FLAG_MARK_IN_SYNC;
+            if (realSize == 0)
+                flags |= CF_UPDATE_FLAGS.CF_UPDATE_FLAG_PASSTHROUGH_FS_METADATA;
             var hr = CfUpdatePlaceholder(new HFILE(h), in metadata, IntPtr.Zero, 0,
-                null, 0, CF_UPDATE_FLAGS.CF_UPDATE_FLAG_MARK_IN_SYNC, ref usn, IntPtr.Zero);
+                null, 0, flags, ref usn, IntPtr.Zero);
             if (hr.Failed)
             {
                 log?.Invoke($"[SIZE] CfUpdatePlaceholder 失败: {hr} path={localPath} newSize={realSize}");

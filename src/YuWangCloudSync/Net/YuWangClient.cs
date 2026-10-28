@@ -582,7 +582,8 @@ public sealed class YuWangClient : IDisposable
     /// 探测成本：2 个轻量请求（PicPlayer 页面 ~5KB + HEAD 无 body），局域网 &lt;100ms。
     /// 失败（页面无 hash / 直链 404 / 无 Content-Length）返回 null，调用方降级用声明值+余量。
     /// </summary>
-    public async Task<(long Size, string DirectUrl)?> ProbeRealSizeAsync(ulong fileId, string fileName)
+    public async Task<(long Size, string DirectUrl, bool IsContentless)?> ProbeRealSizeAsync(
+        ulong fileId, string fileName, long? declaredSize = null)
     {
         // 1. PicPlayer 页面提取 sketch hash（对视频/音频/文档/任意文件均可用）
         using var req = MakeRequest(HttpMethod.Get, $"/fmsPicPlayerAction.jsx?id={fileId}");
@@ -601,10 +602,17 @@ public sealed class YuWangClient : IDisposable
         // 3. HEAD 直链拿精确 Content-Length（直链为静态资源，无需 Cookie）
         using var head = new HttpRequestMessage(HttpMethod.Head, directUrl);
         using var hresp = await SendAsync(head, _requestTimeout).ConfigureAwait(false);
+        // Some server entries retain metadata/name after the uploaded object has disappeared.
+        // A 404 is treated as an empty file only when the directory listing also declared 0 B;
+        // otherwise it remains a normal probe failure.
+        if (hresp.StatusCode == HttpStatusCode.NotFound && declaredSize == 0)
+            return (0, directUrl, true);
         if (!hresp.IsSuccessStatusCode) return null;
         var len = hresp.Content.Headers.ContentLength;
-        if (len is null || len.Value <= 0) return null;
-        return (len.Value, directUrl);
+        if (len is null) return null;
+        if (len.Value == 0)
+            return declaredSize == 0 ? (0, directUrl, true) : null;
+        return (len.Value, directUrl, false);
     }
 
     // ================= 直链 Range 分片下载（水化主路径）=================

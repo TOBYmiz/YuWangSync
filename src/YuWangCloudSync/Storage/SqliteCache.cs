@@ -182,10 +182,19 @@ public sealed class SqliteCache : IDisposable
         lock (_sync)
         {
             using var cmd = _conn.CreateCommand();
-            cmd.CommandText = "SELECT real_size FROM files WHERE file_id=@fid";
+            cmd.CommandText = """
+                SELECT real_size, probed_upload_time, upload_time
+                FROM files WHERE file_id=@fid
+                """;
             cmd.Parameters.AddWithValue("@fid", (long)fileId);
-            var r = cmd.ExecuteScalar();
-            return r is long v && v > 0 ? v : null;
+            using var r = cmd.ExecuteReader();
+            if (!r.Read() || r.IsDBNull(0)) return null;
+            var size = r.GetInt64(0);
+            if (size > 0) return size;
+            if (size == 0 && !r.IsDBNull(1)
+                && string.Equals(r.GetString(1), r.IsDBNull(2) ? "" : r.GetString(2), StringComparison.Ordinal))
+                return 0;
+            return null;
         }
     }
 
@@ -203,9 +212,11 @@ public sealed class SqliteCache : IDisposable
             cmd.Parameters.AddWithValue("@fid", (long)fileId);
             using var r = cmd.ExecuteReader();
             if (!r.Read()) return true;                    // 还没入库 → 探测
-            if (r.IsDBNull(0) || r.GetInt64(0) <= 0) return true;   // 大小未知 → 探测
+            if (r.IsDBNull(0)) return true;                // 大小未知 → 探测
             var probed = r.IsDBNull(1) ? null : r.GetString(1);
-            return probed != uploadTime;                   // 文件被替换过 → 重新探测
+            if (!string.Equals(probed, uploadTime, StringComparison.Ordinal))
+                return true;                               // 文件被替换过 → 重新探测
+            return r.GetInt64(0) < 0;                      // 0 + 同版探测时间表示已确认没有内容对象
         }
     }
 
@@ -213,18 +224,28 @@ public sealed class SqliteCache : IDisposable
     /// 取文件下载所需信息：静态直链 + 文件名（缺一不可时返回 null）。
     /// 直链用于 Range 分片按需下载；文件名用于首次探测时拼直链扩展名。
     /// </summary>
-    public (string? DirectUrl, string? Name) GetFileDownloadInfo(ulong fileId)
+    public (string? DirectUrl, string? Name, long? DeclaredSize, string? UploadTime, bool IsContentless)
+        GetFileDownloadInfo(ulong fileId)
     {
         lock (_sync)
         {
             using var cmd = _conn.CreateCommand();
-            cmd.CommandText = "SELECT direct_url, name FROM files WHERE file_id=@fid";
+            cmd.CommandText = """
+                SELECT direct_url, name, size, real_size, probed_upload_time, upload_time
+                FROM files WHERE file_id=@fid
+                """;
             cmd.Parameters.AddWithValue("@fid", (long)fileId);
             using var r = cmd.ExecuteReader();
-            if (!r.Read()) return (null, null);
+            if (!r.Read()) return (null, null, null, null, false);
             var url = r.IsDBNull(0) ? null : r.GetString(0);
             var name = r.IsDBNull(1) ? null : r.GetString(1);
-            return (string.IsNullOrEmpty(url) ? null : url, name);
+            var declaredSize = r.IsDBNull(2) ? (long?)null : r.GetInt64(2);
+            var realSize = r.IsDBNull(3) ? (long?)null : r.GetInt64(3);
+            var probedUploadTime = r.IsDBNull(4) ? null : r.GetString(4);
+            var uploadTime = r.IsDBNull(5) ? null : r.GetString(5);
+            var isContentless = realSize == 0 && probedUploadTime is not null
+                && string.Equals(probedUploadTime, uploadTime ?? "", StringComparison.Ordinal);
+            return (string.IsNullOrEmpty(url) ? null : url, name, declaredSize, uploadTime, isContentless);
         }
     }
 
@@ -620,7 +641,17 @@ public sealed class SqliteCache : IDisposable
         {
             // 已知真实大小就直接用；否则用列表页的声明值 **+1MB 余量**
             // （声明值是向下取整到整 MB 的，偏小会导致占位把文件截断）
-            cmd.CommandText = "SELECT file_id, name, COALESCE(real_size, size + MAX(@pad, size / @div)), upload_time FROM files WHERE disk_id=@disk AND folder_id=@pf";
+            cmd.CommandText = """
+                SELECT file_id, name,
+                       CASE
+                           WHEN real_size > 0 THEN real_size
+                           WHEN real_size = 0 AND probed_upload_time IS NOT NULL
+                                AND probed_upload_time = COALESCE(upload_time, '') THEN 0
+                           ELSE size + MAX(@pad, size / @div)
+                       END,
+                       upload_time
+                FROM files WHERE disk_id=@disk AND folder_id=@pf
+                """;
             cmd.Parameters.AddWithValue("@disk", (long)diskId);
             cmd.Parameters.AddWithValue("@pf", (long)folderId);
             cmd.Parameters.AddWithValue("@pad", SizePolicy.MinPaddingBytes);
@@ -699,7 +730,13 @@ public sealed class SqliteCache : IDisposable
             {
                 cmd.CommandText = """
                     SELECT fo.local_path, fi.name,
-                           COALESCE(NULLIF(fi.real_size, 0), fi.size + MAX(@pad, fi.size / @div)),
+                           CASE
+                               WHEN fi.real_size = 0
+                                    AND fi.probed_upload_time IS NOT NULL
+                                    AND fi.probed_upload_time = COALESCE(fi.upload_time, '') THEN 0
+                               WHEN fi.real_size > 0 THEN fi.real_size
+                               ELSE fi.size + MAX(@pad, fi.size / @div)
+                           END,
                            fi.upload_time
                     FROM files fi JOIN folders fo
                       ON fo.disk_id=fi.disk_id AND fo.folder_id=fi.folder_id

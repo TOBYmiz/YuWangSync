@@ -847,10 +847,41 @@ public static class Callbacks
                 reportedCompleted = Math.Clamp(completedProgress, 0, totalProgress);
                 ReportProviderProgress(connectionKey, transferKey, totalProgress, reportedCompleted);
             };
-            var (data, total, viaDirect) = FetchRange(identity, offset, fetch.RequiredLength, reportProgress);
+            var (data, total, viaDirect, contentless) =
+                FetchRange(identity, offset, fetch.RequiredLength, reportProgress);
             Log?.Invoke($"[FETCH_DATA] file={identity.FileId} offset={offset} 请求={fetch.RequiredLength} " +
                         $"实得={data.Length} 文件总长={total} 占位声明={info.FileSize} " +
                         $"来源={(viaDirect ? "直链Range" : "整文件缓存")} 用时={sw.Elapsed.TotalSeconds:F1}s");
+
+            if (contentless)
+            {
+                var emptyPath = ResolveFilePath(identity, info)
+                    ?? throw new IOException($"file={identity.FileId} 已确认远端无内容，但无法定位本地占位");
+                if (info.FileSize != 0 && !PlaceholderUpdater.TryUpdateFileSize(emptyPath, 0, Log))
+                    throw new IOException($"file={identity.FileId} 已确认远端无内容，但无法把占位大小改为 0 B");
+
+                // The remote entry exists but its content object does not. Shrink the placeholder
+                // first, then complete the original request with an empty range at EOF.
+                buffer = Marshal.AllocHGlobal(1);
+                Marshal.WriteByte(buffer, 0);
+                var emptyTransfer = Execute(info, CF_OPERATION_TYPE.CF_OPERATION_TYPE_TRANSFER_DATA,
+                    new CF_OPERATION_PARAMETERS.TRANSFERDATA
+                    {
+                        CompletionStatus = NTStatus.STATUS_SUCCESS,
+                        Buffer = buffer,
+                        Offset = offset,
+                        Length = 0
+                    });
+                Log?.Invoke($"[HYDRATION] contentless file={identity.FileId} path='{emptyPath}' " +
+                            $"placeholder={info.FileSize}B -> 0B transfer={emptyTransfer}");
+                if (emptyTransfer.Failed)
+                    throw new IOException($"file={identity.FileId} 空文件水化回执失败：{emptyTransfer}");
+
+                try { Cache?.MarkHydrated(identity.FileId); }
+                catch (Exception ex) { Log?.Invoke($"标记空文件 hydration 状态失败: {ex.Message}"); }
+                ExplorerStateNotifier.NotifyItem(emptyPath);
+                return;
+            }
 
             // 精确大小应在 FETCH_PLACEHOLDERS 期间由直链 HEAD 探测，并在文件访问前对齐旧占位。
             // FETCH_DATA 期间只把 Range 返回的真实大小记入缓存，绝不对正在水化的文件调用
@@ -920,7 +951,7 @@ public static class Callbacks
                     CompletionStatus = NTStatus.STATUS_UNSUCCESSFUL,
                     Buffer = IntPtr.Zero,
                     Offset = offset,
-                    Length = 0
+                    Length = fetch.RequiredLength
                 });
         }
         finally
@@ -1302,33 +1333,53 @@ public static class Callbacks
     ///   不行再回源列举父目录按 fileId 找回文件名并落库，拿到名后照常探测直链。
     ///   这是与枚举期同源的"正确机制"的按需调用，并非回退到已移除的整文件下载路径。
     /// </summary>
-    private static (byte[] data, long total, bool viaDirect) FetchRange(
+    private static (byte[] data, long total, bool viaDirect, bool contentless) FetchRange(
         FileIdentity identity, long offset, long length, Action<long, long>? reportProgress = null)
     {
         var client = Client ?? throw new InvalidOperationException("Cloud client 尚未初始化");
         var cache = Cache;
 
         // 1) 缓存优先：直链 + 文件名
-        var (url, name) = cache?.GetFileDownloadInfo(identity.FileId) ?? (null, null);
+        var cachedInfo = cache?.GetFileDownloadInfo(identity.FileId);
+        var url = cachedInfo?.DirectUrl;
+        var name = cachedInfo?.Name;
+        var declaredSize = cachedInfo?.DeclaredSize;
+        var uploadTime = cachedInfo?.UploadTime ?? "";
+        var contentless = cachedInfo?.IsContentless == true;
+        if (contentless)
+            return (Array.Empty<byte>(), 0, true, true);
 
         // 2) 文件名缺失（文件元数据不在 DB）→ 自愈：回源补齐元数据后再探测直链
         if (string.IsNullOrEmpty(name))
         {
             name = ResolveMissingName(identity);
-            if (!string.IsNullOrEmpty(name))
-                url = TryProbe(client, cache, identity.FileId, name);
+            cachedInfo = cache?.GetFileDownloadInfo(identity.FileId);
+            url = cachedInfo?.DirectUrl;
+            declaredSize = cachedInfo?.DeclaredSize;
+            uploadTime = cachedInfo?.UploadTime ?? "";
+            contentless = cachedInfo?.IsContentless == true;
         }
 
         // 3) 有文件名但还没有直链（枚举期探测失败被降级，或自愈刚拿到名）→ 现探一次
         if (url == null && !string.IsNullOrEmpty(name))
-            url = TryProbe(client, cache, identity.FileId, name);
+        {
+            var probe = TryProbe(client, cache, identity.FileId, name, declaredSize, uploadTime);
+            if (probe.HasValue)
+            {
+                url = probe.Value.Url;
+                contentless = probe.Value.IsContentless;
+            }
+        }
+
+        if (contentless)
+            return (Array.Empty<byte>(), 0, true, true);
 
         if (url != null)
         {
             try
             {
                 var r = client.DownloadRangeDirectAsync(url, offset, length, reportProgress).GetAwaiter().GetResult();
-                if (r.HasValue) return (r.Value.Data, r.Value.Total, true);
+                if (r.HasValue) return (r.Value.Data, r.Value.Total, true, false);
                 Log?.Invoke($"[FETCH_DATA] file={identity.FileId} 直链分片返回 null（忽略 Range 后的整文件切片仍为空），无兜底下载路径");
             }
             catch (OperationCanceledException)
@@ -1351,15 +1402,18 @@ public static class Callbacks
     /// <summary>
     /// 探测直链；成功则落库并返回直链，任何失败返回 null（不抛，交由上层决定兜底）。
     /// </summary>
-    private static string? TryProbe(Net.YuWangClient client, Storage.SqliteCache? cache, ulong fileId, string name)
+    private static (string Url, bool IsContentless)? TryProbe(Net.YuWangClient client,
+        Storage.SqliteCache? cache, ulong fileId, string name, long? declaredSize, string uploadTime)
     {
         try
         {
-            var probe = client.ProbeRealSizeAsync(fileId, name).GetAwaiter().GetResult();
+            var probe = client.ProbeRealSizeAsync(fileId, name, declaredSize).GetAwaiter().GetResult();
             if (probe.HasValue)
             {
-                cache?.SaveDirectInfo(fileId, probe.Value.Size, probe.Value.DirectUrl, "");
-                return probe.Value.DirectUrl;
+                cache?.SaveDirectInfo(fileId, probe.Value.Size, probe.Value.DirectUrl, uploadTime);
+                if (probe.Value.IsContentless)
+                    Log?.Invoke($"[FETCH_DATA] file={fileId} 网页声明 0 B 且直链无内容，按空文件处理");
+                return (probe.Value.DirectUrl, probe.Value.IsContentless);
             }
             Log?.Invoke($"[FETCH_DATA] file={fileId} 直链探测返回 null（页面无 hash / 直链 404 / 无 Content-Length）");
         }
@@ -1460,10 +1514,12 @@ public static class Callbacks
                         local.skipped++;
                         return local;
                     }
-                    var r = client.ProbeRealSizeAsync(item.Id, item.Name).GetAwaiter().GetResult();
+                    var r = client.ProbeRealSizeAsync(item.Id, item.Name, item.Size).GetAwaiter().GetResult();
                     if (r.HasValue)
                     {
                         cache.SaveDirectInfo(item.Id, r.Value.Size, r.Value.DirectUrl, ut);
+                        if (r.Value.IsContentless)
+                            Log?.Invoke($"[PROBE] file={item.Id} 网页声明 0 B 且直链无内容，后续占位按 0 B 创建");
                         local.probed++;
                     }
                     else
@@ -1510,7 +1566,7 @@ public static class Callbacks
     {
         foreach (var item in items)
         {
-            if (item.isFolder || item.size is not > 0) continue;
+            if (item.isFolder || item.size is null) continue;
             var path = Path.Combine(localDir, item.name);
             try
             {
