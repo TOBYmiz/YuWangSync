@@ -111,6 +111,8 @@ internal static class Program
     private static bool _hasConsole;
     /// <summary>--open-folder：启动同步后打开目录；若已有实例则只打开目录并退出。</summary>
     private static bool _openFolder;
+    /// <summary>-about：完成单实例检查并初始化更新状态后显示关于窗口。</summary>
+    private static bool _showAbout;
     private static bool _accountSwitchRestart;
     private static SyncRootContext? _pendingAccountSwitch;
     private static bool _restartAfterAccountSwitch;
@@ -296,6 +298,7 @@ internal static class Program
         _console = args.Any(a => string.Equals(a, "--console", StringComparison.OrdinalIgnoreCase));
         _openFolder = args.Any(a => string.Equals(a, "--open-folder", StringComparison.OrdinalIgnoreCase)
             || string.Equals(a, "-open-folder", StringComparison.OrdinalIgnoreCase));
+        _showAbout = args.Any(a => string.Equals(a, "-about", StringComparison.OrdinalIgnoreCase));
         if (args.Any(argument => argument.Equals("--stop", StringComparison.OrdinalIgnoreCase)))
         {
             try { await InstanceControl.StopAsync(); }
@@ -563,7 +566,11 @@ internal static class Program
         //     即便 --quiet 无头模式也启动（仅建立关机监听窗口，不显示托盘图标/不弹验证码）。
         TrayHost.Start(!_quiet, _ctx.TrayUpdateHintEnabled);
         TrayHost.WaitForUiReady();
-        if (!_quiet) UpdateService.Start(_ctx.AutomaticUpdateCheck, _cts.Token);
+        if (!_quiet)
+        {
+            UpdateService.Start(_ctx.AutomaticUpdateCheck, _cts.Token);
+            if (_showAbout) WinUiUiHost.ShowAbout();
+        }
 
         // 2. 初始化 HTTP 客户端
         _client = new YuWangClient(_ctx.Server, _ctx.Username, _ctx.Password,

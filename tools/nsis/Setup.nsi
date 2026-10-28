@@ -456,7 +456,7 @@ FunctionEnd
 Function .onInstSuccess
   ${If} $QuickUpdateRequested == "1"
   ${AndIf} $IsInstalled == "1"
-    ExecShell "open" "$INSTDIR\${PRODUCT_IDENTIFIER}.exe" "--cleanup-update-temp"
+    ExecShell "open" "$INSTDIR\${PRODUCT_IDENTIFIER}.exe" "--cleanup-update-temp -about"
   ${EndIf}
 FunctionEnd
 
