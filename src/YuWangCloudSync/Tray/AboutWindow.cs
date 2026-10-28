@@ -32,7 +32,9 @@ internal sealed class AboutWindow : Window
 
     private readonly Grid _root;
     private readonly Button _updateButton;
+    private readonly UpdateButtonVisual _updateVisual;
     private readonly TextBlock _updateLabel;
+    private UpdateActivity _displayedActivity = UpdateActivity.Idle;
     private UpdateActivity _dialogDisplayedActivity = UpdateActivity.Idle;
     private ContentDialog? _releaseDialog;
     private Button? _releaseDialogUpdateButton;
@@ -75,15 +77,11 @@ internal sealed class AboutWindow : Window
             Spacing = 12,
             HorizontalAlignment = HorizontalAlignment.Right,
         };
-        _updateLabel = new TextBlock
-        {
-            Text = "检查更新",
-            HorizontalAlignment = HorizontalAlignment.Center,
-            VerticalAlignment = VerticalAlignment.Center,
-        };
+        _updateVisual = CreateUpdateButtonVisual("检查更新");
+        _updateLabel = _updateVisual.Label;
         _updateButton = new Button
         {
-            Content = _updateLabel,
+            Content = _updateVisual.Content,
             Style = (Style)Application.Current.Resources["DefaultButtonStyle"],
             MinWidth = 88,
             HorizontalAlignment = HorizontalAlignment.Right,
@@ -342,7 +340,7 @@ internal sealed class AboutWindow : Window
             }
         }
         if (!_isClosed)
-            _updateButton.IsEnabled = UpdateService.CurrentState.Activity == UpdateActivity.Idle;
+            ApplyUpdateState(UpdateService.CurrentState);
     }
 
     internal void OnEnteredAbout()
@@ -352,7 +350,7 @@ internal sealed class AboutWindow : Window
         _promptedReleaseTag = null;
 
         var state = UpdateService.CurrentState;
-        ApplyUpdateState(state);
+        ApplyUpdateState(state, forceVisuals: true);
         if (state.Activity == UpdateActivity.Idle && state.IsAvailable && state.ErrorMessage is null)
         {
             _ = ShowAvailableReleaseDialogAsync(state);
@@ -372,14 +370,17 @@ internal sealed class AboutWindow : Window
             Serilog.Log.Debug("关于窗口关闭前未能投递自动更新状态");
     }
 
-    private void ApplyUpdateState(UpdateUiState state)
+    private void ApplyUpdateState(UpdateUiState state, bool forceVisuals = false)
     {
         if (_isClosed) return;
 
         _updateButton.Visibility = Visibility.Visible;
-        _updateButton.IsEnabled = state.Activity == UpdateActivity.Idle;
+        var canOpenReleaseDetails = state.IsAvailable
+            && state.Activity is UpdateActivity.Connecting or UpdateActivity.Downloading or UpdateActivity.Launching;
+        _updateButton.IsEnabled = state.Activity == UpdateActivity.Idle || canOpenReleaseDetails;
         _updateButton.Style = (Style)Application.Current.Resources[
             state.IsAvailable ? "AccentButtonStyle" : "DefaultButtonStyle"];
+        _updateVisual.Percent.Text = state.DownloadPercent.ToString(System.Globalization.CultureInfo.InvariantCulture) + "%";
         _updateLabel.Text = state.Activity switch
         {
             UpdateActivity.Checking => "检查中…",
@@ -392,10 +393,20 @@ internal sealed class AboutWindow : Window
         {
             UpdateActivity.Checking => "正在检查更新",
             UpdateActivity.Connecting => "正在连接更新服务器",
-            UpdateActivity.Downloading => "正在下载更新",
+            UpdateActivity.Downloading => "正在下载更新 " + _updateVisual.Percent.Text,
             UpdateActivity.Launching => "正在启动更新安装器",
             _ => state.IsAvailable ? "更新到 " + (state.Release?.TagName ?? "最新版本") : "检查更新",
         });
+
+        if (forceVisuals || _displayedActivity != state.Activity)
+        {
+            _displayedActivity = state.Activity;
+            var isChecking = state.Activity is UpdateActivity.Checking or UpdateActivity.Connecting;
+            _updateVisual.Progress.IsActive = isChecking;
+            AnimateOpacity(_updateLabel, state.Activity is UpdateActivity.Idle or UpdateActivity.Launching ? 1 : 0);
+            AnimateOpacity(_updateVisual.Progress, isChecking ? 1 : 0);
+            AnimateOpacity(_updateVisual.Percent, state.Activity == UpdateActivity.Downloading ? 1 : 0);
+        }
 
         if (state.ErrorMessage is null)
         {

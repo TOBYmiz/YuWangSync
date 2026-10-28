@@ -1,7 +1,9 @@
 using System.Globalization;
 using System.Net;
+using System.Net.Http.Headers;
 using System.Security.Cryptography;
 using System.Text.Json;
+using Microsoft.Win32.SafeHandles;
 
 namespace YuWangCloudSync.Updates;
 
@@ -18,6 +20,10 @@ internal readonly record struct DownloadProgress(long BytesRead, long TotalBytes
 
 internal sealed class GitHubReleaseClient(HttpClient httpClient, string userAgent)
 {
+    private const long RangeChunkSize = 2L * 1024 * 1024;
+    private const int RangeMaxConcurrency = 4;
+    private const int DownloadBufferSize = 128 * 1024;
+
     private const string ApiProxy = "https://v6.gh-proxy.org/https://api.github.com/repos/TOBYmiz/YuWangSync/releases/latest";
     private const string ApiOfficial = "https://api.github.com/repos/TOBYmiz/YuWangSync/releases/latest";
     private const string DownloadProxyPrefix = "https://v6.gh-proxy.org/https://github.com/TOBYmiz/YuWangSync/releases/latest/download/";
@@ -106,45 +112,17 @@ internal sealed class GitHubReleaseClient(HttpClient httpClient, string userAgen
                 using var endpointTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
                 endpointTimeout.CancelAfter(TimeSpan.FromMinutes(20));
                 Directory.CreateDirectory(Path.GetDirectoryName(destinationPath)!);
-                using var request = new HttpRequestMessage(HttpMethod.Get, uri);
-                request.Headers.UserAgent.ParseAdd(userAgent);
-                using var response = await httpClient.SendAsync(request,
-                    HttpCompletionOption.ResponseHeadersRead, endpointTimeout.Token).ConfigureAwait(false);
-                response.EnsureSuccessStatusCode();
+                var actualDigest = asset.Size > RangeChunkSize
+                    ? await TryDownloadRangesAsync(uri, asset, partialPath, progress, endpointTimeout.Token)
+                        .ConfigureAwait(false)
+                    : null;
+                actualDigest ??= await DownloadSingleAsync(uri, asset, partialPath, progress, endpointTimeout.Token)
+                    .ConfigureAwait(false);
 
-                await using var source = await response.Content.ReadAsStreamAsync(endpointTimeout.Token).ConfigureAwait(false);
-                await using var destination = new FileStream(partialPath, FileMode.CreateNew, FileAccess.Write,
-                    FileShare.None, 128 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan);
-                using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
-                var buffer = new byte[128 * 1024];
-                long totalBytes = 0;
-                var lastReportedPercent = -1;
-                while (true)
-                {
-                    var read = await source.ReadAsync(buffer, endpointTimeout.Token).ConfigureAwait(false);
-                    if (read == 0) break;
-                    totalBytes += read;
-                    if (totalBytes > asset.Size)
-                        throw new InvalidDataException("下载文件大于 Release 声明的大小。");
-                    hash.AppendData(buffer, 0, read);
-                    await destination.WriteAsync(buffer.AsMemory(0, read), endpointTimeout.Token).ConfigureAwait(false);
-                    var percent = (int)Math.Min(100, totalBytes * 100 / asset.Size);
-                    if (percent != lastReportedPercent)
-                    {
-                        lastReportedPercent = percent;
-                        progress?.Report(new DownloadProgress(totalBytes, asset.Size));
-                    }
-                }
-                await destination.FlushAsync(endpointTimeout.Token).ConfigureAwait(false);
-
-                if (totalBytes != asset.Size)
-                    throw new InvalidDataException($"下载大小不匹配：期望 {asset.Size} 字节，实际 {totalBytes} 字节。");
-                var actualDigest = Convert.ToHexString(hash.GetHashAndReset()).ToLowerInvariant();
-                if (!CryptographicOperations.FixedTimeEquals(
-                        Convert.FromHexString(actualDigest), Convert.FromHexString(expectedDigest)))
+                if (!CryptographicOperations.FixedTimeEquals(Convert.FromHexString(actualDigest),
+                        Convert.FromHexString(expectedDigest)))
                     throw new InvalidDataException("下载文件的 SHA-256 与 Release digest 不匹配。");
 
-                await destination.DisposeAsync().ConfigureAwait(false);
                 File.Move(partialPath, destinationPath);
                 progress?.Report(new DownloadProgress(asset.Size, asset.Size));
                 return;
@@ -164,6 +142,188 @@ internal sealed class GitHubReleaseClient(HttpClient httpClient, string userAgen
 
         throw new InvalidDataException("代理和 GitHub 官方下载均失败或校验未通过，更新包未运行。", lastError);
     }
+
+    private async Task<string?> TryDownloadRangesAsync(
+        Uri uri,
+        GitHubReleaseAsset asset,
+        string partialPath,
+        IProgress<DownloadProgress>? progress,
+        CancellationToken cancellationToken)
+    {
+        var firstRangeEnd = Math.Min(RangeChunkSize, asset.Size) - 1;
+        using var firstRequest = new HttpRequestMessage(HttpMethod.Get, uri);
+        firstRequest.Headers.UserAgent.ParseAdd(userAgent);
+        firstRequest.Headers.Range = new RangeHeaderValue(0, firstRangeEnd);
+        using var firstResponse = await httpClient.SendAsync(firstRequest,
+            HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
+
+        // Servers and proxies that ignore Range are downloaded once through the regular path.
+        if (firstResponse.StatusCode != HttpStatusCode.PartialContent)
+            return null;
+
+        var progressGate = new object();
+        long downloadedBytes = 0;
+        var lastReportedPercent = -1;
+        void ReportBytesRead(int bytesRead)
+        {
+            lock (progressGate)
+            {
+                downloadedBytes += bytesRead;
+                var percent = (int)Math.Min(100, downloadedBytes * 100 / asset.Size);
+                if (percent == lastReportedPercent) return;
+                lastReportedPercent = percent;
+                progress?.Report(new DownloadProgress(downloadedBytes, asset.Size));
+            }
+        }
+
+        try
+        {
+            ValidateRangeResponse(firstResponse, 0, firstRangeEnd, asset.Size);
+            await using (var destination = new FileStream(partialPath, FileMode.CreateNew, FileAccess.ReadWrite,
+                             FileShare.Read, DownloadBufferSize, FileOptions.Asynchronous | FileOptions.RandomAccess))
+            {
+                destination.SetLength(asset.Size);
+                await CopyRangeToFileAsync(firstResponse, destination.SafeFileHandle, 0,
+                    firstRangeEnd - 0 + 1, ReportBytesRead, cancellationToken).ConfigureAwait(false);
+
+                var ranges = new List<DownloadRange>();
+                for (var start = firstRangeEnd + 1; start < asset.Size;)
+                {
+                    var end = start + Math.Min(RangeChunkSize - 1, asset.Size - 1 - start);
+                    ranges.Add(new DownloadRange(start, end));
+                    start = end + 1;
+                }
+
+                await Parallel.ForEachAsync(ranges,
+                    new ParallelOptions
+                    {
+                        MaxDegreeOfParallelism = RangeMaxConcurrency,
+                        CancellationToken = cancellationToken,
+                    },
+                    async (range, token) =>
+                    {
+                        using var request = new HttpRequestMessage(HttpMethod.Get, uri);
+                        request.Headers.UserAgent.ParseAdd(userAgent);
+                        request.Headers.Range = new RangeHeaderValue(range.Start, range.End);
+                        using var response = await httpClient.SendAsync(request,
+                            HttpCompletionOption.ResponseHeadersRead, token).ConfigureAwait(false);
+                        ValidateRangeResponse(response, range.Start, range.End, asset.Size);
+                        await CopyRangeToFileAsync(response, destination.SafeFileHandle, range.Start,
+                            range.End - range.Start + 1, ReportBytesRead, token).ConfigureAwait(false);
+                    }).ConfigureAwait(false);
+
+                await destination.FlushAsync(cancellationToken).ConfigureAwait(false);
+            }
+
+            return await ComputeSha256Async(partialPath, cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            TryDeleteFile(partialPath);
+            throw;
+        }
+        catch (Exception error) when (error is HttpRequestException or IOException or InvalidDataException
+                                      or UnauthorizedAccessException or OperationCanceledException)
+        {
+            TryDeleteFile(partialPath);
+            progress?.Report(new DownloadProgress(0, asset.Size));
+            return null;
+        }
+    }
+
+    private async Task<string> DownloadSingleAsync(
+        Uri uri,
+        GitHubReleaseAsset asset,
+        string partialPath,
+        IProgress<DownloadProgress>? progress,
+        CancellationToken cancellationToken)
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Get, uri);
+        request.Headers.UserAgent.ParseAdd(userAgent);
+        using var response = await httpClient.SendAsync(request,
+            HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
+        response.EnsureSuccessStatusCode();
+
+        await using var source = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
+        await using var destination = new FileStream(partialPath, FileMode.CreateNew, FileAccess.Write,
+            FileShare.None, DownloadBufferSize, FileOptions.Asynchronous | FileOptions.SequentialScan);
+        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        var buffer = new byte[DownloadBufferSize];
+        long totalBytes = 0;
+        var lastReportedPercent = -1;
+        while (true)
+        {
+            var read = await source.ReadAsync(buffer, cancellationToken).ConfigureAwait(false);
+            if (read == 0) break;
+            totalBytes += read;
+            if (totalBytes > asset.Size)
+                throw new InvalidDataException("下载文件大于 Release 声明的大小。");
+            hash.AppendData(buffer, 0, read);
+            await destination.WriteAsync(buffer.AsMemory(0, read), cancellationToken).ConfigureAwait(false);
+            var percent = (int)Math.Min(100, totalBytes * 100 / asset.Size);
+            if (percent != lastReportedPercent)
+            {
+                lastReportedPercent = percent;
+                progress?.Report(new DownloadProgress(totalBytes, asset.Size));
+            }
+        }
+        await destination.FlushAsync(cancellationToken).ConfigureAwait(false);
+
+        if (totalBytes != asset.Size)
+            throw new InvalidDataException($"下载大小不匹配：期望 {asset.Size} 字节，实际 {totalBytes} 字节。");
+        return Convert.ToHexString(hash.GetHashAndReset()).ToLowerInvariant();
+    }
+
+    private static void ValidateRangeResponse(HttpResponseMessage response, long start, long end, long totalSize)
+    {
+        var contentRange = response.Content.Headers.ContentRange;
+        var expectedLength = end - start + 1;
+        if (response.StatusCode != HttpStatusCode.PartialContent
+            || contentRange is null
+            || !string.Equals(contentRange.Unit, "bytes", StringComparison.OrdinalIgnoreCase)
+            || contentRange.From != start
+            || contentRange.To != end
+            || contentRange.Length != totalSize
+            || response.Content.Headers.ContentLength is { } contentLength && contentLength != expectedLength)
+            throw new InvalidDataException("更新服务器返回的分片范围与请求不匹配。");
+    }
+
+    private static async Task CopyRangeToFileAsync(
+        HttpResponseMessage response,
+        SafeFileHandle destination,
+        long fileOffset,
+        long expectedLength,
+        Action<int> reportBytesRead,
+        CancellationToken cancellationToken)
+    {
+        await using var source = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
+        var buffer = new byte[DownloadBufferSize];
+        long totalBytes = 0;
+        while (true)
+        {
+            var read = await source.ReadAsync(buffer, cancellationToken).ConfigureAwait(false);
+            if (read == 0) break;
+            if (totalBytes + read > expectedLength)
+                throw new InvalidDataException("更新服务器返回的分片长度超过 Content-Range。");
+            await RandomAccess.WriteAsync(destination, buffer.AsMemory(0, read), fileOffset + totalBytes,
+                cancellationToken).ConfigureAwait(false);
+            totalBytes += read;
+            reportBytesRead(read);
+        }
+
+        if (totalBytes != expectedLength)
+            throw new InvalidDataException($"更新分片大小不匹配：期望 {expectedLength} 字节，实际 {totalBytes} 字节。");
+    }
+
+    private static async Task<string> ComputeSha256Async(string path, CancellationToken cancellationToken)
+    {
+        await using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read,
+            DownloadBufferSize, FileOptions.Asynchronous | FileOptions.SequentialScan);
+        var digest = await SHA256.HashDataAsync(stream, cancellationToken).ConfigureAwait(false);
+        return Convert.ToHexString(digest).ToLowerInvariant();
+    }
+
+    private readonly record struct DownloadRange(long Start, long End);
 
     internal static GitHubRelease ParseRelease(string json)
     {
