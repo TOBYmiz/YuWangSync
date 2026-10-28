@@ -76,7 +76,7 @@ internal sealed class CloudFilePinStateWatcher
             try
             {
                 await Task.Delay(100).ConfigureAwait(false);
-                ProcessPath(fullPath);
+                await ProcessPathAsync(fullPath).ConfigureAwait(false);
             }
             catch (Exception ex)
             {
@@ -90,7 +90,7 @@ internal sealed class CloudFilePinStateWatcher
         });
     }
 
-    private void ProcessPath(string path)
+    private async Task ProcessPathAsync(string path)
     {
         if (_stopping || !File.Exists(path) || Directory.Exists(path)
             || !ProviderIdentity.OwnsPlaceholder(path))
@@ -121,9 +121,39 @@ internal sealed class CloudFilePinStateWatcher
                 break;
 
             case CF_PIN_STATE.CF_PIN_STATE_UNPINNED:
-                // Unpin changes retention intent only. Explorer's separate "Free up space"
-                // operation owns dehydration; never infer it from CF_PIN_STATE_UNPINNED.
+                await DehydrateUnpinnedFileAsync(path, state.FileId).ConfigureAwait(false);
                 break;
         }
+    }
+
+    private async Task DehydrateUnpinnedFileAsync(string path, long fileId)
+    {
+        int[] retryDelaysMs = [0, 250, 500, 1_000, 2_000];
+        for (var attempt = 0; attempt < retryDelaysMs.Length; attempt++)
+        {
+            if (_stopping) return;
+            if (retryDelaysMs[attempt] > 0)
+                await Task.Delay(retryDelaysMs[attempt]).ConfigureAwait(false);
+
+            if (!File.Exists(path)
+                || !PlaceholderUpdater.TryGetPlaceholderDataState(path, out var state)
+                || state.PinState != CF_PIN_STATE.CF_PIN_STATE_UNPINNED)
+                return;
+            if (state.OnDiskDataSize <= 0) return;
+            if (state.InSyncState != CF_IN_SYNC_STATE.CF_IN_SYNC_STATE_IN_SYNC)
+            {
+                _log($"[PIN] 暂缓脱水 file={fileId}：当前不在同步状态 ({state.InSyncState})");
+                continue;
+            }
+
+            var dehydrated = PlaceholderUpdater.TryDehydrate(path, out var freedBytes, _log);
+            if (dehydrated)
+            {
+                _log($"[PIN] UNPINNED 脱水完成 file={fileId} freed={freedBytes}");
+                return;
+            }
+        }
+
+        _log($"[PIN] UNPINNED 脱水尚未完成 file={fileId}；稍后属性变化时会再次检查");
     }
 }
