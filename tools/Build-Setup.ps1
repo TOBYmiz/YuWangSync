@@ -97,6 +97,15 @@ try {
     [System.IO.Directory]::CreateDirectory($mainBuildOutput) | Out-Null
     Invoke-Checked 'dotnet' @('publish', (Join-Path $repository 'src\YuWangCloudSync\YuWangCloudSync.csproj'), '-c', 'Release', '-r', 'win-x64', '--no-self-contained', ('-p:ProductVersion=' + $version), '-p:WindowsAppSDKSelfContained=true', '-p:DebugType=None', '-p:DebugSymbols=false', ('-p:OutDir=' + $mainBuildOutput + '\'), '-o', $publish)
 
+    # Version the shortcut icon path so Explorer can use a fresh icon-cache key after updates.
+    $shortcutIconSource = Join-Path $publish 'Assets\yw_tray.ico'
+    $shortcutIconName = '{0}-shortcut-{1}.ico' -f $productIdentifier, $version
+    $shortcutIconPath = Join-Path (Join-Path $publish 'Assets') $shortcutIconName
+    if (-not (Test-Path -LiteralPath $shortcutIconSource -PathType Leaf)) {
+        throw "程序载荷缺少桌面快捷方式图标：$shortcutIconSource"
+    }
+    Copy-Item -LiteralPath $shortcutIconSource -Destination $shortcutIconPath -Force
+
     # The project publish target copies compiled XAML and the app's root resources.pri.
     foreach ($requiredResource in @('App.xbf', 'resources.pri')) {
         if (-not (Test-Path -LiteralPath (Join-Path $publish $requiredResource) -PathType Leaf)) {

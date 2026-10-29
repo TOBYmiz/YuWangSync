@@ -1454,6 +1454,42 @@ remove_legacy_file_list:
 remove_legacy_artifacts_done:
 FunctionEnd
 
+Function AddExistingShortcutIconsToManifest
+  Push $0
+  Push $1
+  Push $2
+  StrCpy $R9 "0"
+
+  ClearErrors
+  FindFirst $0 $1 "$INSTDIR\Assets\${PRODUCT_IDENTIFIER}-shortcut-*.ico"
+  IfErrors record_shortcut_icons_done
+  ClearErrors
+  FileOpen $2 "$PLUGINSDIR\installed-files.new.txt" a
+  IfErrors record_shortcut_icons_open_failed
+  ${Do}
+    StrCmp $1 "${PRODUCT_IDENTIFIER}-shortcut-${PRODUCT_VERSION}.ico" record_shortcut_icon_next
+    ClearErrors
+    FileWrite $2 "Assets\$1$\r$\n"
+    IfErrors record_shortcut_icons_write_failed
+record_shortcut_icon_next:
+    ClearErrors
+    FindNext $0 $1
+  ${LoopUntil} ${Errors}
+  FileClose $2
+  FindClose $0
+  Goto record_shortcut_icons_done
+
+record_shortcut_icons_write_failed:
+  FileClose $2
+record_shortcut_icons_open_failed:
+  FindClose $0
+  StrCpy $R9 "1"
+record_shortcut_icons_done:
+  Pop $2
+  Pop $1
+  Pop $0
+FunctionEnd
+
 Function RefreshDesktopShortcutIcons
   Push $0
   Push $1
@@ -1475,7 +1511,10 @@ Function RefreshDesktopShortcutIcons
     ${If} $4 == 0
     ${AndIf} $3 P<> 0
       GetFullPathName $7 "$INSTDIR\${PRODUCT_IDENTIFIER}.exe"
+      GetFullPathName $9 "$INSTDIR\Assets\${PRODUCT_IDENTIFIER}-shortcut-${PRODUCT_VERSION}.ico"
+      IfFileExists "$9" 0 refresh_shortcuts_done
       System::Call 'shell32::SHChangeNotify(i 0x00002000, i 0x0005, w "$7", p 0)'
+      System::Call 'shell32::SHChangeNotify(i 0x00002000, i 0x0005, w "$9", p 0)'
       ClearErrors
       FindFirst $0 $1 "$DESKTOP\*.lnk"
       IfErrors refresh_shortcuts_done
@@ -1494,24 +1533,34 @@ Function RefreshDesktopShortcutIcons
               StrCpy $8 0
               ${IShellLink::GetIconLocation} $2 '(.r6,${NSIS_MAX_STRLEN},.r8).r4'
               ${If} $4 == 0
-                StrCmp $6 "" refresh_shortcut_use_app_icon
-                StrCpy $9 $6
-                ExpandEnvStrings $9 $9
+                StrCmp $6 "" refresh_shortcut_use_versioned_icon
+                StrCpy $5 $6
+                ExpandEnvStrings $5 $5
                 ClearErrors
-                GetFullPathName $9 "$9"
+                GetFullPathName $5 "$5"
                 ${IfNot} ${Errors}
-                ${AndIf} $9 == $7
-                  StrCpy $6 "$7"
-                  StrCpy $8 0
-                  Goto refresh_shortcut_set_icon
+                ${AndIf} $5 == $7
+                  Goto refresh_shortcut_use_versioned_icon
                 ${EndIf}
-                IfFileExists "$9" refresh_shortcut_set_icon refresh_shortcut_use_app_icon
+                ${IfNot} ${Errors}
+                ${AndIf} $5 == $9
+                  Goto refresh_shortcut_use_versioned_icon
+                ${EndIf}
+                StrCpy $4 "$INSTDIR\Assets\${PRODUCT_IDENTIFIER}-shortcut-"
+                StrLen $4 $4
+                StrCpy $5 $5 $4
+                StrCmp $5 "$INSTDIR\Assets\${PRODUCT_IDENTIFIER}-shortcut-" refresh_shortcut_use_versioned_icon
+                StrCpy $5 $6
+                ExpandEnvStrings $5 $5
+                ClearErrors
+                GetFullPathName $5 "$5"
+                IfFileExists "$5" refresh_shortcut_set_icon refresh_shortcut_use_versioned_icon
               ${Else}
-                Goto refresh_shortcut_use_app_icon
+                Goto refresh_shortcut_use_versioned_icon
               ${EndIf}
 
-refresh_shortcut_use_app_icon:
-              StrCpy $6 "$7"
+refresh_shortcut_use_versioned_icon:
+              StrCpy $6 "$9"
               StrCpy $8 0
 refresh_shortcut_set_icon:
               ${IShellLink::SetIconLocation} $2 '("$6",$8).r4'
@@ -1555,6 +1604,12 @@ Section "Install"
   SetOutPath "$PLUGINSDIR"
   File /oname=installed-files.new.txt "${INSTALLED_FILES_PATH}"
   File /oname=installed-directories.new.txt "${INSTALLED_DIRECTORIES_PATH}"
+  Call AddExistingShortcutIconsToManifest
+  ${If} $R9 != "0"
+    MessageBox MB_OK|MB_ICONSTOP "无法保留旧版快捷方式图标清单，安装已停止。"
+    SetErrorLevel 1
+    Abort
+  ${EndIf}
 
   ${If} $IsInstalled == "1"
     IfFileExists "$INSTDIR\${PRODUCT_IDENTIFIER}.exe" 0 install_stop_done
@@ -1663,7 +1718,7 @@ install_shell_file_done:
   ; Preserve the user's shortcut name and contents during upgrades.
   ${If} $IsInstalled != "1"
   ${AndIf} $CreateDesktopShortcut == "1"
-    CreateShortCut "$DESKTOP\${PRODUCT_NAME_ZH}.lnk" "$INSTDIR\${PRODUCT_IDENTIFIER}.exe" "-open-folder" "$INSTDIR\${PRODUCT_IDENTIFIER}.exe" 0 SW_SHOWNORMAL "" "启动${PRODUCT_NAME_ZH}并打开同步目录"
+    CreateShortCut "$DESKTOP\${PRODUCT_NAME_ZH}.lnk" "$INSTDIR\${PRODUCT_IDENTIFIER}.exe" "-open-folder" "$INSTDIR\Assets\${PRODUCT_IDENTIFIER}-shortcut-${PRODUCT_VERSION}.ico" 0 SW_SHOWNORMAL "" "启动${PRODUCT_NAME_ZH}并打开同步目录"
   ${EndIf}
   Call RefreshDesktopShortcutIcons
 
