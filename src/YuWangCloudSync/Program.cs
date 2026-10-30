@@ -1994,8 +1994,10 @@ internal static class Program
 
         try
         {
-            await File.WriteAllTextAsync(configPath, JsonSerializer.Serialize(fakeConfig));
-            _ctx = JsonSerializer.Deserialize<SyncRootContext>(await File.ReadAllTextAsync(configPath))
+            await File.WriteAllTextAsync(configPath,
+                JsonSerializer.Serialize(fakeConfig, AppJsonSerializerContext.Default.SyncRootContext));
+            _ctx = JsonSerializer.Deserialize(await File.ReadAllTextAsync(configPath),
+                AppJsonSerializerContext.Default.SyncRootContext)
                 ?? throw new InvalidDataException("自检临时配置无法读取。");
             var image = Convert.FromBase64String(
                 "iVBORw0KGgoAAAANSUhEUgAAAGQAAAAyCAYAAACqNX6+AAAAOklEQVR4nO3BAQ0AAADCoPdPbQ8H" +
@@ -2008,7 +2010,9 @@ internal static class Program
                 || a.Equals("--wpf-ui-selftest-shot", StringComparison.OrdinalIgnoreCase));
 
             var checks = await WinUiUiHost.RunSelfTestAsync(captchaPath, testRoot,
-                _uiSelfTestHoldSeconds, _uiSelfTestShot).ConfigureAwait(false);
+                _uiSelfTestHoldSeconds, _uiSelfTestShot,
+                args.Any(argument => argument.Equals("--ui-selftest-folder-picker", StringComparison.OrdinalIgnoreCase)))
+                .ConfigureAwait(false);
             var passed = checks.All(check => check.Passed);
             foreach (var check in checks)
             {
@@ -2016,14 +2020,10 @@ internal static class Program
                 else Log.Error("[SELFTEST] FAIL {Name}: {Detail}", check.Name, check.Detail);
             }
 
-            await File.WriteAllTextAsync(reportPath, JsonSerializer.Serialize(new
-            {
-                ProcessId = Environment.ProcessId,
-                Passed = passed,
-                ConfigPath = configPath,
-                CaptchaPath = captchaPath,
-                Checks = checks,
-            }, new JsonSerializerOptions { WriteIndented = true }));
+            var report = new UiSelfTestReport(Environment.ProcessId, passed, configPath, captchaPath,
+                checks.ToArray());
+            await File.WriteAllTextAsync(reportPath,
+                JsonSerializer.Serialize(report, AppJsonSerializerContext.Default.UiSelfTestReport));
             Log.Information("[SELFTEST] 报告路径：{ReportPath}", reportPath);
             if (!passed) Environment.ExitCode = 1;
         }
@@ -2032,14 +2032,10 @@ internal static class Program
             Environment.ExitCode = 1;
             try
             {
-                await File.WriteAllTextAsync(reportPath, JsonSerializer.Serialize(new
-                {
-                    ProcessId = Environment.ProcessId,
-                    Passed = false,
-                    ConfigPath = configPath,
-                    CaptchaPath = captchaPath,
-                    Error = error.ToString(),
-                }, new JsonSerializerOptions { WriteIndented = true }));
+                var report = new UiSelfTestErrorReport(Environment.ProcessId, false, configPath, captchaPath,
+                    error.ToString());
+                await File.WriteAllTextAsync(reportPath,
+                    JsonSerializer.Serialize(report, AppJsonSerializerContext.Default.UiSelfTestErrorReport));
             }
             catch { }
             Log.Fatal(error, "WinUI 自检失败");
@@ -2058,8 +2054,9 @@ internal static class Program
     /// </summary>
     internal static SyncRootContext SnapshotConfig()
     {
-        var snapshot = JsonSerializer.Deserialize<SyncRootContext>(JsonSerializer.Serialize(_ctx),
-            new JsonSerializerOptions { PropertyNameCaseInsensitive = true }) ?? new SyncRootContext();
+        var snapshotJson = JsonSerializer.Serialize(_ctx, AppJsonSerializerContext.Default.SyncRootContext);
+        var snapshot = JsonSerializer.Deserialize(snapshotJson, AppJsonSerializerContext.Default.SyncRootContext)
+            ?? new SyncRootContext();
         snapshot.Password = _ctx.Password;
         return snapshot;
     }

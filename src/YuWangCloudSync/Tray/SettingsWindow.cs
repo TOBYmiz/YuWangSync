@@ -504,7 +504,7 @@ internal sealed class SettingsWindow : Window
     private async void OnBrowse(object sender, RoutedEventArgs args)
     {
         var owner = WindowNative.GetWindowHandle(this);
-        var picked = FolderPicker.Pick(owner, "选择同步根目录",
+        var picked = await FolderPicker.PickAsync(owner, "选择同步根目录",
             !string.IsNullOrWhiteSpace(_path.Text) && Directory.Exists(_path.Text) ? _path.Text : null);
         if (string.IsNullOrWhiteSpace(picked)) return;
         _path.Text = picked;

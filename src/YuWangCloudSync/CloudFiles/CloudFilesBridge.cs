@@ -231,7 +231,7 @@ public static class PlaceholderCreator
         if (ptr == IntPtr.Zero || count == 0) return;
         var elemSize = Marshal.SizeOf<CF_PLACEHOLDER_CREATE_INFO>();
         for (var i = 0; i < count; i++)
-            Marshal.DestroyStructure(ptr + i * elemSize, typeof(CF_PLACEHOLDER_CREATE_INFO));
+            Marshal.DestroyStructure<CF_PLACEHOLDER_CREATE_INFO>(ptr + i * elemSize);
         Marshal.FreeHGlobal(ptr);
     }
 

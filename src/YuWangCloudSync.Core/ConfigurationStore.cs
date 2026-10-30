@@ -13,6 +13,7 @@ public static class ConfigurationStore
         WriteIndented = true,
         Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping
     };
+    private static readonly ConfigurationJsonSerializerContext SerializerContext = new(Options);
 
     public static SyncRootContext Load(string? legacyDirectory = null, bool decryptPassword = true,
         string? configurationPath = null, bool migrate = true)
@@ -24,7 +25,7 @@ public static class ConfigurationStore
             throw new FileNotFoundException("请重装应用配置服务器、账号和同步目录。", targetPath);
 
         var json = File.ReadAllText(source);
-        var config = JsonSerializer.Deserialize<SyncRootContext>(json, Options)
+        var config = JsonSerializer.Deserialize(json, SerializerContext.SyncRootContext)
             ?? throw new InvalidDataException("配置文件为空。");
         var document = JsonNode.Parse(json) as JsonObject
             ?? throw new InvalidDataException("配置文件必须为 JSON 对象。");
@@ -228,7 +229,7 @@ public static class ConfigurationStore
 
     private static void SaveProtected(SyncRootContext config, string path)
     {
-        var document = JsonSerializer.SerializeToNode(config, Options) as JsonObject
+        var document = JsonSerializer.SerializeToNode(config, SerializerContext.SyncRootContext) as JsonObject
             ?? throw new InvalidDataException("配置无法序列化为 JSON 对象。");
         ProtectAccountNames(document);
         WriteAtomic(path, document.ToJsonString(Options));

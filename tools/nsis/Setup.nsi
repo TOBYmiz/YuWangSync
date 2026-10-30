@@ -6,6 +6,7 @@
 !include "TextFunc.nsh"
 !include "StrFunc.nsh"
 ${Using:StrFunc} UnStrRep
+${Using:StrFunc} StrRep
 ${Using:StrFunc} StrStr
 ${Using:StrFunc} UnStrStr
 !include "WordFunc.nsh"
@@ -145,6 +146,12 @@ Var KeepConfigurationCheckbox
 Var SummaryText
 Var RelativePathValid
 Var RelativePathFull
+Var ManifestSearchFile
+Var ManifestSearchPath
+Var ManifestPathFound
+Var PreviousManifestHandle
+Var NewInstalledFilesManifest
+Var NewInstalledDirectoriesManifest
 Var InstalledFileCount
 Var TreeScanResult
 Var ProtectedPassword
@@ -1442,6 +1449,316 @@ Function un.UninstallOptionsLeave
   ${EndIf}
 FunctionEnd
 
+Function ManifestContainsPath
+  Push $R0
+  Push $R1
+  StrCpy $ManifestPathFound "0"
+  ClearErrors
+  FileOpen $R0 "$ManifestSearchFile" r
+  IfErrors manifest_contains_open_failed
+manifest_contains_loop:
+  ClearErrors
+  FileRead $R0 $R1
+  IfErrors manifest_contains_close
+  ${StrRep} $R1 $R1 "$\r" ""
+  ${StrRep} $R1 $R1 "$\n" ""
+  StrCmp $R1 "" manifest_contains_loop
+  StrCmp $R1 $ManifestSearchPath manifest_contains_found
+  Goto manifest_contains_loop
+manifest_contains_found:
+  StrCpy $ManifestPathFound "1"
+manifest_contains_close:
+  FileClose $R0
+  Goto manifest_contains_done
+manifest_contains_open_failed:
+  StrCpy $ManifestPathFound "-1"
+manifest_contains_done:
+  Pop $R1
+  Pop $R0
+FunctionEnd
+
+Function ValidatePreviousInstallRelativePath
+  StrCpy $RelativePathValid "0"
+  StrCmp $R1 "" upgrade_validate_path_invalid
+  StrLen $R3 $R1
+  StrCpy $R2 "0"
+  StrCpy $R7 "0"
+upgrade_validate_path_chars:
+  IntCmp $R2 $R3 upgrade_validate_path_root upgrade_validate_path_char upgrade_validate_path_char
+upgrade_validate_path_char:
+  StrCpy $R4 $R1 1 $R2
+  StrCmp $R4 "\" upgrade_validate_path_component_end
+  StrCmp $R4 ":" upgrade_validate_path_invalid
+  StrCmp $R4 "*" upgrade_validate_path_invalid
+  StrCmp $R4 "?" upgrade_validate_path_invalid
+  StrCmp $R4 "|" upgrade_validate_path_invalid
+  StrCmp $R4 "/" upgrade_validate_path_invalid
+  StrCmp $R4 "<" upgrade_validate_path_invalid
+  StrCmp $R4 ">" upgrade_validate_path_invalid
+  StrCmp $R4 "$\"" upgrade_validate_path_invalid
+  IntOp $R2 $R2 + 1
+  Goto upgrade_validate_path_chars
+upgrade_validate_path_component_end:
+  StrCpy $R9 $R2
+  IntOp $R9 $R9 - $R7
+  StrCpy $R8 $R1 $R9 $R7
+  StrCmp $R8 "" upgrade_validate_path_invalid
+  StrCmp $R8 "." upgrade_validate_path_invalid
+  StrCmp $R8 ".." upgrade_validate_path_invalid
+  IntOp $R2 $R2 + 1
+  StrCpy $R7 $R2
+  Goto upgrade_validate_path_chars
+upgrade_validate_path_root:
+  StrCpy $R9 $R3
+  IntOp $R9 $R9 - $R7
+  StrCpy $R8 $R1 $R9 $R7
+  StrCmp $R8 "" upgrade_validate_path_invalid
+  StrCmp $R8 "." upgrade_validate_path_invalid
+  StrCmp $R8 ".." upgrade_validate_path_invalid
+
+  GetFullPathName $R6 "$PreviousInstallDirectory"
+  StrCmp $R6 "" upgrade_validate_path_invalid
+  StrCpy $RelativePathFull "$R6\$R1"
+
+  ; Reject reparse points from the volume root through the previous install directory.
+  StrCpy $R8 $R6 3
+  System::Call 'kernel32::GetFileAttributesW(w "$R8") i.R9'
+  IntCmp $R9 -1 upgrade_validate_path_invalid upgrade_validate_volume_attributes upgrade_validate_volume_attributes
+upgrade_validate_volume_attributes:
+  IntOp $R4 $R9 & 0x10
+  IntCmp $R4 0 upgrade_validate_path_invalid upgrade_validate_volume_reparse upgrade_validate_volume_reparse
+upgrade_validate_volume_reparse:
+  IntOp $R4 $R9 & 0x400
+  IntCmp $R4 0 upgrade_validate_ancestor_scan_init upgrade_validate_path_invalid upgrade_validate_path_invalid
+upgrade_validate_ancestor_scan_init:
+  StrCpy $R2 3
+  StrLen $R3 $R6
+upgrade_validate_ancestor_scan:
+  IntCmp $R2 $R3 upgrade_validate_root_attributes upgrade_validate_ancestor_char upgrade_validate_ancestor_char
+upgrade_validate_ancestor_char:
+  StrCpy $R4 $R6 1 $R2
+  StrCmp $R4 "\" upgrade_validate_ancestor_check
+  IntOp $R2 $R2 + 1
+  Goto upgrade_validate_ancestor_scan
+upgrade_validate_ancestor_check:
+  StrCpy $R8 $R6 $R2
+  System::Call 'kernel32::GetFileAttributesW(w "$R8") i.R9'
+  IntCmp $R9 -1 upgrade_validate_path_invalid upgrade_validate_ancestor_attributes upgrade_validate_ancestor_attributes
+upgrade_validate_ancestor_attributes:
+  IntOp $R4 $R9 & 0x10
+  IntCmp $R4 0 upgrade_validate_path_invalid upgrade_validate_ancestor_reparse upgrade_validate_ancestor_reparse
+upgrade_validate_ancestor_reparse:
+  IntOp $R4 $R9 & 0x400
+  IntCmp $R4 0 upgrade_validate_ancestor_next upgrade_validate_path_invalid upgrade_validate_path_invalid
+upgrade_validate_ancestor_next:
+  IntOp $R2 $R2 + 1
+  Goto upgrade_validate_ancestor_scan
+upgrade_validate_root_attributes:
+  System::Call 'kernel32::GetFileAttributesW(w "$R6") i.R9'
+  IntCmp $R9 -1 upgrade_validate_path_invalid upgrade_validate_root_attributes_read upgrade_validate_root_attributes_read
+upgrade_validate_root_attributes_read:
+  IntOp $R4 $R9 & 0x10
+  IntCmp $R4 0 upgrade_validate_path_invalid upgrade_validate_root_reparse upgrade_validate_root_reparse
+upgrade_validate_root_reparse:
+  IntOp $R4 $R9 & 0x400
+  IntCmp $R4 0 upgrade_validate_root_prefix upgrade_validate_path_invalid upgrade_validate_path_invalid
+upgrade_validate_root_prefix:
+  StrLen $R7 $R6
+  StrCpy $R8 $RelativePathFull $R7
+  StrCmp $R8 $R6 0 upgrade_validate_path_invalid
+  StrCpy $R8 $RelativePathFull 1 $R7
+  StrCmp $R8 "\" 0 upgrade_validate_path_invalid
+
+  ; Existing intermediate directories and leaves must not be junctions or symlinks.
+  StrCpy $R2 "0"
+  StrLen $R3 $R1
+upgrade_validate_parent_scan:
+  IntCmp $R2 $R3 upgrade_validate_leaf_attributes upgrade_validate_parent_scan_char upgrade_validate_parent_scan_char
+upgrade_validate_parent_scan_char:
+  StrCpy $R4 $R1 1 $R2
+  StrCmp $R4 "\" upgrade_validate_parent_check
+  IntOp $R2 $R2 + 1
+  Goto upgrade_validate_parent_scan
+upgrade_validate_parent_check:
+  StrCpy $R8 $R1 $R2
+  StrCpy $R9 "$R6\$R8"
+  System::Call 'kernel32::GetFileAttributesW(w "$R9") i.R5'
+  IntCmp $R5 -1 upgrade_validate_parent_skip upgrade_validate_parent_attributes_read upgrade_validate_parent_attributes_read
+upgrade_validate_parent_attributes_read:
+  IntOp $R4 $R5 & 0x10
+  IntCmp $R4 0 upgrade_validate_path_invalid upgrade_validate_parent_reparse upgrade_validate_parent_reparse
+upgrade_validate_parent_reparse:
+  IntOp $R4 $R5 & 0x400
+  IntCmp $R4 0 upgrade_validate_parent_skip upgrade_validate_path_invalid upgrade_validate_path_invalid
+upgrade_validate_parent_skip:
+  IntOp $R2 $R2 + 1
+  Goto upgrade_validate_parent_scan
+upgrade_validate_leaf_attributes:
+  System::Call 'kernel32::GetFileAttributesW(w "$RelativePathFull") i.R9'
+  IntCmp $R9 -1 upgrade_validate_path_valid upgrade_validate_leaf_attributes_read upgrade_validate_leaf_attributes_read
+upgrade_validate_leaf_attributes_read:
+  IntOp $R4 $R9 & 0x400
+  IntCmp $R4 0 upgrade_validate_path_valid upgrade_validate_path_invalid upgrade_validate_path_invalid
+upgrade_validate_path_valid:
+  StrCpy $RelativePathValid "1"
+  Return
+upgrade_validate_path_invalid:
+  StrCpy $RelativePathValid "0"
+FunctionEnd
+
+Function RemoveObsoleteInstalledFiles
+  ${If} $IsInstalled != "1"
+    Return
+  ${EndIf}
+  Push $R0
+  Push $R1
+  Push $R2
+  Push $R3
+  Push $R4
+  Push $R5
+  Push $R6
+  Push $R7
+  Push $R8
+  Push $R9
+
+  ClearErrors
+  FileOpen $PreviousManifestHandle "$PreviousInstallDirectory\installed-files.txt" r
+  IfErrors upgrade_obsolete_files_open_failed
+upgrade_obsolete_files_loop:
+  ClearErrors
+  FileRead $PreviousManifestHandle $ManifestSearchPath
+  IfErrors upgrade_obsolete_files_done
+  ${StrRep} $ManifestSearchPath $ManifestSearchPath "$\r" ""
+  ${StrRep} $ManifestSearchPath $ManifestSearchPath "$\n" ""
+  StrCmp $ManifestSearchPath "" upgrade_obsolete_files_loop
+
+  StrCpy $R1 $ManifestSearchPath
+  Call ValidatePreviousInstallRelativePath
+  StrCmp $RelativePathValid "1" 0 upgrade_obsolete_files_invalid_path
+  StrCpy $ManifestSearchFile $NewInstalledFilesManifest
+  Call ManifestContainsPath
+  StrCmp $ManifestPathFound "-1" upgrade_obsolete_files_new_manifest_failed
+  StrCmp $ManifestPathFound "1" upgrade_obsolete_files_loop
+
+  System::Call 'kernel32::GetFileAttributesW(w "$RelativePathFull") i.R9'
+  IntCmp $R9 -1 upgrade_obsolete_files_loop upgrade_obsolete_file_attributes upgrade_obsolete_file_attributes
+upgrade_obsolete_file_attributes:
+  IntOp $R8 $R9 & 0x10
+  IntCmp $R8 0 upgrade_obsolete_file_delete upgrade_obsolete_files_loop upgrade_obsolete_files_loop
+upgrade_obsolete_file_delete:
+  SetFileAttributes "$RelativePathFull" NORMAL
+  ClearErrors
+  Delete /REBOOTOK "$RelativePathFull"
+  IfErrors upgrade_obsolete_files_delete_failed
+  Goto upgrade_obsolete_files_loop
+
+upgrade_obsolete_files_done:
+  FileClose $PreviousManifestHandle
+  Call RemoveObsoleteInstalledDirectories
+  Goto upgrade_obsolete_files_restore
+upgrade_obsolete_files_open_failed:
+  MessageBox MB_OK|MB_ICONSTOP "无法读取旧版安装文件清单；为保护其他文件，升级已停止。"
+  SetErrorLevel 1
+  Abort
+upgrade_obsolete_files_invalid_path:
+  FileClose $PreviousManifestHandle
+  MessageBox MB_OK|MB_ICONSTOP "旧版安装文件清单包含越界路径或重解析路径；为保护其他文件，升级已停止。"
+  SetErrorLevel 1
+  Abort
+upgrade_obsolete_files_new_manifest_failed:
+  FileClose $PreviousManifestHandle
+  MessageBox MB_OK|MB_ICONSTOP "无法读取新版安装文件清单；为保护其他文件，升级已停止。"
+  SetErrorLevel 1
+  Abort
+upgrade_obsolete_files_delete_failed:
+  FileClose $PreviousManifestHandle
+  MessageBox MB_OK|MB_ICONSTOP "无法清理旧版文件：$RelativePathFull。请检查权限或文件占用后重试。"
+  SetErrorLevel 1
+  Abort
+upgrade_obsolete_files_restore:
+  Pop $R9
+  Pop $R8
+  Pop $R7
+  Pop $R6
+  Pop $R5
+  Pop $R4
+  Pop $R3
+  Pop $R2
+  Pop $R1
+  Pop $R0
+FunctionEnd
+
+Function RemoveObsoleteInstalledDirectories
+  Push $R0
+  Push $R1
+  Push $R2
+  Push $R3
+  Push $R4
+  Push $R5
+  Push $R6
+  Push $R7
+  Push $R8
+  Push $R9
+  ClearErrors
+  FileOpen $PreviousManifestHandle "$PreviousInstallDirectory\installed-directories.txt" r
+  IfErrors upgrade_obsolete_directories_open_failed
+upgrade_obsolete_directories_loop:
+  ClearErrors
+  FileRead $PreviousManifestHandle $ManifestSearchPath
+  IfErrors upgrade_obsolete_directories_done
+  ${StrRep} $ManifestSearchPath $ManifestSearchPath "$\r" ""
+  ${StrRep} $ManifestSearchPath $ManifestSearchPath "$\n" ""
+  StrCmp $ManifestSearchPath "" upgrade_obsolete_directories_loop
+
+  StrCpy $R1 $ManifestSearchPath
+  Call ValidatePreviousInstallRelativePath
+  StrCmp $RelativePathValid "1" 0 upgrade_obsolete_directories_invalid_path
+  StrCpy $ManifestSearchFile $NewInstalledDirectoriesManifest
+  Call ManifestContainsPath
+  StrCmp $ManifestPathFound "-1" upgrade_obsolete_directories_new_manifest_failed
+  StrCmp $ManifestPathFound "1" upgrade_obsolete_directories_loop
+
+  System::Call 'kernel32::GetFileAttributesW(w "$RelativePathFull") i.R9'
+  IntCmp $R9 -1 upgrade_obsolete_directories_loop upgrade_obsolete_directory_attributes upgrade_obsolete_directory_attributes
+upgrade_obsolete_directory_attributes:
+  IntOp $R8 $R9 & 0x10
+  IntCmp $R8 0 upgrade_obsolete_directories_loop upgrade_obsolete_directory_remove upgrade_obsolete_directory_remove
+upgrade_obsolete_directory_remove:
+  ClearErrors
+  RMDir /REBOOTOK "$RelativePathFull"
+  ClearErrors
+  Goto upgrade_obsolete_directories_loop
+
+upgrade_obsolete_directories_done:
+  FileClose $PreviousManifestHandle
+  Goto upgrade_obsolete_directories_restore
+upgrade_obsolete_directories_open_failed:
+  MessageBox MB_OK|MB_ICONSTOP "无法读取旧版安装目录清单；为保护其他文件，升级已停止。"
+  SetErrorLevel 1
+  Abort
+upgrade_obsolete_directories_invalid_path:
+  FileClose $PreviousManifestHandle
+  MessageBox MB_OK|MB_ICONSTOP "旧版安装目录清单包含越界路径或重解析路径；为保护其他文件，升级已停止。"
+  SetErrorLevel 1
+  Abort
+upgrade_obsolete_directories_new_manifest_failed:
+  FileClose $PreviousManifestHandle
+  MessageBox MB_OK|MB_ICONSTOP "无法读取新版安装目录清单；为保护其他文件，升级已停止。"
+  SetErrorLevel 1
+  Abort
+upgrade_obsolete_directories_restore:
+  Pop $R9
+  Pop $R8
+  Pop $R7
+  Pop $R6
+  Pop $R5
+  Pop $R4
+  Pop $R3
+  Pop $R2
+  Pop $R1
+  Pop $R0
+FunctionEnd
+
 Function RemoveLegacyUninstallerArtifacts
   ; Remove only the exact product-owned paths from the previous installer generation.
   IfFileExists "$R5\uninstall-core.exe" 0 remove_legacy_file_list
@@ -1604,6 +1921,8 @@ Section "Install"
   SetOutPath "$PLUGINSDIR"
   File /oname=installed-files.new.txt "${INSTALLED_FILES_PATH}"
   File /oname=installed-directories.new.txt "${INSTALLED_DIRECTORIES_PATH}"
+  StrCpy $NewInstalledFilesManifest "$PLUGINSDIR\installed-files.new.txt"
+  StrCpy $NewInstalledDirectoriesManifest "$PLUGINSDIR\installed-directories.new.txt"
   Call AddExistingShortcutIconsToManifest
   ${If} $R9 != "0"
     MessageBox MB_OK|MB_ICONSTOP "无法保留旧版快捷方式图标清单，安装已停止。"
@@ -1662,6 +1981,7 @@ install_shell_file_same:
   SetOutPath "$INSTDIR"
   File /oname=${SHELL_EXTENSION_FILE_NAME} "${SHELL_EXTENSION_PATH}"
 install_shell_file_done:
+  Call RemoveObsoleteInstalledFiles
   Delete "$INSTDIR\${PRODUCT_IDENTIFIER}.pri"
   WriteUninstaller "$INSTDIR\uninstall.exe"
   CopyFiles /SILENT "$PLUGINSDIR\installed-files.new.txt" "$INSTDIR\installed-files.txt"

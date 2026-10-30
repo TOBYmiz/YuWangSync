@@ -2,7 +2,7 @@
 
 ## 构建
 
-需要 .NET 10 SDK、NSIS 3.x、Visual Studio 2022 的 C++ x64 工具、ATL v143 和 Windows SDK。输出名为 `YuWangCloudSync.exe`或 `YuWangCloudSync_WinAppSDK_Required.exe`，组件版本号定义在 `src/Directory.Build.props` 。
+需要 .NET 10 SDK、NSIS 3.x、Visual Studio 2022 的 C++ x64 工具、ATL v143 和 Windows SDK。输出名为 `YuWangCloudSync.exe`或 `YuWangCloudSync_WinAppSDK_Required.exe`，采用自包含 NativeAOT 发布，组件版本号定义在 `src/Directory.Build.props` 。
 
 ```powershell
 # 主版本
@@ -21,6 +21,7 @@ powershell -ExecutionPolicy Bypass -File .\tools\Build-Setup-All.ps1
 | -------------------------------------- | ------------------------------------------------------------------------------------------------ |
 | （无）                                 | GUI 模式                                                                                         |
 | `--console`                            | 控制台模式：控制台呈现日志与验证码输入                                                           |
+| `--about`| 启动时开启关于页，用于应用内更新后|
 | `--quiet`                              | 静默模式：无 UI 、控制台，仅文件日志；无有效会话直接退出                                         |
 | `--open-folder` / `-open-folder`       | 启动同步并打开同步目录；同步已运行时仅打开目录                                                   |
 | `--stop`                               | 请求运行中的同步进程退出并等待结束，无进程时直接返回                                             |
@@ -102,7 +103,7 @@ src/YuWangCloudSync/
 
 ## 技术栈
 
-C# .NET 10 x64（net10.0-windows10.0.19041.0，unpackaged WinUI 3 / Win32）· Windows App SDK 2.5.1（Windows App Runtime 随载荷部署子集）· Vanara.PInvoke.CldApi 5.0.7 · HttpClient · Microsoft.Data.Sqlite · Serilog · H.NotifyIcon
+C# .NET 10 x64（net10.0-windows10.0.19041.0，unpackaged WinUI 3 / Win32）· Windows App SDK 2.5.1（Windows App Runtime 主版本随载荷部署子集）· Vanara.PInvoke.CldApi 5.0.7 · HttpClient · Microsoft.Data.Sqlite · Serilog · H.NotifyIcon
 
 ## 已知约束
 

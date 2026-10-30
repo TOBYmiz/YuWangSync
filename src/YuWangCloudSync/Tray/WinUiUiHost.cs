@@ -311,14 +311,14 @@ internal static class WinUiUiHost
     }
 
     internal static async Task<IReadOnlyList<UiSelfTestCheck>> RunSelfTestAsync(
-        string captchaPath, string testRoot, int holdSeconds, bool saveShots)
+        string captchaPath, string testRoot, int holdSeconds, bool saveShots, bool probeFolderPicker)
     {
         var completion = new TaskCompletionSource<IReadOnlyList<UiSelfTestCheck>>(
             TaskCreationOptions.RunContinuationsAsynchronously);
         if (!Post(async () =>
             {
                 try { completion.TrySetResult(await RunSelfTestOnUiAsync(captchaPath, testRoot,
-                    holdSeconds, saveShots)); }
+                    holdSeconds, saveShots, probeFolderPicker)); }
                 catch (Exception error)
                 {
                     completion.TrySetResult([new UiSelfTestCheck("WinUI UI host", false, error.ToString())]);
@@ -330,8 +330,21 @@ internal static class WinUiUiHost
         return await completion.Task.ConfigureAwait(false);
     }
 
+    private static async Task<bool> CloseFolderPickerProbeAsync(string title)
+    {
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(10);
+        while (DateTime.UtcNow < deadline)
+        {
+            var dialog = FindWindowW(null, title);
+            if (dialog != IntPtr.Zero)
+                return PostMessageW(dialog, 0x0010, IntPtr.Zero, IntPtr.Zero); // WM_CLOSE
+            await Task.Delay(50).ConfigureAwait(false);
+        }
+        return false;
+    }
+
     private static async Task<IReadOnlyList<UiSelfTestCheck>> RunSelfTestOnUiAsync(
-        string captchaPath, string testRoot, int holdSeconds, bool saveShots)
+        string captchaPath, string testRoot, int holdSeconds, bool saveShots, bool probeFolderPicker)
     {
         var checks = new List<UiSelfTestCheck>();
         void Check(string name, bool passed, string detail) => checks.Add(new(name, passed, detail));
@@ -378,6 +391,15 @@ internal static class WinUiUiHost
         Check("Settings single instance", ReferenceEquals(settings, duplicate), "Repeated request activates the existing settings window.");
         Check("Settings validation", settings.ValidateForSelfTest(),
             "Invalid TypeId is rejected by the same value validation used before applying settings.");
+        if (probeFolderPicker)
+        {
+            const string title = "YuWangCloudSync NativeAOT folder picker probe";
+            var closeDialogTask = CloseFolderPickerProbeAsync(title);
+            var pickedFolder = await FolderPicker.PickAsync(settingsHandle, title, testRoot);
+            var dialogShown = await closeDialogTask.ConfigureAwait(true);
+            Check("Folder picker COM dialog", dialogShown && string.IsNullOrEmpty(pickedFolder),
+                $"DialogShown={dialogShown}; selection is empty after the probe cancels it: {string.IsNullOrEmpty(pickedFolder)}.");
+        }
         checks.AddRange(await CheckSystemControlStylesAsync(settings.Root));
         ShowWindow(settingsHandle, 6); // SW_MINIMIZE
         await Task.Delay(120);
@@ -708,4 +730,11 @@ internal static class WinUiUiHost
     private static extern bool SetForegroundWindow(IntPtr window);
     [DllImport("user32.dll")]
     private static extern bool ShowWindow(IntPtr window, int command);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, ExactSpelling = true)]
+    private static extern IntPtr FindWindowW(string? className, string? windowName);
+
+    [DllImport("user32.dll", ExactSpelling = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool PostMessageW(IntPtr window, uint message, IntPtr wParam, IntPtr lParam);
 }

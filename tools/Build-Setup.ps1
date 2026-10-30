@@ -95,7 +95,10 @@ try {
     # GenerateDepsFile writes into OutDir before every project reference has
     # necessarily created it, so prepare the shared custom output directory first.
     [System.IO.Directory]::CreateDirectory($mainBuildOutput) | Out-Null
-    Invoke-Checked 'dotnet' @('publish', (Join-Path $repository 'src\YuWangCloudSync\YuWangCloudSync.csproj'), '-c', 'Release', '-r', 'win-x64', '--no-self-contained', ('-p:ProductVersion=' + $version), '-p:WindowsAppSDKSelfContained=true', '-p:DebugType=None', '-p:DebugSymbols=false', ('-p:OutDir=' + $mainBuildOutput + '\'), '-o', $publish)
+    Invoke-Checked 'dotnet' @('publish', (Join-Path $repository 'src\YuWangCloudSync\YuWangCloudSync.csproj'), '-c', 'Release', '-r', 'win-x64', '--self-contained', 'true', '-p:PublishAot=true', '-p:PublishTrimmed=true', ('-p:ProductVersion=' + $version), '-p:WindowsAppSDKSelfContained=true', '-p:DebugType=None', '-p:DebugSymbols=false', ('-p:OutDir=' + $mainBuildOutput + '\'), '-o', $publish)
+    & (Join-Path $PSScriptRoot 'Copy-DotNetRuntimeNotices.ps1') `
+        -ProjectAssetsFile (Join-Path $appProject 'obj\project.assets.json') `
+        -PublishDirectory $publish
 
     # Version the shortcut icon path so Explorer can use a fresh icon-cache key after updates.
     $shortcutIconSource = Join-Path $publish 'Assets\yw_tray.ico'
@@ -200,6 +203,10 @@ try {
         'Microsoft.WindowsAppRuntime.Bootstrap.dll'
         'Microsoft.ui.xaml.dll'
         'Microsoft.UI.Xaml.Controls.dll'
+        # Microsoft.UI.Windowing.Core.dll imports CoreMessagingXP.dll; without it, loading
+        # Microsoft.ui.xaml.dll fails with DllNotFoundException during XamlCheckProcessRequirements.
+        'Microsoft.UI.Windowing.Core.dll'
+        'CoreMessagingXP.dll'
         'Microsoft.UI.Xaml.Controls.pri'
         'Microsoft.UI.pri'
         'Microsoft.ui.xaml.resources.19h1.dll'

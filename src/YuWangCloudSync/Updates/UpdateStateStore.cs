@@ -13,12 +13,10 @@ internal sealed record PersistedUpdateState(
 
 internal static class UpdateStateStore
 {
-    private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
-
     internal static PersistedUpdateState? Read(string path)
     {
         if (!File.Exists(path)) return null;
-        return JsonSerializer.Deserialize<PersistedUpdateState>(File.ReadAllText(path), JsonOptions);
+        return JsonSerializer.Deserialize(File.ReadAllText(path), AppJsonSerializerContext.Default.PersistedUpdateState);
     }
 
     internal static void Write(string path, PersistedUpdateState state)
@@ -30,7 +28,7 @@ internal static class UpdateStateStore
         var temporaryPath = fullPath + ".tmp-" + Guid.NewGuid().ToString("N");
         try
         {
-            File.WriteAllText(temporaryPath, JsonSerializer.Serialize(state, JsonOptions));
+            File.WriteAllText(temporaryPath, JsonSerializer.Serialize(state, AppJsonSerializerContext.Default.PersistedUpdateState));
             File.Move(temporaryPath, fullPath, overwrite: true);
         }
         catch

@@ -10,7 +10,7 @@ dotnet list src/YuWangCloudSync/YuWangCloudSync.csproj package --include-transit
 
 | NuGet 包 | 版本 | 用途 | 上游 / 许可证 | 备注 |
 | --- | --- | --- | --- | --- |
-| Microsoft.WindowsAppSDK | 2.5.1 | WinUI 3 窗口、控件和 Windows App Runtime | [Microsoft/WindowsAppSDK](https://github.com/microsoft/WindowsAppSDK) / NuGet 包内 `license.txt`、`NOTICE.txt` | `WindowsAppSDKSelfContained=true`；Windows App Runtime 随应用本地部署，.NET 仍为 framework-dependent。 |
+| Microsoft.WindowsAppSDK | 2.5.1 | WinUI 3 窗口、控件和 Windows App Runtime | [Microsoft/WindowsAppSDK](https://github.com/microsoft/WindowsAppSDK) / NuGet 包内 `license.txt`、`NOTICE.txt` | 标准变体将 Windows App Runtime 随应用本地部署；Required 变体使用目标机已安装版本。主程序以 NativeAOT self-contained 发布。 |
 | Vanara.PInvoke.CldApi | 5.0.7 | Cloud Files API P/Invoke | [dahall/Vanara](https://github.com/dahall/Vanara) / MIT | Core 与主程序都引用。 |
 | Microsoft.Data.Sqlite | 8.0.8 | SQLite 元数据缓存 | [dotnet/efcore](https://github.com/dotnet/efcore) / MIT | 依赖 Microsoft.Data.Sqlite.Core 和 SQLitePCLRaw，见传递依赖。 |
 | Serilog | 4.0.1 | 结构化日志 | [serilog/serilog](https://github.com/serilog/serilog) / Apache-2.0 |  |
@@ -73,6 +73,10 @@ dotnet list src/YuWangCloudSync/YuWangCloudSync.csproj package --include-transit
 | --- | --- | --- | --- |
 | Microsoft.Windows.SDK.BuildTools | 10.0.26100.4654 | [Microsoft Windows SDK 许可条款](https://aka.ms/WinSDKLicenseURL) | Microsoft.WindowsAppSDK.Base；构建工具 |
 | Microsoft.Windows.SDK.BuildTools.MSIX | 1.7.251221100 | NuGet 元数据声明包内 `sdk_license.txt`，项目页指向 [Microsoft Windows SDK](https://developer.microsoft.com/en-us/windows/downloads/windows-sdk/) | Microsoft.WindowsAppSDK.Base；MSIX 构建工具 |
+
+## 随应用分发的 .NET Runtime
+
+主程序以 self-contained NativeAOT 发布。构建脚本从已还原的 `Microsoft.NETCore.App.Runtime.win-x64` runtime pack 中，将 `LICENSE.TXT` 和 `THIRD-PARTY-NOTICES.TXT` 复制到载荷的 `licenses\dotnet-runtime` 目录；Runtime 包许可证为 MIT，版本由 .NET 10 SDK 选择。
 
 这两个包是还原图中的构建工具，不是应用开源库；发行时是否需要随包分发，按实际发布内容和各自许可条款判断。
 

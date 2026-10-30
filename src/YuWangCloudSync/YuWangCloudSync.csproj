@@ -16,7 +16,7 @@
     <ProjectPriFileName>resources.pri</ProjectPriFileName>
     <!-- Program owns the app entry point so the existing engine can retain its class name. -->
     <DefineConstants>$(DefineConstants);DISABLE_XAML_GENERATED_MAIN</DefineConstants>
-    <!-- .NET 仍使用 framework-dependent；Windows App Runtime 随应用本地部署。 -->
+    <!-- IDE dotnet build defaults to framework-dependent; installer scripts publish self-contained NativeAOT. -->
     <WindowsAppSDKSelfContained>true</WindowsAppSDKSelfContained>
     <!-- RuntimeIdentifier=win-x64 已锁定 x64 目标（输出在 .../win-x64/ 下）。
          不再设置 <Platforms>、也不在构建命令里传 -p:Platform=x64，否则会多生成一层 bin/x64/ 段，

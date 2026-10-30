@@ -1,6 +1,7 @@
 using System.Net;
 using System.Net.Http.Headers;
 using System.Text;
+using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
 using YuWangCloudSync.Core;
 using YuWangCloudSync.Crypto;
@@ -993,10 +994,9 @@ public sealed class YuWangClient : IDisposable
         try
         {
             if (string.IsNullOrEmpty(_jsessionid)) return;
-            var json = System.Text.Json.JsonSerializer.Serialize(new[]
-            {
-                new { name = "JSESSIONID", value = _jsessionid, domain = new Uri(Server).Host, path = "/" }
-            });
+            var json = System.Text.Json.JsonSerializer.Serialize(
+                new[] { new SessionCookie("JSESSIONID", _jsessionid, new Uri(Server).Host, "/") },
+                AppJsonSerializerContext.Default.SessionCookieArray);
             File.WriteAllText(cookiesJsonPath, json);
         }
         catch { /* 存盘失败不影响运行 */ }
@@ -1004,3 +1004,9 @@ public sealed class YuWangClient : IDisposable
 
     public void Dispose() => _http.Dispose();
 }
+
+internal sealed record SessionCookie(
+    [property: JsonPropertyName("name")] string Name,
+    [property: JsonPropertyName("value")] string Value,
+    [property: JsonPropertyName("domain")] string Domain,
+    [property: JsonPropertyName("path")] string Path);

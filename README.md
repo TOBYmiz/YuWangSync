@@ -5,8 +5,6 @@
 
 > 把局域网"育网云"资源库挂载进 Windows 资源管理器的同步引擎。
 
-> 使用本应用，需要安装 .NET 10 Runtime x64。未安装时，启动安装程序会提示安装。
-
 >开发信息见 [DEVELOP.md](DEVELOP.md)。
 ## 功能特性
 
@@ -21,7 +19,7 @@
 - **隐私保护**：手机号账户名隐藏中间四位
 ## 快速开始
 
-要求：Windows 10 19041+ x64，安装 .NET 10 Runtime x64。主版本内置来自 Windows App Runtime 的必要文件。
+要求：Windows 10 19041+ x64。内置来自 .NET 10 Runtime 的必要文件，主版本也含 Windows App Runtime 依赖。
 
 前往 [Release 页面](https://github.com/TOBYmiz/YuWangSync/releases/latest)，下载最新版本安装包。如果已安装 Windows App Runtime 2.5.1+（对应 Windows App SDK 2.5.1+），可以使用 `WinAppSDK_Required` 版本。安装后资源管理器导航窗格出现"育网云"，双击占位文件自动下载并打开。
 

@@ -78,7 +78,7 @@ try {
     Invoke-Checked $MSBuildPath @((Join-Path $repository 'src\YuWangCloudSync.ShellExt\YuWangCloudSync.ShellExt.vcxproj'), '/p:Configuration=Release', '/p:Platform=x64', ('/p:ProductVersion=' + $version), '/nologo')
 
     # A prior packaged or differently configured WinUI build can leave an incompatible
-    # PRI/XBF set in obj. Generate this unpackaged, framework-dependent build's own
+    # PRI/XBF set in obj. Generate this unpackaged, self-contained NativeAOT build's own
     # application resource index instead of reusing those intermediates.
     $appProject = [System.IO.Path]::GetFullPath((Join-Path $repository 'src\YuWangCloudSync'))
     $appIntermediate = [System.IO.Path]::GetFullPath((Join-Path $appProject 'obj'))
@@ -93,12 +93,16 @@ try {
     }
 
     # Require the machine-wide Windows App Runtime instead of copying its framework
-    # payload next to the app. The bootstrapper NuGet asset may still be needed to
-    # activate that installed runtime for this unpackaged WinUI application.
+    # payload next to the app. .NET itself is published self-contained with NativeAOT.
+    # The bootstrapper NuGet asset may still be needed to activate the installed
+    # Windows App Runtime for this unpackaged WinUI application.
     # GenerateDepsFile writes into OutDir before every project reference has
     # necessarily created it, so prepare the shared custom output directory first.
     [System.IO.Directory]::CreateDirectory($mainBuildOutput) | Out-Null
-    Invoke-Checked 'dotnet' @('publish', (Join-Path $repository 'src\YuWangCloudSync\YuWangCloudSync.csproj'), '-c', 'Release', '-r', 'win-x64', '--no-self-contained', ('-p:ProductVersion=' + $version), '-p:WindowsAppSDKSelfContained=false', '-p:DebugType=None', '-p:DebugSymbols=false', ('-p:OutDir=' + $mainBuildOutput + '\'), '-o', $publish)
+    Invoke-Checked 'dotnet' @('publish', (Join-Path $repository 'src\YuWangCloudSync\YuWangCloudSync.csproj'), '-c', 'Release', '-r', 'win-x64', '--self-contained', 'true', '-p:PublishAot=true', '-p:PublishTrimmed=true', ('-p:ProductVersion=' + $version), '-p:WindowsAppSDKSelfContained=false', '-p:DebugType=None', '-p:DebugSymbols=false', ('-p:OutDir=' + $mainBuildOutput + '\'), '-o', $publish)
+    & (Join-Path $PSScriptRoot 'Copy-DotNetRuntimeNotices.ps1') `
+        -ProjectAssetsFile (Join-Path $appProject 'obj\project.assets.json') `
+        -PublishDirectory $publish
 
     # Version the shortcut icon path so Explorer can use a fresh icon-cache key after updates.
     $shortcutIconSource = Join-Path $publish 'Assets\yw_tray.ico'
@@ -116,8 +120,8 @@ try {
         }
     }
 
-    # The framework-dependent publish uses the machine-wide Windows App Runtime,
-    # so its WinUI MUI directories may be absent. When local MUI directories exist,
+    # The machine-wide Windows App Runtime supplies the WinUI framework resources;
+    # local MUI directories may be absent. When local MUI directories exist,
     # keep simplified Chinese and English and remove the other languages.
     $unselectedLanguageDirectories = @(Get-ChildItem -LiteralPath $publish -Directory | Where-Object {
         $_.Name -notin @('zh-CN', 'en-us') -and @(Get-ChildItem -LiteralPath $_.FullName -Filter '*.mui' -File).Count -gt 0
@@ -128,9 +132,9 @@ try {
     foreach ($directory in $unselectedLanguageDirectories) { Remove-Item -LiteralPath $directory.FullName -Recurse -Force }
     Write-Output ('裁剪 WinUI 非中文/英文资源目录：{0} 个文件，未压缩 {1:N2} MiB。' -f $languageFiles.Count, ($languageBytes / 1MB))
 
-    # A framework-dependent publish must not carry app-local Windows App Runtime
-    # files. Keep the small bootstrapper NuGet asset if the SDK emits it; it activates
-    # the separately installed framework and is not the runtime payload.
+    # This variant must not carry app-local Windows App Runtime files. Keep the small
+    # bootstrapper NuGet asset if the SDK emits it; it activates the separately
+    # installed framework. The native AOT executable carries the .NET runtime itself.
     $forbiddenRuntimeFiles = @(
         'Microsoft.WindowsAppRuntime.dll'
         'Microsoft.ui.xaml.dll'
@@ -146,7 +150,7 @@ try {
     $bundledRuntimeFiles = @(Get-ChildItem -LiteralPath $publish -Recurse -File | Where-Object { $_.Name -in $forbiddenRuntimeFiles })
     if ($bundledRuntimeFiles) {
         $bundledNames = ($bundledRuntimeFiles | ForEach-Object { $_.FullName.Substring($publish.Length + 1) }) -join ', '
-        throw "framework-dependent 发布意外包含本地 Windows App Runtime 文件：$bundledNames"
+        throw "Windows App Runtime Required 发布意外包含本地 Windows App Runtime 文件：$bundledNames"
     }
     $legacyUiAssemblies = Get-ChildItem -LiteralPath $publish -Recurse -File | Where-Object {
         $_.Name -in @('PresentationFramework.dll', 'PresentationCore.dll', 'WindowsBase.dll', 'System.Windows.Forms.dll', 'WindowsFormsIntegration.dll')
@@ -172,7 +176,7 @@ try {
         'installed-directories.txt', 'uninstall-core.exe', 'installed-files.json'))
     [System.IO.File]::WriteAllLines($installedFilesPath, $installedFiles, [System.Text.UTF8Encoding]::new($false))
     [System.IO.File]::WriteAllLines($installedDirectoriesPath, $payloadDirectories, [System.Text.UTF8Encoding]::new($false))
-    Write-Output ('Windows App Runtime 使用目标机已安装版本；应用文件：{0} 个，载荷：{1:N2} MiB。' -f
+    Write-Output ('Windows App Runtime 使用目标机已安装版本；.NET 使用 self-contained NativeAOT；应用文件：{0} 个，载荷：{1:N2} MiB。' -f
         ($payloadFiles.Count + 1), ($payloadFileBytes / 1MB))
 
     $nsisSource = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot 'nsis\Setup.nsi'))
