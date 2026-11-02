@@ -82,7 +82,7 @@ internal sealed class AboutWindow : Window
         _updateButton = new Button
         {
             Content = _updateVisual.Content,
-            Style = (Style)Application.Current.Resources["DefaultButtonStyle"],
+            Style = WinUiUiHost.GetStyleResource("DefaultButtonStyle"),
             MinWidth = 88,
             HorizontalAlignment = HorizontalAlignment.Right,
             Visibility = Visibility.Visible,
@@ -141,13 +141,13 @@ internal sealed class AboutWindow : Window
         panel.Children.Add(new TextBlock
         {
             Text = ProductIdentity.DisplayNameZh,
-            Style = (Style)Application.Current.Resources["TitleTextBlockStyle"],
+            Style = WinUiUiHost.GetStyleResource("TitleTextBlockStyle"),
             HorizontalAlignment = HorizontalAlignment.Center,
         });
         panel.Children.Add(new TextBlock
         {
             Text = ProductIdentity.DisplayNameEn,
-            Style = (Style)Application.Current.Resources["YuWangCaptionTextBlockStyle"],
+            Style = WinUiUiHost.GetStyleResource("YuWangCaptionTextBlockStyle"),
             HorizontalAlignment = HorizontalAlignment.Center,
         });
         return panel;
@@ -166,11 +166,11 @@ internal sealed class AboutWindow : Window
         card.Children.Add(new TextBlock
         {
             Text = "应用信息",
-            Style = (Style)Application.Current.Resources["SubtitleTextBlockStyle"],
+            Style = WinUiUiHost.GetStyleResource("SubtitleTextBlockStyle"),
         });
         card.Children.Add(new Border
         {
-            Style = (Style)Application.Current.Resources["YuWangCardStyle"],
+            Style = WinUiUiHost.GetStyleResource("YuWangCardStyle"),
             Child = details,
         });
         return card;
@@ -182,16 +182,16 @@ internal sealed class AboutWindow : Window
         card.Children.Add(new TextBlock
         {
             Text = "关于此应用",
-            Style = (Style)Application.Current.Resources["SubtitleTextBlockStyle"],
+            Style = WinUiUiHost.GetStyleResource("SubtitleTextBlockStyle"),
         });
         card.Children.Add(new Border
         {
-            Style = (Style)Application.Current.Resources["YuWangCardStyle"],
+            Style = WinUiUiHost.GetStyleResource("YuWangCardStyle"),
             Child = new TextBlock
             {
                 Text = "将育网云盘目录接入 Windows 文件资源管理器，按需获取云端文件。",
                 TextWrapping = TextWrapping.Wrap,
-                Style = (Style)Application.Current.Resources["YuWangCaptionTextBlockStyle"],
+                Style = WinUiUiHost.GetStyleResource("YuWangCaptionTextBlockStyle"),
             },
         });
         return card;
@@ -213,7 +213,7 @@ internal sealed class AboutWindow : Window
             {
                 Text = entry.License,
                 TextWrapping = TextWrapping.Wrap,
-                Style = (Style)Application.Current.Resources["YuWangCaptionTextBlockStyle"],
+                Style = WinUiUiHost.GetStyleResource("YuWangCaptionTextBlockStyle"),
             });
             entries.Children.Add(new Border
             {
@@ -228,11 +228,11 @@ internal sealed class AboutWindow : Window
         card.Children.Add(new TextBlock
         {
             Text = "开源许可",
-            Style = (Style)Application.Current.Resources["SubtitleTextBlockStyle"],
+            Style = WinUiUiHost.GetStyleResource("SubtitleTextBlockStyle"),
         });
         card.Children.Add(new Border
         {
-            Style = (Style)Application.Current.Resources["YuWangCardStyle"],
+            Style = WinUiUiHost.GetStyleResource("YuWangCardStyle"),
             Child = entries,
         });
         return card;
@@ -247,7 +247,7 @@ internal sealed class AboutWindow : Window
         {
             Text = label,
             VerticalAlignment = VerticalAlignment.Center,
-            Style = (Style)Application.Current.Resources["YuWangCaptionTextBlockStyle"],
+            Style = WinUiUiHost.GetStyleResource("YuWangCaptionTextBlockStyle"),
         });
         var valueText = new TextBlock
         {
@@ -268,7 +268,7 @@ internal sealed class AboutWindow : Window
         {
             Text = "开源仓库",
             VerticalAlignment = VerticalAlignment.Center,
-            Style = (Style)Application.Current.Resources["YuWangCaptionTextBlockStyle"],
+            Style = WinUiUiHost.GetStyleResource("YuWangCaptionTextBlockStyle"),
         });
 
         var linkText = new TextBlock
@@ -277,7 +277,7 @@ internal sealed class AboutWindow : Window
             TextWrapping = TextWrapping.Wrap,
             TextAlignment = TextAlignment.Right,
             MaxWidth = 330,
-            Foreground = (Brush)Application.Current.Resources["TextFillColorPrimaryBrush"],
+            Foreground = WinUiUiHost.GetBrushResource("TextFillColorPrimaryBrush"),
         };
         var link = new HyperlinkButton
         {
@@ -292,12 +292,12 @@ internal sealed class AboutWindow : Window
         };
         link.PointerEntered += (_, _) =>
         {
-            linkText.Foreground = (Brush)Application.Current.Resources["AccentTextFillColorPrimaryBrush"];
+            linkText.Foreground = WinUiUiHost.GetBrushResource("AccentTextFillColorPrimaryBrush");
             linkText.TextDecorations = Windows.UI.Text.TextDecorations.Underline;
         };
         link.PointerExited += (_, _) =>
         {
-            linkText.Foreground = (Brush)Application.Current.Resources["TextFillColorPrimaryBrush"];
+            linkText.Foreground = WinUiUiHost.GetBrushResource("TextFillColorPrimaryBrush");
             linkText.TextDecorations = Windows.UI.Text.TextDecorations.None;
         };
         Grid.SetColumn(link, 1);
@@ -310,7 +310,7 @@ internal sealed class AboutWindow : Window
         panel.Children.Add(new Border
         {
             Height = 1,
-            Background = (Microsoft.UI.Xaml.Media.Brush)Application.Current.Resources["CardStrokeColorDefaultBrush"],
+            Background = WinUiUiHost.GetBrushResource("CardStrokeColorDefaultBrush"),
         });
     }
 
@@ -378,8 +378,8 @@ internal sealed class AboutWindow : Window
         var canOpenReleaseDetails = state.IsAvailable
             && state.Activity is UpdateActivity.Connecting or UpdateActivity.Downloading or UpdateActivity.Launching;
         _updateButton.IsEnabled = state.Activity == UpdateActivity.Idle || canOpenReleaseDetails;
-        _updateButton.Style = (Style)Application.Current.Resources[
-            state.IsAvailable ? "AccentButtonStyle" : "DefaultButtonStyle"];
+        _updateButton.Style = WinUiUiHost.GetStyleResource(
+            state.IsAvailable ? "AccentButtonStyle" : "DefaultButtonStyle");
         _updateVisual.Percent.Text = state.DownloadPercent.ToString(System.Globalization.CultureInfo.InvariantCulture) + "%";
         _updateLabel.Text = state.Activity switch
         {
@@ -436,7 +436,7 @@ internal sealed class AboutWindow : Window
         _releaseDialogStatus = new TextBlock
         {
             TextWrapping = TextWrapping.Wrap,
-            Style = (Style)Application.Current.Resources["YuWangCaptionTextBlockStyle"],
+            Style = WinUiUiHost.GetStyleResource("YuWangCaptionTextBlockStyle"),
             Visibility = Visibility.Collapsed,
         };
 
@@ -445,7 +445,7 @@ internal sealed class AboutWindow : Window
         {
             Text = FormatReleaseSummary(release),
             TextWrapping = TextWrapping.Wrap,
-            Style = (Style)Application.Current.Resources["YuWangCaptionTextBlockStyle"],
+            Style = WinUiUiHost.GetStyleResource("YuWangCaptionTextBlockStyle"),
         });
         content.Children.Add(new ScrollViewer
         {
@@ -461,7 +461,7 @@ internal sealed class AboutWindow : Window
             Title = "发现新版本",
             Content = content,
             PrimaryButtonText = "更新",
-            PrimaryButtonStyle = (Style)Application.Current.Resources["AccentButtonStyle"],
+            PrimaryButtonStyle = WinUiUiHost.GetStyleResource("AccentButtonStyle"),
             CloseButtonText = "取消",
             DefaultButton = ContentDialogButton.Primary,
             XamlRoot = _root.XamlRoot,
@@ -493,7 +493,7 @@ internal sealed class AboutWindow : Window
         };
 
         _releaseDialog = dialog;
-        dialog.Style = Application.Current.Resources["DefaultContentDialogStyle"] as Style;
+        dialog.Style = WinUiUiHost.GetStyleResource("DefaultContentDialogStyle");
         try
         {
             await dialog.ShowAsync();
@@ -654,7 +654,7 @@ internal sealed class AboutWindow : Window
                 if (index < lines.Length) index++;
                 panel.Children.Add(new Border
                 {
-                    Style = (Style)Application.Current.Resources["YuWangCardStyle"],
+                    Style = WinUiUiHost.GetStyleResource("YuWangCardStyle"),
                     Child = new TextBlock
                     {
                         Text = string.Join(Environment.NewLine, codeLines),
@@ -689,7 +689,7 @@ internal sealed class AboutWindow : Window
                 panel.Children.Add(new Border
                 {
                     Height = 1,
-                    Background = (Brush)Application.Current.Resources["CardStrokeColorDefaultBrush"],
+                    Background = WinUiUiHost.GetBrushResource("CardStrokeColorDefaultBrush"),
                 });
                 index++;
                 continue;
@@ -856,7 +856,7 @@ internal sealed class AboutWindow : Window
                 FlushPlain();
                 var link = new Hyperlink
                 {
-                    Foreground = (Brush)Application.Current.Resources["AccentTextFillColorPrimaryBrush"],
+                    Foreground = WinUiUiHost.GetBrushResource("AccentTextFillColorPrimaryBrush"),
                 };
                 link.Click += (_, _) => OpenExternalLink(linkUri);
                 AppendMarkdownInlines(link.Inlines, label, depth + 1);
@@ -870,7 +870,7 @@ internal sealed class AboutWindow : Window
                 FlushPlain();
                 var link = new Hyperlink
                 {
-                    Foreground = (Brush)Application.Current.Resources["AccentTextFillColorPrimaryBrush"],
+                    Foreground = WinUiUiHost.GetBrushResource("AccentTextFillColorPrimaryBrush"),
                 };
                 link.Click += (_, _) => OpenExternalLink(bareLinkUri);
                 link.Inlines.Add(new Run { Text = bareLinkUri.AbsoluteUri });
@@ -998,7 +998,7 @@ internal sealed class AboutWindow : Window
             XamlRoot = _root.XamlRoot,
             RequestedTheme = _root.ActualTheme,
         };
-        dialog.Style = Application.Current.Resources["DefaultContentDialogStyle"] as Style;
+        dialog.Style = WinUiUiHost.GetStyleResource("DefaultContentDialogStyle");
         try { await dialog.ShowAsync(); }
         catch (Exception error) { Serilog.Log.Warning(error, "无法显示更新失败信息"); }
     }

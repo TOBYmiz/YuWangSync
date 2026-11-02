@@ -119,6 +119,8 @@ Var Server
 Var Username
 Var Password
 Var SyncRoot
+Var SyncRootRecoveryFailed
+Var SyncRootRecoveryPayloadExtracted
 Var CreateDesktopShortcut
 Var KeepDownloadedFiles
 Var KeepUserConfiguration
@@ -248,6 +250,8 @@ FunctionEnd
 
 Function .onInit
   StrCpy $QuickUpdateRequested "0"
+  StrCpy $SyncRootRecoveryFailed "0"
+  StrCpy $SyncRootRecoveryPayloadExtracted "0"
   ${GetParameters} $R0
   ${GetOptions} $R0 "-quick-update" $R1
   IfErrors quick_update_argument_missing
@@ -999,6 +1003,30 @@ FunctionEnd
 
 Function SyncRootPage
   !insertmacro SKIP_CONFIGURATION_PAGE
+  StrCpy $SyncRootRecoveryFailed "0"
+  SetOutPath "$PLUGINSDIR\syncroot-recovery"
+  ${If} $SyncRootRecoveryPayloadExtracted != "1"
+    File /r "${APP_PAYLOAD_DIRECTORY}\*"
+    StrCpy $SyncRootRecoveryPayloadExtracted "1"
+  ${EndIf}
+  nsExec::ExecToStack /TIMEOUT=180000 '"$PLUGINSDIR\syncroot-recovery\${PRODUCT_IDENTIFIER}.exe" --prepare-syncroot-for-setup --quiet'
+  Pop $R9
+  Pop $R8
+  ${If} $R9 != "0"
+    StrCpy $SyncRootRecoveryFailed "1"
+    MessageBox MB_OK|MB_ICONSTOP "无法处理残留同步目录注册，请重试安装。"
+  ${Else}
+    ReadRegStr $R0 HKCU "SOFTWARE\${PRODUCT_IDENTIFIER}\SetupRecovery" "SyncRootPath"
+    ${If} $R0 != ""
+      StrCpy $SyncRoot $R0
+    ${Else}
+      ReadRegDWORD $R0 HKCU "SOFTWARE\${PRODUCT_IDENTIFIER}\SetupRecovery" "SelectNewDirectory"
+      ${If} $R0 == "1"
+        StrCpy $SyncRoot ""
+      ${EndIf}
+    ${EndIf}
+    DeleteRegKey HKCU "SOFTWARE\${PRODUCT_IDENTIFIER}\SetupRecovery"
+  ${EndIf}
   !insertmacro MUI_HEADER_TEXT "选择同步目录与快捷方式" "选择同步根目录，需选择空目录。"
   nsDialogs::Create 1018
   Pop $PageDialog
@@ -1029,6 +1057,9 @@ Function BrowseSyncRoot
 FunctionEnd
 
 Function SyncRootPageLeave
+  ${If} $SyncRootRecoveryFailed == "1"
+    Abort
+  ${EndIf}
   ${NSD_GetText} $SyncRootEdit $SyncRoot
   ${NSD_GetState} $DesktopShortcutCheckbox $0
   StrCpy $CreateDesktopShortcut "0"

@@ -52,7 +52,15 @@ public static class InstanceControl
         try
         {
             using var process = Process.GetProcessById(processId);
-            await process.WaitForExitAsync(deadline.Token);
+            try
+            {
+                await process.WaitForExitAsync(deadline.Token);
+            }
+            catch (OperationCanceledException) when (deadline.IsCancellationRequested)
+            {
+                if (process.HasExited) return;
+                throw new TimeoutException("同步进程在 60 秒内未退出。");
+            }
         }
         catch (ArgumentException) { }
     }

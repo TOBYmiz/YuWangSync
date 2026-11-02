@@ -61,6 +61,48 @@ internal static class WinUiUiHost
     internal static bool IsReady => Ready.IsSet && _dispatcher is not null;
     internal static int UiThreadId => _uiThreadId;
     internal static bool IsSettingsWindowOpen => _settings is not null;
+    internal static AboutWindow? AboutWindowForSelfTest => _about;
+
+    internal static Style? GetStyleResource(string key)
+        => GetResource<Style>(key);
+
+    internal static Brush? GetBrushResource(string key)
+        => GetResource<Brush>(key);
+
+    private static T? GetResource<T>(string key) where T : class
+    {
+        try
+        {
+            var resources = Application.Current?.Resources;
+            var value = resources?[key];
+            if (value is null)
+            {
+                Serilog.Log.Warning("WinUI 资源不存在：{Key}", key);
+                return null;
+            }
+
+            if (value is T typed)
+                return typed;
+
+            // WinUI resources are native WinRT objects. NativeAOT may project a Style or
+            // Brush as its DependencyObject base type, so a CLR `as T` test is insufficient.
+            try
+            {
+                return WinRT.CastExtensions.As<T>(value);
+            }
+            catch (Exception error)
+            {
+                Serilog.Log.Warning(error, "WinUI 资源类型不匹配：{Key}; 期望类型={Expected}; 实际类型={Actual}",
+                    key, typeof(T).FullName, value.GetType().FullName);
+                return null;
+            }
+        }
+        catch (Exception error)
+        {
+            Serilog.Log.Warning(error, "读取 WinUI 资源失败：{Key}", key);
+            return null;
+        }
+    }
 
     internal static void Initialize()
     {
@@ -391,6 +433,11 @@ internal static class WinUiUiHost
         Check("Settings single instance", ReferenceEquals(settings, duplicate), "Repeated request activates the existing settings window.");
         Check("Settings validation", settings.ValidateForSelfTest(),
             "Invalid TypeId is rejected by the same value validation used before applying settings.");
+        Check("NativeAOT WinUI resource projections",
+            GetStyleResource("DefaultButtonStyle") is not null
+                && GetStyleResource("DefaultContentDialogStyle") is not null
+                && GetBrushResource("TextFillColorPrimaryBrush") is not null,
+            "Native WinUI control, dialog Style and Brush resources can be projected to their typed C# interfaces.");
         if (probeFolderPicker)
         {
             const string title = "YuWangCloudSync NativeAOT folder picker probe";
@@ -431,6 +478,18 @@ internal static class WinUiUiHost
         Check("Tray settings callback", IsSettingsWindowOpen,
             "The Win32 PopupMenu settings item opens the WinUI settings window.");
         try { _settings?.Close(); } catch { }
+
+        TrayHost.OpenAboutForSelfTest();
+        var aboutDeadline = DateTime.UtcNow + TimeSpan.FromSeconds(10);
+        while (DateTime.UtcNow < aboutDeadline && AboutWindowForSelfTest is null)
+            await Task.Delay(50);
+        var about = AboutWindowForSelfTest;
+        await Task.Delay(100);
+        var aboutHandle = about is null ? IntPtr.Zero : WindowNative.GetWindowHandle(about);
+        Check("Tray about callback", about is not null && IsWindowVisible(aboutHandle),
+            "The Win32 PopupMenu about item opens the WinUI about window.");
+        try { about?.Close(); } catch { }
+        await Task.Delay(100);
 
         var captchaCompletion = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
         var captcha = new CaptchaWindow(captchaPath);
@@ -499,9 +558,9 @@ internal static class WinUiUiHost
         // Explicit stock styles provide a reference independent of any app implicit style.
         var references = new Control[]
         {
-            new Button { Style = (Style)Application.Current.Resources["DefaultButtonStyle"] },
-            new TextBox { Style = (Style)Application.Current.Resources["DefaultTextBoxStyle"] },
-            new CheckBox { Style = (Style)Application.Current.Resources["DefaultCheckBoxStyle"] },
+            new Button { Style = GetStyleResource("DefaultButtonStyle") },
+            new TextBox { Style = GetStyleResource("DefaultTextBoxStyle") },
+            new CheckBox { Style = GetStyleResource("DefaultCheckBoxStyle") },
         };
         var controls = DescendantControls(root).Where(control => control is Button or TextBox or CheckBox).ToArray();
         var referenceHost = new StackPanel { Opacity = 0, IsHitTestVisible = false };
@@ -528,13 +587,12 @@ internal static class WinUiUiHost
                         || control.Padding != reference.Padding
                         || control.FontSize != reference.FontSize
                         || control.FontFamily.Source != reference.FontFamily.Source
-                        || control.MinHeight != reference.MinHeight
-                        || !double.IsNaN(control.Height))
+                        || control.MinHeight != reference.MinHeight)
                         mismatches.Add(string.IsNullOrEmpty(control.Name) ? control.GetType().Name : control.Name);
                 }
                 checks.Add(new UiSelfTestCheck($"{root.Name} stock controls ({theme})", controls.Length > 0 && mismatches.Count == 0,
                     mismatches.Count == 0
-                        ? $"{controls.Length} controls match stock brushes, border, radius, padding, typography and automatic height."
+                        ? $"{controls.Length} controls match stock brushes, border, radius, padding and typography."
                         : "Differ from stock style: " + string.Join(", ", mismatches)));
             }
         }

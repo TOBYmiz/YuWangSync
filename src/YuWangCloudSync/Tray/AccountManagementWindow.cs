@@ -24,7 +24,7 @@ internal sealed class AccountManagementWindow : Window
         Name = "SingleAccountNoteTextBlock",
         Text = "至少保留一个账户。",
         TextWrapping = TextWrapping.Wrap,
-        Style = (Style)Application.Current.Resources["YuWangCaptionTextBlockStyle"],
+        Style = WinUiUiHost.GetStyleResource("YuWangCaptionTextBlockStyle"),
         Margin = new Thickness(0, 2, 0, 0),
         Visibility = Visibility.Collapsed,
     };
@@ -137,7 +137,7 @@ internal sealed class AccountManagementWindow : Window
             XamlRoot = Root.XamlRoot,
             RequestedTheme = Root.ActualTheme,
         };
-        dialog.Style = Application.Current.Resources["DefaultContentDialogStyle"] as Style;
+        dialog.Style = WinUiUiHost.GetStyleResource("DefaultContentDialogStyle");
         if (await dialog.ShowAsync() != ContentDialogResult.Primary) return;
 
         _accounts.Remove(account);
@@ -319,7 +319,7 @@ internal sealed class AccountManagementWindow : Window
 
         try
         {
-            dialog.Style = Application.Current.Resources["DefaultContentDialogStyle"] as Style;
+            dialog.Style = WinUiUiHost.GetStyleResource("DefaultContentDialogStyle");
             var dialogOperation = dialog.ShowAsync();
             await RefreshCaptchaAsync();
             await dialogOperation;

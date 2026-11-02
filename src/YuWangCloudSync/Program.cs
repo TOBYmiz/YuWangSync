@@ -5,6 +5,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using Microsoft.Data.Sqlite;
+using Microsoft.Win32;
 using Serilog;
 using Vanara.PInvoke;
 using YuWangCloudSync.CloudFiles;
@@ -128,6 +129,12 @@ internal static class Program
     [System.Runtime.InteropServices.DllImport("Microsoft.ui.xaml.dll", ExactSpelling = true)]
     private static extern void XamlCheckProcessRequirements();
 
+    [System.Runtime.InteropServices.DllImport("api-ms-win-core-winrt-l1-1-0.dll", ExactSpelling = true)]
+    private static extern int RoInitialize(uint initType);
+
+    [System.Runtime.InteropServices.DllImport("api-ms-win-core-winrt-l1-1-0.dll", ExactSpelling = true)]
+    private static extern void RoUninitialize();
+
     private static void ValidateWinUiResourceIndex()
     {
         // WinUI 3 uses MRT Core. Loading PRI files into the OS MRT ResourceManager
@@ -148,7 +155,9 @@ internal static class Program
     }
 
     private const uint MessageBoxOk = 0x00000000;
+    private const uint MessageBoxOkCancel = 0x00000001;
     private const uint MessageBoxIconError = 0x00000010;
+    private const uint MessageBoxIconWarning = 0x00000030;
     private const uint MessageBoxSystemModal = 0x00001000;
     private const uint MessageBoxIconInformation = 0x00000040;
     private const uint MessageBoxSetForeground = 0x00010000;
@@ -195,6 +204,52 @@ internal static class Program
             ConfigureLogger();
             Log.Information("启动入口：进程={Process}; Windows={Windows}; .NET={Runtime}",
                 Environment.ProcessPath, Environment.OSVersion.VersionString, Environment.Version);
+            var prepareSyncRootForSetup = args.Any(argument => string.Equals(argument,
+                "--prepare-syncroot-for-setup", StringComparison.OrdinalIgnoreCase));
+            if (prepareSyncRootForSetup)
+            {
+                try
+                {
+                    Log.Information("安装同步目录页恢复入口：初始化 WinRT STA");
+                    var initializeResult = RoInitialize(0); // RO_INIT_SINGLETHREADED
+                    if (initializeResult < 0)
+                        System.Runtime.InteropServices.Marshal.ThrowExceptionForHR(initializeResult);
+                    Log.Information("安装同步目录页恢复入口：WinRT STA 已初始化（HRESULT=0x{Hresult:X8}）",
+                        initializeResult);
+                    try
+                    {
+                        WinRT.ComWrappersSupport.InitializeComWrappers();
+                        Log.Information("安装同步目录页恢复入口：WinRT COM 包装器已初始化");
+                        Log.Information("安装同步目录页恢复入口：开始检查残留 SyncRoot 注册");
+                        Environment.ExitCode = PrepareSyncRootForSetup();
+                    }
+                    finally
+                    {
+                        RoUninitialize();
+                    }
+                }
+                catch (Exception error)
+                {
+                    Environment.ExitCode = 1;
+                    Log.Error(error, "安装同步目录页处理残留 SyncRoot 注册失败");
+                }
+                Log.CloseAndFlush();
+                return;
+            }
+            // The installer/control helper must not start WinUI. Starting a second XAML
+            // dispatcher just to send --stop can leave a hidden native window alive after
+            // the pipe command completes and turns a normal timeout into a crash dialog.
+            if (args.Any(argument => string.Equals(argument, "--stop", StringComparison.OrdinalIgnoreCase)))
+            {
+                try { InstanceControl.StopAsync().GetAwaiter().GetResult(); }
+                catch (Exception error)
+                {
+                    Environment.ExitCode = 1;
+                    Log.Error(error, "停止同步进程失败（--stop）");
+                }
+                Log.CloseAndFlush();
+                return;
+            }
             if (args.Any(argument => string.Equals(argument, "--cleanup-update-temp", StringComparison.OrdinalIgnoreCase)))
                 _ = Task.Run(UpdateTemporaryFiles.CleanupAfterUpdateAsync);
             var resourceBaseDirectory = Environment.GetEnvironmentVariable("MICROSOFT_WINDOWSAPPRUNTIME_BASE_DIRECTORY");
@@ -217,7 +272,17 @@ internal static class Program
             // Read the embedded XBF through the same MRT Core API that WinUI uses, so a
             // missing native resource implementation is reported before XAML initialization.
             SetStartupStage("校验 MRT Core 主题资源");
-            ValidateWinUiResourceIndex();
+            try
+            {
+                ValidateWinUiResourceIndex();
+            }
+            catch (Exception error)
+            {
+                // The OS ResourceManager can lack the unpackaged app resource context even
+                // when WinUI's own ms-appx resolver can load the same PRI/XBF set. Keep this
+                // probe diagnostic; let Microsoft.UI.Xaml perform the authoritative check.
+                Log.Warning(error, "MRT Core 主题资源预检失败，继续交给 WinUI 资源解析");
+            }
             SetStartupStage("启动 WinUI 应用");
             Microsoft.UI.Xaml.Application.Start(_ =>
             {
@@ -252,6 +317,163 @@ internal static class Program
             HandleFatalException(error, _startupStage);
             Log.CloseAndFlush();
         }
+    }
+
+    private static int PrepareSyncRootForSetup()
+    {
+        const string recoverySubKey = @"Software\" + ProductIdentity.Identifier + @"\SetupRecovery";
+        Registry.CurrentUser.DeleteSubKeyTree(recoverySubKey, throwOnMissingSubKey: false);
+
+        var staleRoots = SyncRootShellRegistration.GetRegisteredRoots()
+            .OrderBy(root => root.Path, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        Log.Information("安装同步目录页恢复入口：发现 {Count} 个本产品 SyncRoot 注册", staleRoots.Length);
+
+        if (staleRoots.Length == 0)
+        {
+            Log.Information("未发现需要清理的残留 SyncRoot 注册");
+            return 0;
+        }
+
+        var rootToUse = staleRoots[0];
+        var prompt = new StringBuilder()
+            .Append($"有残留的同步目录注册（{rootToUse.Path}），是否清空其中文件并使用？选择“取消”将清理残留并选择新目录。");
+        if (staleRoots.Length > 1)
+            prompt.AppendLine().Append($"另有 {staleRoots.Length - 1} 个本产品注册目录将一并注销。");
+
+        var choice = MessageBoxW(IntPtr.Zero, prompt.ToString(),
+            $"{ProductIdentity.DisplayNameZh}安装程序", MessageBoxOkCancel | MessageBoxIconWarning
+                | MessageBoxSetForeground | MessageBoxTopMost);
+        if (choice is not (1 or 2))
+        {
+            Log.Error("显示残留同步目录确认框失败");
+            return 1;
+        }
+
+        var clearAndUse = choice == 1;
+        Log.Information("用户选择处理残留同步目录：{Action}; Path={Path}",
+            clearAndUse ? "清空并使用" : "注销并选择新目录", rootToUse.Path);
+        if (clearAndUse && Directory.Exists(rootToUse.Path)
+            && !ProviderIdentity.OwnsRoot(rootToUse.Path, allowLegacy: true))
+        {
+            Log.Warning("残留 shell 注册对应的目录已不再由本程序持有，改为清理注册并选择新目录：{Path}", rootToUse.Path);
+            MessageBoxW(IntPtr.Zero,
+                "该目录已不再由本程序注册。为保护其中现有内容，安装程序将清理本程序的残留注册，请选择新目录。",
+                $"{ProductIdentity.DisplayNameZh}安装程序", MessageBoxOk | MessageBoxIconInformation
+                    | MessageBoxSetForeground | MessageBoxTopMost);
+            clearAndUse = false;
+        }
+
+        foreach (var root in staleRoots)
+        {
+            try
+            {
+                SyncRootRegistrar.UnregisterDiscoveredRoot(root.Path, root.Id);
+                Log.Information("已清理残留 SyncRoot 注册：{Path}", root.Path);
+            }
+            catch (Exception error)
+            {
+                Log.Error(error, "清理残留 SyncRoot 注册失败：{Path}", root.Path);
+                return 1;
+            }
+        }
+
+        if (clearAndUse && Directory.Exists(rootToUse.Path))
+        {
+            try { ClearUnregisteredSyncRootContents(rootToUse.Path); }
+            catch (Exception error)
+            {
+                Log.Error(error, "注销后清空同步目录失败：{Path}", rootToUse.Path);
+                return 1;
+            }
+        }
+
+        var remaining = SyncRootShellRegistration.GetRegisteredRoots();
+        if (remaining.Length != 0)
+        {
+            Log.Error("清理后仍有 {Count} 个残留 SyncRoot 注册", remaining.Length);
+            return 1;
+        }
+
+        using var recoveryKey = Registry.CurrentUser.CreateSubKey(recoverySubKey, writable: true)
+            ?? throw new InvalidOperationException("无法创建安装同步目录恢复状态。");
+        if (clearAndUse)
+        {
+            recoveryKey.SetValue("SyncRootPath", rootToUse.Path, RegistryValueKind.String);
+            Log.Information("已清空并注销残留同步目录，安装将使用该目录：{Path}", rootToUse.Path);
+        }
+        else
+        {
+            recoveryKey.SetValue("SelectNewDirectory", 1, RegistryValueKind.DWord);
+            Log.Information("已注销残留同步目录注册，安装将要求选择新目录");
+        }
+        return 0;
+    }
+
+    private static void ClearUnregisteredSyncRootContents(string syncRootPath)
+    {
+        var root = Path.GetFullPath(syncRootPath);
+        if (Path.GetPathRoot(root) == root)
+            throw new InvalidOperationException($"拒绝清空磁盘根目录：{root}");
+        if (!Directory.Exists(root)) return;
+        if ((File.GetAttributes(root) & FileAttributes.ReparsePoint) != 0)
+            throw new InvalidOperationException($"SyncRoot 本身是重解析目录，拒绝清空：{root}");
+
+        var pending = new Stack<(string Path, bool DeleteAfterChildren)>();
+        pending.Push((root, false));
+        while (pending.Count != 0)
+        {
+            var (path, deleteAfterChildren) = pending.Pop();
+            if (deleteAfterChildren)
+            {
+                if (string.Equals(path, root, StringComparison.OrdinalIgnoreCase)) continue;
+                try { Directory.Delete(path, recursive: false); }
+                catch
+                {
+                    File.SetAttributes(path, FileAttributes.Normal);
+                    Directory.Delete(path, recursive: false);
+                }
+                continue;
+            }
+
+            var attributes = File.GetAttributes(path);
+            var isDirectory = (attributes & FileAttributes.Directory) != 0;
+            var isReparsePoint = (attributes & FileAttributes.ReparsePoint) != 0;
+            if (!isDirectory)
+            {
+                if (!isReparsePoint) File.SetAttributes(path, FileAttributes.Normal);
+                try { File.Delete(path); }
+                catch
+                {
+                    if (!isReparsePoint || !PlaceholderUpdater.TryStripReparsePoint(path, isDirectory: false,
+                            message => Log.Debug("{Message}", message)))
+                        throw;
+                    File.SetAttributes(path, FileAttributes.Normal);
+                    File.Delete(path);
+                }
+                continue;
+            }
+
+            if (isReparsePoint)
+            {
+                try
+                {
+                    Directory.Delete(path, recursive: false);
+                    continue;
+                }
+                catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+                {
+                    if (!PlaceholderUpdater.TryStripReparsePoint(path, isDirectory: true,
+                            message => Log.Debug("{Message}", message)))
+                        throw;
+                }
+            }
+
+            pending.Push((path, true));
+            foreach (var child in Directory.EnumerateFileSystemEntries(path))
+                pending.Push((child, false));
+        }
+        Log.Information("已清空残留同步目录内容：{Path}", root);
     }
 
     internal static void SetStartupStage(string stage)
@@ -299,16 +521,6 @@ internal static class Program
         _openFolder = args.Any(a => string.Equals(a, "--open-folder", StringComparison.OrdinalIgnoreCase)
             || string.Equals(a, "-open-folder", StringComparison.OrdinalIgnoreCase));
         _showAbout = args.Any(a => string.Equals(a, "-about", StringComparison.OrdinalIgnoreCase));
-        if (args.Any(argument => argument.Equals("--stop", StringComparison.OrdinalIgnoreCase)))
-        {
-            try { await InstanceControl.StopAsync(); }
-            catch (Exception error)
-            {
-                Environment.ExitCode = 1;
-                HandleFatalException(error, "--stop");
-            }
-            return;
-        }
         // 1. 加载配置
         try
         {

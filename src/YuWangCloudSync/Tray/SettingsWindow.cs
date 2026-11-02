@@ -321,11 +321,11 @@ internal sealed class SettingsWindow : Window
     private static Border NewCard(string title, UIElement content)
     {
         var stack = new StackPanel { Spacing = 8 };
-        stack.Children.Add(new TextBlock { Text = title, Style = (Style)Application.Current.Resources["SubtitleTextBlockStyle"] });
+        stack.Children.Add(new TextBlock { Text = title, Style = WinUiUiHost.GetStyleResource("SubtitleTextBlockStyle") });
         stack.Children.Add(content);
         return new Border
         {
-            Style = (Style)Application.Current.Resources["YuWangCardStyle"],
+            Style = WinUiUiHost.GetStyleResource("YuWangCardStyle"),
             Child = stack,
         };
     }
@@ -347,7 +347,7 @@ internal sealed class SettingsWindow : Window
     {
         Text = text,
         TextWrapping = TextWrapping.Wrap,
-        Style = (Style)Application.Current.Resources["YuWangCaptionTextBlockStyle"],
+        Style = WinUiUiHost.GetStyleResource("YuWangCaptionTextBlockStyle"),
         Margin = new Thickness(0, 2, 0, 6),
     };
 
@@ -440,7 +440,7 @@ internal sealed class SettingsWindow : Window
             XamlRoot = Root.XamlRoot,
             RequestedTheme = Root.ActualTheme,
         };
-        dialog.Style = Application.Current.Resources["DefaultContentDialogStyle"] as Style;
+        dialog.Style = WinUiUiHost.GetStyleResource("DefaultContentDialogStyle");
         if (await dialog.ShowAsync() == ContentDialogResult.Primary)
         {
             Close();
@@ -943,7 +943,7 @@ internal sealed class SettingsWindow : Window
             XamlRoot = Root.XamlRoot,
             RequestedTheme = Root.ActualTheme,
         };
-        dialog.Style = Application.Current.Resources["DefaultContentDialogStyle"] as Style;
+        dialog.Style = WinUiUiHost.GetStyleResource("DefaultContentDialogStyle");
         await dialog.ShowAsync();
     }
 
@@ -959,7 +959,7 @@ internal sealed class SettingsWindow : Window
             XamlRoot = Root.XamlRoot,
             RequestedTheme = Root.ActualTheme,
         };
-        dialog.Style = Application.Current.Resources["DefaultContentDialogStyle"] as Style;
+        dialog.Style = WinUiUiHost.GetStyleResource("DefaultContentDialogStyle");
         return await dialog.ShowAsync() == ContentDialogResult.Primary;
     }
 

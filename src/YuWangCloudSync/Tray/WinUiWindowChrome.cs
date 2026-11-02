@@ -50,7 +50,7 @@ internal static class WinUiWindowChrome
         titleContent.Children.Add(new TextBlock
         {
             Text = title,
-            Style = (Style)Application.Current.Resources["CaptionTextBlockStyle"],
+            Style = WinUiUiHost.GetStyleResource("CaptionTextBlockStyle"),
             VerticalAlignment = VerticalAlignment.Center,
         });
         Grid.SetColumn(titleContent, 1);

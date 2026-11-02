@@ -97,6 +97,10 @@ public partial class App : Application
             Program.HandleFatalException(error, "主程序后台流程意外终止");
         }
 
+        // RunAsync has already completed the provider disconnect/cleanup and TrayHost shutdown.
+        // End the native WinUI loop and terminate the process explicitly; leaving termination to
+        // the last hidden Window can keep native WinUI/CFAPI threads alive after --stop.
         WinUiUiHost.Post(Exit);
+        Environment.Exit(Environment.ExitCode);
     }
 }

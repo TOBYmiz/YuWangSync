@@ -107,6 +107,30 @@ public static class SyncRootRegistrar
         }
         ExplorerStateNotifier.NotifyItem(syncRootPath);
     }
+
+    public static void UnregisterDiscoveredRoot(string syncRootPath, string registrationId,
+        string? providerName = null)
+    {
+        // The shell registration is a discovery marker. Only call the Cloud Files API when
+        // the path still reports this provider's identity, or its directory has already been
+        // removed. A missing path cannot belong to a replacement provider, and the API may
+        // still have a registration record keyed by that path.
+        var rootExists = Directory.Exists(syncRootPath);
+        var isOwnedRoot = ProviderIdentity.OwnsRoot(syncRootPath, allowLegacy: true, providerName: providerName);
+        if (isOwnedRoot || !rootExists)
+        {
+            var result = CfUnregisterSyncRoot(syncRootPath);
+            if (result.Failed
+                && isOwnedRoot
+                && ProviderIdentity.OwnsRoot(syncRootPath, allowLegacy: true, providerName: providerName))
+                throw new Win32Exception(result.Code, $"CfUnregisterSyncRoot 失败: {result}");
+            if (result.Failed && !rootExists)
+                Callbacks.Log?.Invoke($"SyncRoot 目录已不存在，CfUnregisterSyncRoot 返回 0x{result.Code:X}；继续移除 shell 残留项。");
+        }
+
+        SyncRootShellRegistration.Remove(registrationId, syncRootPath);
+        ExplorerStateNotifier.NotifyItem(syncRootPath);
+    }
 }
 
 [SupportedOSPlatform("windows")]

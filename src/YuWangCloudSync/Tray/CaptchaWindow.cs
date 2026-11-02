@@ -35,7 +35,7 @@ internal sealed class CaptchaWindow : Window
         var panel = new StackPanel { Spacing = 12 };
         panel.Children.Add(new Border
         {
-            Style = (Style)Application.Current.Resources["YuWangImageFrameStyle"],
+            Style = WinUiUiHost.GetStyleResource("YuWangImageFrameStyle"),
             Child = _image,
         });
         panel.Children.Add(_input);

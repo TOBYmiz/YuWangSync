@@ -506,6 +506,7 @@ internal static class TrayHost
     }
 
     internal static void OpenSettingsForSelfTest() => OnSettingsMenuSelected();
+    internal static void OpenAboutForSelfTest() => OnAboutMenuSelected();
 
     private static void RequestExit() => Program.RequestShutdownFromUi();
 }
