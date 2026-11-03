@@ -48,8 +48,30 @@ public static class ProviderIdentity
 
     public static bool OwnsPlaceholder(string path)
     {
+        var identity = GetPlaceholderIdentity(path);
+        return identity != null
+            && unchecked((uint)BitConverter.ToInt32(identity, 0)) == FileIdentity.MagicExpected;
+    }
+
+    public static bool OwnsSyncRootPlaceholder(string path)
+    {
+        try
+        {
+            var attributes = File.GetAttributes(path);
+            if ((attributes & (FileAttributes.Directory | FileAttributes.ReparsePoint))
+                != (FileAttributes.Directory | FileAttributes.ReparsePoint))
+                return false;
+        }
+        catch { return false; }
+
+        var identity = GetPlaceholderIdentity(path);
+        return identity != null && identity.AsSpan().SequenceEqual(FileIdentity.SyncRoot.Serialize());
+    }
+
+    private static byte[]? GetPlaceholderIdentity(string path)
+    {
         var handle = CreateFileW(path, 0x80, 7, IntPtr.Zero, 3, 0x02200000, IntPtr.Zero);
-        if (handle == new IntPtr(-1)) return false;
+        if (handle == IntPtr.Zero || handle == new IntPtr(-1)) return null;
         var identityOffset = Marshal.OffsetOf<CF_PLACEHOLDER_STANDARD_INFO>(nameof(CF_PLACEHOLDER_STANDARD_INFO.FileIdentity)).ToInt32();
         var lengthOffset = Marshal.OffsetOf<CF_PLACEHOLDER_STANDARD_INFO>(nameof(CF_PLACEHOLDER_STANDARD_INFO.FileIdentityLength)).ToInt32();
         var capacity = Marshal.SizeOf<CF_PLACEHOLDER_STANDARD_INFO>() + 4096;
@@ -58,10 +80,13 @@ public static class ProviderIdentity
         {
             var result = CfGetPlaceholderInfo((HFILE)handle, CF_PLACEHOLDER_INFO_CLASS.CF_PLACEHOLDER_INFO_STANDARD,
                 buffer, (uint)capacity, out var returned);
-            return !result.Failed && returned >= identityOffset + 29 && Marshal.ReadInt32(buffer, lengthOffset) >= 29
-                && unchecked((uint)Marshal.ReadInt32(buffer, identityOffset)) == FileIdentity.MagicExpected;
+            if (result.Failed || returned < identityOffset + 29 || Marshal.ReadInt32(buffer, lengthOffset) < 29)
+                return null;
+            var identity = new byte[29];
+            Marshal.Copy(buffer + identityOffset, identity, 0, identity.Length);
+            return identity;
         }
-        catch { return false; }
+        catch { return null; }
         finally { Marshal.FreeHGlobal(buffer); CloseHandle(handle); }
     }
 

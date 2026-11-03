@@ -206,7 +206,9 @@ internal static class Program
                 Environment.ProcessPath, Environment.OSVersion.VersionString, Environment.Version);
             var prepareSyncRootForSetup = args.Any(argument => string.Equals(argument,
                 "--prepare-syncroot-for-setup", StringComparison.OrdinalIgnoreCase));
-            if (prepareSyncRootForSetup)
+            var cleanupSelectedSyncRootForSetupIndex = Array.FindIndex(args, argument => string.Equals(argument,
+                "--cleanup-selected-syncroot-for-setup", StringComparison.OrdinalIgnoreCase));
+            if (prepareSyncRootForSetup || cleanupSelectedSyncRootForSetupIndex >= 0)
             {
                 try
                 {
@@ -220,8 +222,18 @@ internal static class Program
                     {
                         WinRT.ComWrappersSupport.InitializeComWrappers();
                         Log.Information("安装同步目录页恢复入口：WinRT COM 包装器已初始化");
-                        Log.Information("安装同步目录页恢复入口：开始检查残留 SyncRoot 注册");
-                        Environment.ExitCode = PrepareSyncRootForSetup();
+                        if (prepareSyncRootForSetup)
+                        {
+                            Log.Information("安装同步目录页恢复入口：开始检查残留 SyncRoot 注册");
+                            Environment.ExitCode = PrepareSyncRootForSetup();
+                        }
+                        else
+                        {
+                            if (cleanupSelectedSyncRootForSetupIndex + 1 >= args.Length)
+                                throw new ArgumentException("缺少所选同步目录路径。", "--cleanup-selected-syncroot-for-setup");
+                            Environment.ExitCode = CleanupSelectedSyncRootForSetup(
+                                args[cleanupSelectedSyncRootForSetupIndex + 1]);
+                        }
                     }
                     finally
                     {
@@ -354,7 +366,8 @@ internal static class Program
         Log.Information("用户选择处理残留同步目录：{Action}; Path={Path}",
             clearAndUse ? "清空并使用" : "注销并选择新目录", rootToUse.Path);
         if (clearAndUse && Directory.Exists(rootToUse.Path)
-            && !ProviderIdentity.OwnsRoot(rootToUse.Path, allowLegacy: true))
+            && !ProviderIdentity.OwnsRoot(rootToUse.Path, allowLegacy: true)
+            && !ProviderIdentity.OwnsSyncRootPlaceholder(rootToUse.Path))
         {
             Log.Warning("残留 shell 注册对应的目录已不再由本程序持有，改为清理注册并选择新目录：{Path}", rootToUse.Path);
             MessageBoxW(IntPtr.Zero,
@@ -388,7 +401,7 @@ internal static class Program
             }
         }
 
-        var remaining = SyncRootShellRegistration.GetRegisteredRoots();
+        var remaining = SyncRootShellRegistration.GetShellRegisteredRoots();
         if (remaining.Length != 0)
         {
             Log.Error("清理后仍有 {Count} 个残留 SyncRoot 注册", remaining.Length);
@@ -410,6 +423,64 @@ internal static class Program
         return 0;
     }
 
+    private static int CleanupSelectedSyncRootForSetup(string selectedSyncRootPath)
+    {
+        var root = Path.GetFullPath(selectedSyncRootPath);
+        if (string.Equals(Path.GetPathRoot(root), root, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException($"拒绝清理磁盘根目录：{root}");
+        if (!Directory.Exists(root))
+        {
+            Log.Information("所选同步目录不存在，无本程序残留需要清理：{Path}", root);
+            return 0;
+        }
+
+        var ownsRoot = ProviderIdentity.OwnsRoot(root, allowLegacy: true, providerName: _ctx.ProviderName);
+        var ownsRootPlaceholder = ProviderIdentity.OwnsSyncRootPlaceholder(root);
+        if (!ownsRoot && !ownsRootPlaceholder)
+        {
+            Log.Information("所选同步目录不含本程序 SyncRoot 身份标记，继续常规目录探测：{Path}", root);
+            return 0;
+        }
+
+        var hasShellRegistration = SyncRootShellRegistration.GetShellRegisteredRoots().Any(registered =>
+            string.Equals(Path.GetFullPath(registered.Path).TrimEnd('\\'), root.TrimEnd('\\'),
+                StringComparison.OrdinalIgnoreCase));
+        var anotherInstanceRunning = false;
+        if (ownsRoot || hasShellRegistration)
+        {
+            foreach (var process in Process.GetProcessesByName(ProductIdentity.Identifier))
+            {
+                using (process)
+                    anotherInstanceRunning |= process.Id != Environment.ProcessId;
+            }
+        }
+        if (anotherInstanceRunning)
+        {
+            Log.Error("所选目录仍由运行中的本程序实例注册，拒绝静默清理：{Path}", root);
+            return 1;
+        }
+
+        Log.Information("所选同步目录命中本程序残留身份，开始静默注销并清理：{Path}", root);
+        if (ownsRoot)
+            SyncRootRegistrar.Unregister(root, _ctx.ProviderName);
+        else
+            SyncRootShellRegistration.Remove(root);
+
+        if (ProviderIdentity.OwnsRoot(root, allowLegacy: true, providerName: _ctx.ProviderName))
+            throw new InvalidOperationException($"本程序仍注册着所选同步目录，无法清理：{root}");
+
+        ClearUnregisteredSyncRootContents(root);
+        if (Directory.EnumerateFileSystemEntries(root).Any())
+            throw new IOException($"所选同步目录清理后仍有内容：{root}");
+        if (SyncRootShellRegistration.GetShellRegisteredRoots().Any(registered =>
+                string.Equals(Path.GetFullPath(registered.Path).TrimEnd('\\'), root.TrimEnd('\\'),
+                    StringComparison.OrdinalIgnoreCase)))
+            throw new InvalidOperationException($"所选同步目录仍有本程序 shell 注册：{root}");
+
+        Log.Information("已静默清理所选目录中的本程序残留，继续安装：{Path}", root);
+        return 0;
+    }
+
     private static void ClearUnregisteredSyncRootContents(string syncRootPath)
     {
         var root = Path.GetFullPath(syncRootPath);
@@ -417,7 +488,12 @@ internal static class Program
             throw new InvalidOperationException($"拒绝清空磁盘根目录：{root}");
         if (!Directory.Exists(root)) return;
         if ((File.GetAttributes(root) & FileAttributes.ReparsePoint) != 0)
-            throw new InvalidOperationException($"SyncRoot 本身是重解析目录，拒绝清空：{root}");
+        {
+            if (!ProviderIdentity.OwnsSyncRootPlaceholder(root)
+                || !PlaceholderUpdater.TryStripReparsePoint(root, isDirectory: true,
+                    message => Log.Debug("{Message}", message)))
+                throw new InvalidOperationException($"SyncRoot 本身是未确认归属的重解析目录，拒绝清空：{root}");
+        }
 
         var pending = new Stack<(string Path, bool DeleteAfterChildren)>();
         pending.Push((root, false));
@@ -445,7 +521,8 @@ internal static class Program
                 try { File.Delete(path); }
                 catch
                 {
-                    if (!isReparsePoint || !PlaceholderUpdater.TryStripReparsePoint(path, isDirectory: false,
+                    if (!isReparsePoint || !ProviderIdentity.OwnsPlaceholder(path)
+                        || !PlaceholderUpdater.TryStripReparsePoint(path, isDirectory: false,
                             message => Log.Debug("{Message}", message)))
                         throw;
                     File.SetAttributes(path, FileAttributes.Normal);
@@ -463,7 +540,8 @@ internal static class Program
                 }
                 catch (Exception error) when (error is IOException or UnauthorizedAccessException)
                 {
-                    if (!PlaceholderUpdater.TryStripReparsePoint(path, isDirectory: true,
+                    if (!ProviderIdentity.OwnsPlaceholder(path)
+                        || !PlaceholderUpdater.TryStripReparsePoint(path, isDirectory: true,
                             message => Log.Debug("{Message}", message)))
                         throw;
                 }

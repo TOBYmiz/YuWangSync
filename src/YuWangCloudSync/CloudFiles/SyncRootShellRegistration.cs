@@ -1,5 +1,6 @@
 using System.Security.Principal;
 using Microsoft.Win32;
+using System.Text.Json;
 using Windows.Storage;
 using Windows.Storage.Provider;
 using Windows.Storage.Streams;
@@ -50,6 +51,15 @@ internal static class SyncRootShellRegistration
     }
 
     public static (string Id, string Path)[] GetRegisteredRoots()
+    {
+        var roots = GetShellRegisteredRoots().ToList();
+        roots.AddRange(GetKnownProviderRootsMissingShellRegistration());
+        return roots
+            .DistinctBy(root => (root.Id, root.Path))
+            .ToArray();
+    }
+
+    public static (string Id, string Path)[] GetShellRegisteredRoots()
     {
         var roots = new List<(string Id, string Path)>();
         try
@@ -138,6 +148,73 @@ internal static class SyncRootShellRegistration
                 manager?.Dispose();
                 baseKey?.Dispose();
             }
+        }
+        return roots.ToArray();
+    }
+
+    private static (string Id, string Path)[] GetKnownProviderRootsMissingShellRegistration()
+    {
+        var candidates = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        void AddCandidate(string? path)
+        {
+            if (string.IsNullOrWhiteSpace(path)) return;
+            try
+            {
+                if (Path.IsPathFullyQualified(path)) candidates.Add(Path.GetFullPath(path));
+            }
+            catch { }
+        }
+
+        // Retain paths persisted by the app, including previous paths recorded for migration.
+        try
+        {
+            using var document = JsonDocument.Parse(File.ReadAllText(AppPaths.ConfigPath));
+            var config = document.RootElement;
+            if (config.TryGetProperty("SyncRootPath", out var configuredPath))
+                AddCandidate(configuredPath.GetString());
+            if (config.TryGetProperty("LegacySyncRootPaths", out var legacyPaths)
+                && legacyPaths.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var path in legacyPaths.EnumerateArray())
+                    if (path.ValueKind == JsonValueKind.String) AddCandidate(path.GetString());
+            }
+        }
+        catch { }
+
+        // Older installs used the product's default folder name directly under a volume root.
+        var defaultName = ProductIdentity.SyncRootDefaultName;
+        try
+        {
+            var profile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+            if (!string.IsNullOrWhiteSpace(profile))
+                AddCandidate(Path.Combine(profile, defaultName));
+        }
+        catch { }
+        try
+        {
+            foreach (var drive in DriveInfo.GetDrives())
+            {
+                try
+                {
+                    if (drive.DriveType == DriveType.Fixed && drive.IsReady)
+                        AddCandidate(Path.Combine(drive.RootDirectory.FullName, defaultName));
+                }
+                catch { }
+            }
+        }
+        catch { }
+
+        var roots = new List<(string Id, string Path)>();
+        foreach (var path in candidates)
+        {
+            try
+            {
+                if (Directory.Exists(path)
+                    && (ProviderIdentity.OwnsRoot(path, allowLegacy: true)
+                        || ProviderIdentity.OwnsSyncRootPlaceholder(path)))
+                    roots.Add((RegistrationId, path));
+            }
+            catch { }
         }
         return roots.ToArray();
     }

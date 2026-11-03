@@ -1136,6 +1136,13 @@ sync_root_volume_ok:
       Return
     ${EndIf}
   ${EndIf}
+  nsExec::ExecToStack /TIMEOUT=300000 '"$PLUGINSDIR\syncroot-recovery\${PRODUCT_IDENTIFIER}.exe" --cleanup-selected-syncroot-for-setup "$R0" --quiet'
+  Pop $R9
+  Pop $R8
+  ${If} $R9 != "0"
+    MessageBox MB_OK|MB_ICONEXCLAMATION "无法清理所选目录中的本程序残留同步内容，请重试安装或选择其他目录。"
+    Return
+  ${EndIf}
   ; A previous installer version could leave its empty probe file if FindNext's
   ; end-of-enumeration error flag made the later FileOpen check fail spuriously.
   StrCpy $R4 "$R0\.yw-setup-probe"
