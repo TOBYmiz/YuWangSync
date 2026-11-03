@@ -2091,6 +2091,18 @@ install_shell_file_done:
   WriteRegStr HKLM "${UNINSTALL_KEY}" "UninstallString" '"$INSTDIR\uninstall.exe"'
   WriteRegDWORD HKLM "${UNINSTALL_KEY}" "NoModify" 1
   WriteRegDWORD HKLM "${UNINSTALL_KEY}" "NoRepair" 1
+
+  ; Store the install-directory size in KiB in the Windows uninstall entry.
+  ${GetSize} "$INSTDIR" "/S=0K" $0 $1 $2
+  IfErrors install_estimated_size_failed
+  IntFmt $0 "0x%08X" $0
+  WriteRegDWORD HKLM "${UNINSTALL_KEY}" "EstimatedSize" $0
+  Goto install_estimated_size_done
+install_estimated_size_failed:
+  DetailPrint "无法计算安装目录大小，未写入 EstimatedSize。"
+  DeleteRegValue HKLM "${UNINSTALL_KEY}" "EstimatedSize"
+  ClearErrors
+install_estimated_size_done:
   System::Call 'shell32::SHChangeNotify(i 0x08000000, i 0, p 0, p 0)'
 SectionEnd
 
