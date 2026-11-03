@@ -2,12 +2,14 @@
 
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
-    <!-- 19041 = Win10 2004，满足 Cloud Files API 和 WinUI 3 的目标平台要求。
+    <!-- 使用 19041 SDK 编译，最低运行版本显式设为 17763（Win10 1809 / LTSC 2019）。
          双模收口：OutputType 改为 WinExe（默认无控制台窗口）。
            - 默认 GUI：无控制台，日志仅写文件，验证码走 WinUI 弹窗；
            - console 模式：显式 AllocConsole 重新启用调试控制台（控制台日志 + 控制台读验证码）；
            - 无头 quiet 模式：无 UI、无控制台，仅写文件日志，无会话直接退出。 -->
     <TargetFramework>net10.0-windows10.0.19041.0</TargetFramework>
+    <SupportedOSPlatformVersion>10.0.17763.0</SupportedOSPlatformVersion>
+    <TargetPlatformMinVersion>10.0.17763.0</TargetPlatformMinVersion>
     <!-- unpackaged：免 MSIX 打包。 -->
     <WindowsPackageType>None</WindowsPackageType>
     <UseWinUI>true</UseWinUI>

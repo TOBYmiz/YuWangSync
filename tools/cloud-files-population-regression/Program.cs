@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using YuWangCloudSync.CloudFiles;
+using YuWangCloudSync.Core;
 using YuWangCloudSync.Models;
 using YuWangCloudSync.Net;
 using YuWangCloudSync.Storage;
@@ -64,21 +65,15 @@ CF_CALLBACK callback = (in CF_CALLBACK_INFO info, in CF_CALLBACK_PARAMETERS para
 CF_CALLBACK fetchData = (in CF_CALLBACK_INFO info, in CF_CALLBACK_PARAMETERS parameters) =>
 {
     Interlocked.Increment(ref hydrationRequests);
-    var fetch = parameters.GetParam<CF_CALLBACK_PARAMETERS.FETCHDATA>();
+    if (!CloudFilesInterop.TryReadFetchData(parameters, out var fetch))
+        throw new InvalidDataException("Invalid fixture FETCH_DATA callback.");
     var data = System.Text.Encoding.UTF8.GetBytes("Keep cloud file content.");
     var buffer = Marshal.AllocHGlobal(data.Length);
     try
     {
         Marshal.Copy(data, 0, buffer, data.Length);
-        var operation = new CF_OPERATION_INFO
-        {
-            StructSize = (uint)Marshal.SizeOf<CF_OPERATION_INFO>(),
-            Type = CF_OPERATION_TYPE.CF_OPERATION_TYPE_TRANSFER_DATA,
-            ConnectionKey = info.ConnectionKey,
-            TransferKey = info.TransferKey,
-            RequestKey = info.RequestKey
-        };
-        var transfer = CF_OPERATION_PARAMETERS.Create(new CF_OPERATION_PARAMETERS.TRANSFERDATA
+        var operation = CloudFilesInterop.CreateOperationInfo(info, CF_OPERATION_TYPE.CF_OPERATION_TYPE_TRANSFER_DATA);
+        var transfer = CloudFilesInterop.CreateOperationParameters(new CF_OPERATION_PARAMETERS.TRANSFERDATA
         {
             CompletionStatus = NTStatus.STATUS_SUCCESS,
             Buffer = buffer + checked((int)fetch.RequiredFileOffset),

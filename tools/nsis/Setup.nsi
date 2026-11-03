@@ -1,5 +1,7 @@
 ; YuWangCloudSync installer implemented in NSIS with Modern UI 2.
 !include "LogicLib.nsh"
+!include "WinVer.nsh"
+!include "x64.nsh"
 !include "FileFunc.nsh"
 !include "Win\COM.nsh"
 !include "nsDialogs.nsh"
@@ -249,6 +251,21 @@ install_base_done:
 FunctionEnd
 
 Function .onInit
+  ${IfNot} ${IsNativeAMD64}
+    MessageBox MB_OK|MB_ICONSTOP "需要 x64 Windows 10 1809（17763，包括 LTSC 2019）或更高版本。"
+    SetErrorLevel 1150
+    Abort
+  ${EndIf}
+  ${IfNot} ${AtLeastWin10}
+    MessageBox MB_OK|MB_ICONSTOP "需要 Windows 10 1809（17763，包括 LTSC 2019）或更高版本。"
+    SetErrorLevel 1150
+    Abort
+  ${EndIf}
+  ${IfNot} ${AtLeastBuild} 17763
+    MessageBox MB_OK|MB_ICONSTOP "当前 Windows 版本过旧。需要 Windows 10 1809（17763，包括 LTSC 2019）或更高版本。"
+    SetErrorLevel 1150
+    Abort
+  ${EndIf}
   StrCpy $QuickUpdateRequested "0"
   StrCpy $SyncRootRecoveryFailed "0"
   StrCpy $SyncRootRecoveryPayloadExtracted "0"

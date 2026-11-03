@@ -276,6 +276,9 @@ internal static class Program
                 File.Exists(Path.Combine(AppContext.BaseDirectory, ProductIdentity.Identifier + ".pri")),
                 File.Exists(Path.Combine(AppContext.BaseDirectory, "Microsoft.UI.Xaml.Controls.pri")),
                 File.Exists(Path.Combine(AppContext.BaseDirectory, "Microsoft.UI.pri")));
+            SetStartupStage("校验 Windows Cloud Files 平台");
+            CloudFilesPlatform.EnsureSupported();
+            Log.Information("Cloud Files 平台：{Platform}", CloudFilesPlatform.Describe());
             SetStartupStage("校验 WinUI XAML 进程要求");
             XamlCheckProcessRequirements();
             SetStartupStage("初始化 WinRT COM 包装器");

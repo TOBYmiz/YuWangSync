@@ -9,7 +9,7 @@
       </requestedPrivileges>
     </security>
   </trustInfo>
-  <!-- Win10 1709+ 才支持 Cloud Files API -->
+  <!-- CFAPI 自 Win10 1709 提供；应用因 WinUI 3 最低要求 Win10 1809。 -->
   <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
     <application>
       <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd5061a6d3}" /> <!-- Windows 10/11 -->

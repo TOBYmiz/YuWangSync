@@ -404,12 +404,11 @@ public static class SyncRootProbe
                 string? prov;
                 try
                 {
-                    var info = CfGetSyncRootInfoByPath<CF_SYNC_ROOT_PROVIDER_INFO>(d);
-                    prov = info.ProviderName;
+                    if (!CloudFilesInterop.TryGetProviderName(d, out prov)) break;
                 }
                 catch
                 {
-                    break;   // 不在任何 SyncRoot 内了（Vanara 的泛型重载失败即抛）
+                    break;   // 不在任何 SyncRoot 内了。
                 }
                 hit = d;
                 provider = prov;

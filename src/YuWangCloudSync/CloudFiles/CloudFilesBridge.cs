@@ -49,6 +49,8 @@ public static class SyncRootRegistrar
             };
             var policies = new CF_SYNC_POLICIES
             {
+                // Vanara 5.0.7 exposes the original 20-byte policy structure;
+                // do not append newer SDK-only PlaceholderManagement fields.
                 StructSize = (uint)Marshal.SizeOf<CF_SYNC_POLICIES>(),
                 Hydration = new CF_HYDRATION_POLICY
                 {
@@ -444,7 +446,11 @@ public static class Callbacks
 
     public static void OnCleanupFetchData(in CF_CALLBACK_INFO info, in CF_CALLBACK_PARAMETERS parameters)
     {
-        var fetch = parameters.GetParam<CF_CALLBACK_PARAMETERS.FETCHDATA>();
+        if (!CloudFilesInterop.TryReadFetchData(parameters, out var fetch))
+        {
+            Log?.Invoke($"[CFAPI] 忽略无效的清理水化回调 ParamSize={parameters.ParamSize}");
+            return;
+        }
         Execute(info, CF_OPERATION_TYPE.CF_OPERATION_TYPE_TRANSFER_DATA,
             new CF_OPERATION_PARAMETERS.TRANSFERDATA
             {
@@ -643,8 +649,8 @@ public static class Callbacks
                 ?? DirectoryPermission.Unknown;
             if (permission == DirectoryPermission.FullAccess)
             {
-                var rename = parameters.GetParam<CF_CALLBACK_PARAMETERS.RENAME>();
-                PendingRenameTargets[new NodeKey(identity)] = ResolveTargetPath(info, rename.TargetPath);
+                PendingRenameTargets[new NodeKey(identity)] = ResolveTargetPath(info,
+                    CloudFilesInterop.ReadRenameTarget(parameters));
                 status = NTStatus.STATUS_SUCCESS;
             }
             Log?.Invoke($"[WRITE] rename-request file={identity.FileId} permission={permission} ack={status}");
@@ -823,7 +829,11 @@ public static class Callbacks
 
     public static void OnFetchData(in CF_CALLBACK_INFO info, in CF_CALLBACK_PARAMETERS parameters)
     {
-        var fetch = parameters.GetParam<CF_CALLBACK_PARAMETERS.FETCHDATA>();
+        if (!CloudFilesInterop.TryReadFetchData(parameters, out var fetch))
+        {
+            Log?.Invoke($"[CFAPI] 忽略无效的水化回调 ParamSize={parameters.ParamSize}");
+            return;
+        }
         var offset = fetch.RequiredFileOffset;
         IntPtr buffer = IntPtr.Zero;
         HydrationActivity? activity = null;
@@ -1751,18 +1761,10 @@ public static class Callbacks
     }
 
     private static HRESULT Execute<T>(in CF_CALLBACK_INFO callbackInfo, CF_OPERATION_TYPE type, T parameters)
-        where T : struct
+        where T : unmanaged
     {
-        var operationInfo = new CF_OPERATION_INFO
-        {
-            StructSize = (uint)Marshal.SizeOf<CF_OPERATION_INFO>(),
-            Type = type,
-            ConnectionKey = callbackInfo.ConnectionKey,
-            TransferKey = callbackInfo.TransferKey,
-            CorrelationVector = callbackInfo.CorrelationVector,
-            RequestKey = callbackInfo.RequestKey
-        };
-        var operationParameters = CF_OPERATION_PARAMETERS.Create(parameters);
+        var operationInfo = CloudFilesInterop.CreateOperationInfo(callbackInfo, type);
+        var operationParameters = CloudFilesInterop.CreateOperationParameters(parameters);
         var result = CfExecute(in operationInfo, ref operationParameters);
         if (result.Failed)
             Log?.Invoke($"CfExecute({type}) 失败: {result}");
