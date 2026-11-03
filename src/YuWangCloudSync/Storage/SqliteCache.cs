@@ -327,9 +327,18 @@ public sealed class SqliteCache : IDisposable
     {
         lock (_sync)
         {
+        var previousItems = ListCachedItems(diskId, folderId);
         using var tx = _conn.BeginTransaction();
         try
         {
+            // A successful listing is a complete snapshot, including an empty directory.
+            // Upserts alone leave deleted files/folders in ListCachedItems forever.
+            var current = items.Select(item => (item.Id, item.IsFolder)).ToHashSet();
+            foreach (var previous in previousItems)
+                if (!current.Contains((previous.id, previous.isFolder)))
+                    RemoveCachedItem(new FileIdentity(diskId, folderId, previous.id,
+                        previous.isFolder ? (byte)0 : (byte)1), tx);
+
             // upsert folder
             using (var cmd = _conn.CreateCommand())
             {
@@ -354,7 +363,12 @@ public sealed class SqliteCache : IDisposable
             // upsert files
             foreach (var item in items)
             {
-                if (item.IsFolder) continue;  // 文件夹入库走 SaveSubFolder（由调用方遍历 items 触发）
+                if (item.IsFolder)
+                {
+                    SaveSubFolder(diskId, item.Id, folderId, item.Name,
+                        string.IsNullOrEmpty(localPath) ? null : Path.Combine(localPath, item.Name), tx);
+                    continue;
+                }
                 using var cmd = _conn.CreateCommand();
                 cmd.Transaction = tx;
                 cmd.CommandText = """
@@ -383,10 +397,15 @@ public sealed class SqliteCache : IDisposable
     /// 子文件夹 local_path 恒空，对账全部"跳过（DB 无记录）"。此处补存完整本地路径。
     /// ON CONFLICT 用 CASE 保护：仅当新值非空才覆盖，避免空调用覆盖已有值。</summary>
     public void SaveSubFolder(ulong diskId, ulong folderId, ulong parentFolderId, string name, string? localPath = null)
+        => SaveSubFolder(diskId, folderId, parentFolderId, name, localPath, null);
+
+    private void SaveSubFolder(ulong diskId, ulong folderId, ulong parentFolderId, string name,
+        string? localPath, SqliteTransaction? transaction)
     {
         lock (_sync)
         {
         using var cmd = _conn.CreateCommand();
+        cmd.Transaction = transaction;
         cmd.CommandText = """
             INSERT INTO folders(folder_id, disk_id, parent_folder_id, name, local_path, item_count, last_listed)
             VALUES(@fid, @disk, @parent, @name, @path, 0, 0)
@@ -781,6 +800,22 @@ public sealed class SqliteCache : IDisposable
         }
     }
 
+    public List<(FileIdentity identity, string path)> ListKnownFolderPaths()
+    {
+        lock (_sync)
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = "SELECT disk_id, parent_folder_id, folder_id, local_path FROM folders WHERE local_path IS NOT NULL AND local_path <> ''";
+            using var reader = cmd.ExecuteReader();
+            var result = new List<(FileIdentity, string)>();
+            while (reader.Read())
+                result.Add((new FileIdentity((ulong)reader.GetInt64(0),
+                    reader.IsDBNull(1) ? 0 : (ulong)reader.GetInt64(1),
+                    (ulong)reader.GetInt64(2), 0), reader.GetString(3)));
+            return result;
+        }
+    }
+
     public void RemoveCachedItem(FileIdentity identity)
     {
         lock (_sync)
@@ -788,41 +823,46 @@ public sealed class SqliteCache : IDisposable
             using var tx = _conn.BeginTransaction();
             try
             {
-                using var cmd = _conn.CreateCommand();
-                cmd.Transaction = tx;
-                if (identity.Type == 1)
-                {
-                    cmd.CommandText = "DELETE FROM files WHERE disk_id=@disk AND folder_id=@parent AND file_id=@item";
-                    cmd.Parameters.AddWithValue("@parent", (long)identity.FolderId);
-                }
-                else
-                {
-                    cmd.CommandText = """
-                        WITH RECURSIVE subtree(folder_id) AS (
-                            SELECT @item
-                            UNION
-                            SELECT child.folder_id FROM folders child
-                            JOIN subtree parent ON child.parent_folder_id=parent.folder_id
-                            WHERE child.disk_id=@disk
-                        )
-                        DELETE FROM files WHERE disk_id=@disk AND folder_id IN (SELECT folder_id FROM subtree);
-                        WITH RECURSIVE subtree(folder_id) AS (
-                            SELECT @item
-                            UNION
-                            SELECT child.folder_id FROM folders child
-                            JOIN subtree parent ON child.parent_folder_id=parent.folder_id
-                            WHERE child.disk_id=@disk
-                        )
-                        DELETE FROM folders WHERE disk_id=@disk AND folder_id IN (SELECT folder_id FROM subtree);
-                        """;
-                }
-                cmd.Parameters.AddWithValue("@disk", (long)identity.DiskId);
-                cmd.Parameters.AddWithValue("@item", (long)identity.FileId);
-                cmd.ExecuteNonQuery();
+                RemoveCachedItem(identity, tx);
                 tx.Commit();
             }
             catch { tx.Rollback(); throw; }
         }
+    }
+
+    private void RemoveCachedItem(FileIdentity identity, SqliteTransaction tx)
+    {
+        using var cmd = _conn.CreateCommand();
+        cmd.Transaction = tx;
+        if (identity.Type == 1)
+        {
+            cmd.CommandText = "DELETE FROM files WHERE disk_id=@disk AND folder_id=@parent AND file_id=@item";
+            cmd.Parameters.AddWithValue("@parent", (long)identity.FolderId);
+        }
+        else
+        {
+            cmd.CommandText = """
+                WITH RECURSIVE subtree(folder_id) AS (
+                    SELECT @item
+                    UNION
+                    SELECT child.folder_id FROM folders child
+                    JOIN subtree parent ON child.parent_folder_id=parent.folder_id
+                    WHERE child.disk_id=@disk
+                )
+                DELETE FROM files WHERE disk_id=@disk AND folder_id IN (SELECT folder_id FROM subtree);
+                WITH RECURSIVE subtree(folder_id) AS (
+                    SELECT @item
+                    UNION
+                    SELECT child.folder_id FROM folders child
+                    JOIN subtree parent ON child.parent_folder_id=parent.folder_id
+                    WHERE child.disk_id=@disk
+                )
+                DELETE FROM folders WHERE disk_id=@disk AND folder_id IN (SELECT folder_id FROM subtree);
+                """;
+        }
+        cmd.Parameters.AddWithValue("@disk", (long)identity.DiskId);
+        cmd.Parameters.AddWithValue("@item", (long)identity.FileId);
+        cmd.ExecuteNonQuery();
     }
 
     /// <summary>

@@ -418,10 +418,6 @@ public static class CallbackTable
             new() { Type = CF_CALLBACK_TYPE.CF_CALLBACK_TYPE_NOTIFY_DELETE_COMPLETION, Callback = Callbacks.OnNotifyDeleteCompletion },
             new() { Type = CF_CALLBACK_TYPE.CF_CALLBACK_TYPE_NOTIFY_RENAME, Callback = Callbacks.OnNotifyRename },
             new() { Type = CF_CALLBACK_TYPE.CF_CALLBACK_TYPE_NOTIFY_RENAME_COMPLETION, Callback = Callbacks.OnNotifyRenameCompletion },
-            // 文件/目录打开完成通知：用于"关闭按需填充后仍可刷新"。
-            // 填充后关闭按需的目录，用户重新进入时此回调触发 → 缓存过期则重开按需 →
-            // cfapi 重新触发 FETCH_PLACEHOLDERS 刷新 → 填充后再关闭。闭环实现刷新。
-            new() { Type = CF_CALLBACK_TYPE.CF_CALLBACK_TYPE_NOTIFY_FILE_OPEN_COMPLETION, Callback = Callbacks.OnNotifyFileOpenCompletion },
             CF_CALLBACK_REGISTRATION.CF_CALLBACK_REGISTRATION_END
         ];
     }
@@ -430,6 +426,19 @@ public static class CallbackTable
 [SupportedOSPlatform("windows")]
 public static class Callbacks
 {
+    private static DirectoryPopulationRefresh? _directoryRefresh;
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<NodeKey, object> ListingGates = new();
+
+    public static void StartDirectoryRefresh()
+    {
+        StopDirectoryRefresh();
+        if (Cache is { } cache)
+            _directoryRefresh = new DirectoryPopulationRefresh(cache, SyncRootPath, Log);
+    }
+
+    public static void StopDirectoryRefresh()
+        => Interlocked.Exchange(ref _directoryRefresh, null)?.Dispose();
+
     public static void OnCleanupFetchPlaceholders(in CF_CALLBACK_INFO info, in CF_CALLBACK_PARAMETERS parameters)
     {
         Execute(info, CF_OPERATION_TYPE.CF_OPERATION_TYPE_TRANSFER_PLACEHOLDERS,
@@ -1023,38 +1032,6 @@ public static class Callbacks
         return result;
     }
 
-    /// <summary>
-    /// 文件/目录打开完成通知回调。
-    /// 用于实现"关闭按需填充后仍可刷新"：
-    ///   填充后关闭按需的目录，用户重新进入时此回调触发 → 检查统一缓存周期 →
-    ///   周期已过则清除进程快照并重开按需填充 → cfapi 重新触发 FETCH_PLACEHOLDERS 联网刷新 → 填充后再关闭。
-    /// 非目录打开直接 return（文件水化的 CreateFile 不触发刷新）。
-    /// </summary>
-    public static void OnNotifyFileOpenCompletion(in CF_CALLBACK_INFO info, in CF_CALLBACK_PARAMETERS parameters)
-    {
-        try
-        {
-            var identity = ReadIdentity(info);
-            // 非目录（文件打开）不处理——FileIdentity.Type=0 是文件夹，!=0 是文件
-            if (identity.Type != 0) return;
-            // 虚拟节点（SyncRoot 根/容器）不走 HTTP 刷新（disk_tree 启动时已拉取，无 last_listed 过期概念）
-            if (identity.IsVirtual) return;
-            var localDir = GetLocalPath(info);
-            var cache = Cache;
-            if (cache == null) return;
-            // 缓存有效则不刷新——避免每次进入都 HTTP
-            if (cache.IsFolderCached(identity.DiskId, identity.FileId, FolderCache)) return;
-            // 到期后先清除内存清单和占位创建快照；否则后续回调可能命中旧快照而不联网。
-            InvalidateFolderListing(identity.DiskId, identity.FileId);
-            // 重开按需填充，cfapi 下次列举触发 FETCH_PLACEHOLDERS 联网刷新，填充后再关闭。
-            PlaceholderUpdater.TryEnableOnDemandPopulation(localDir, Log);
-        }
-        catch (Exception ex)
-        {
-            Log?.Invoke($"[POP] OnNotifyFileOpenCompletion 异常（忽略）: {ex.Message}");
-        }
-    }
-
     public static void OnFetchPlaceholders(in CF_CALLBACK_INFO info, in CF_CALLBACK_PARAMETERS parameters)
     {
         var identity = default(FileIdentity);
@@ -1109,95 +1086,112 @@ public static class Callbacks
             }
             else
             {
-                // ===== 真实磁盘节点：SQLite 时间戳判定后复用进程内存 → SQLite → HTTP =====
-                // cacheHit=true 表示之前已列举过该目录、占位文件已存在 → 后面跳过创建
-                bool cacheHit;
-                if (cache.IsFolderCached(identity.DiskId, identity.FileId, FolderCache))
+                lock (ListingGates.GetOrAdd(nodeKey, _ => new object()))
                 {
-                    cacheHit = true;
-                    if (!TryMem(nodeKey, out items))
+                    var forceRefresh = _directoryRefresh?.BeginEnumeration(identity, localDir) == true;
+                    if (forceRefresh)
                     {
-                        items = EnrichFolderTimes(cache, identity.DiskId,
-                            cache.ListCachedItems(identity.DiskId, identity.FileId));
-                        ProbeCachedRealSizes(identity.FileId, items);
-                        items = EnrichFolderTimes(cache, identity.DiskId,
-                            cache.ListCachedItems(identity.DiskId, identity.FileId));
-                        SetMem(nodeKey, items);
-                        if (DiagAllowed(nodeKey))
-                            Log?.Invoke($"[DEBUG] 列举 folder={nodeKey} SQLITE_HIT items={items.Count} dir='{localDir}'");
+                        Log?.Invoke($"[REFRESH] 目录重新枚举，立即查询云端 folder={nodeKey} dir='{localDir}'");
                     }
-                }
-                else
-                {
-                    cacheHit = false;
-                    Log?.Invoke($"[DEBUG] 列举 folder={nodeKey} MISS → HTTP（dir='{localDir}' " +
-                                $"identity(disk={identity.DiskId},folder={identity.FolderId},file={identity.FileId})）");
-                    // 并发节流：限制同时打出的育网云列举请求数（Explorer 连锁触发时避免 HTTP 风暴）
-                    ListThrottle.Wait();
-                    try
+                    // ===== 真实磁盘节点：SQLite 时间戳判定后复用进程内存 → SQLite → HTTP =====
+                    // cacheHit=true 表示之前已列举过该目录、占位文件已存在 → 后面跳过创建
+                    bool cacheHit;
+                    if (!forceRefresh && cache.IsFolderCached(identity.DiskId, identity.FileId, FolderCache))
                     {
-                        // 再查一次：排队期间可能已被其他线程填充（避免重复 HTTP）
-                        if (cache.IsFolderCached(identity.DiskId, identity.FileId, FolderCache))
+                        cacheHit = true;
+                        if (!TryMem(nodeKey, out items))
                         {
-                            cacheHit = true;
-                            if (!TryMem(nodeKey, out items))
+                            items = EnrichFolderTimes(cache, identity.DiskId,
+                                cache.ListCachedItems(identity.DiskId, identity.FileId));
+                            ProbeCachedRealSizes(identity.FileId, items);
+                            items = EnrichFolderTimes(cache, identity.DiskId,
+                                cache.ListCachedItems(identity.DiskId, identity.FileId));
+                            SetMem(nodeKey, items);
+                            if (DiagAllowed(nodeKey))
+                                Log?.Invoke($"[DEBUG] 列举 folder={nodeKey} SQLITE_HIT items={items.Count} dir='{localDir}'");
+                        }
+                    }
+                    else
+                    {
+                        cacheHit = false;
+                        Log?.Invoke($"[DEBUG] 列举 folder={nodeKey} MISS → HTTP（dir='{localDir}' " +
+                                    $"identity(disk={identity.DiskId},folder={identity.FolderId},file={identity.FileId})）");
+                        // 并发节流：限制同时打出的育网云列举请求数（Explorer 连锁触发时避免 HTTP 风暴）
+                        ListThrottle.Wait();
+                        try
+                        {
+                            // 再查一次：排队期间可能已被其他线程填充（避免重复 HTTP）
+                            if (!forceRefresh && cache.IsFolderCached(identity.DiskId, identity.FileId, FolderCache))
                             {
-                                items = EnrichFolderTimes(cache, identity.DiskId,
-                                    cache.ListCachedItems(identity.DiskId, identity.FileId));
-                                ProbeCachedRealSizes(identity.FileId, items);
-                                items = EnrichFolderTimes(cache, identity.DiskId,
-                                    cache.ListCachedItems(identity.DiskId, identity.FileId));
+                                cacheHit = true;
+                                if (!TryMem(nodeKey, out items))
+                                {
+                                    items = EnrichFolderTimes(cache, identity.DiskId,
+                                        cache.ListCachedItems(identity.DiskId, identity.FileId));
+                                    ProbeCachedRealSizes(identity.FileId, items);
+                                    items = EnrichFolderTimes(cache, identity.DiskId,
+                                        cache.ListCachedItems(identity.DiskId, identity.FileId));
+                                    SetMem(nodeKey, items);
+                                }
+                            }
+                            else
+                            {
+                                var listing = (Client ?? throw new InvalidOperationException("Cloud client 尚未初始化"))
+                                    .ListFolderWithPermissionsAsync(identity.DiskId, identity.FileId)
+                                    .GetAwaiter().GetResult();
+                                if (!listing.IsValidPage)
+                                    throw new InvalidDataException("目录响应不是目标目录页面，拒绝缓存或变更占位。");
+                                var remoteItems = listing.Items.ToList();
+                                cache.SaveDirectoryPermission(UserKey, identity.DiskId, identity.FileId,
+                                    listing.Permission);
+                                cache.SaveFolder(identity.DiskId, identity.FileId, identity.FolderId,
+                                    Path.GetFileName(localDir), localDir, remoteItems);
+                                ReconcileRemovedPlaceholders(identity, localDir, remoteItems);
+                                // 列表页大小向下取整到整 MB；创建占位前通过直链 HEAD 取得精确字节数，
+                                // 避免在 FETCH_DATA 期间修改正在水化的文件。
+                                //   PicPlayer 页 → sketch hash → upload_dir/file/<yyyyMM>/<hash>.<ext>
+                                //   直链 → HEAD Content-Length
+                                // 探测结果写 real_size + direct_url + probed_upload_time；
+                                // 之后列举时 upload_time 不变 → 不再重复探测。
+                                // 探测失败仍降级用声明值+余量，不阻塞列举。
+                                ProbeRealSizes(identity.FileId, remoteItems);
+
+                                items = EnrichFolderTimes(cache, identity.DiskId, cache.ListCachedItems(identity.DiskId, identity.FileId));
                                 SetMem(nodeKey, items);
                             }
                         }
-                        else
+                        catch (Exception error) when (forceRefresh
+                            && cache.IsFolderCached(identity.DiskId, identity.FileId, TimeSpan.MaxValue))
                         {
-                            var listing = (Client ?? throw new InvalidOperationException("Cloud client 尚未初始化"))
-                                .ListFolderWithPermissionsAsync(identity.DiskId, identity.FileId)
-                                .GetAwaiter().GetResult();
-                            if (!listing.IsValidPage)
-                                throw new InvalidDataException("目录响应不是目标目录页面，拒绝缓存或变更占位。");
-                            var remoteItems = listing.Items.ToList();
-                            cache.SaveDirectoryPermission(UserKey, identity.DiskId, identity.FileId,
-                                listing.Permission);
-                            cache.SaveFolder(identity.DiskId, identity.FileId, identity.FolderId,
-                                Path.GetFileName(localDir), localDir, remoteItems);
-                            foreach (var directory in remoteItems.Where(item => item.IsFolder))
-                                cache.SaveSubFolder(identity.DiskId, directory.Id, identity.FileId, directory.Name,
-                                    System.IO.Path.Combine(localDir, directory.Name));
-                            // 列表页大小向下取整到整 MB；创建占位前通过直链 HEAD 取得精确字节数，
-                            // 避免在 FETCH_DATA 期间修改正在水化的文件。
-                            //   PicPlayer 页 → sketch hash → upload_dir/file/<yyyyMM>/<hash>.<ext>
-                            //   直链 → HEAD Content-Length
-                            // 探测结果写 real_size + direct_url + probed_upload_time；
-                            // 之后列举时 upload_time 不变 → 不再重复探测。
-                            // 探测失败仍降级用声明值+余量，不阻塞列举。
-                            ProbeRealSizes(identity.FileId, remoteItems);
-
-                            items = EnrichFolderTimes(cache, identity.DiskId, cache.ListCachedItems(identity.DiskId, identity.FileId));
+                            // A failed refresh must not turn an existing local directory into
+                            // an error or interpret a login/error page as an empty snapshot.
+                            Log?.Invoke($"[REFRESH] 云端查询未成功，保留已有列表 folder={nodeKey}: {error.Message}");
+                            cacheHit = false;
+                            items = EnrichFolderTimes(cache, identity.DiskId,
+                                cache.ListCachedItems(identity.DiskId, identity.FileId));
                             SetMem(nodeKey, items);
                         }
+                        finally
+                        {
+                            ListThrottle.Release();
+                        }
                     }
-                    finally
+
+                    // Memory cache can predate enumeration of a child folder. Refresh folder
+                    // timestamps from SQLite before deriving this directory's timestamp.
+                    items = EnrichFolderTimes(cache, identity.DiskId, items);
+                    ReconcileExistingPlaceholderSizes(localDir, items);
+
+                    var count = EnsurePlaceholders(nodeKey, localDir, cacheHit, out var built, () =>
                     {
-                        ListThrottle.Release();
-                    }
+                        var permission = cache.GetDirectoryPermission(UserKey, identity.DiskId, identity.FileId);
+                        var phs = PlaceholderCreator.Build(identity.DiskId, identity.FileId, items, out var ids,
+                            readOnly: permission != DirectoryPermission.FullAccess);
+                        return (phs, ids);
+                    });
+                    if (built && DiagAllowed(nodeKey))
+                        Log?.Invoke($"[DEBUG] 占位已准备 folder={nodeKey} count={count}");
                 }
-
-                // Memory cache can predate enumeration of a child folder. Refresh folder
-                // timestamps from SQLite before deriving this directory's timestamp.
-                items = EnrichFolderTimes(cache, identity.DiskId, items);
-                ReconcileExistingPlaceholderSizes(localDir, items);
-
-                var count = EnsurePlaceholders(nodeKey, localDir, cacheHit, out var built, () =>
-                {
-                    var permission = cache.GetDirectoryPermission(UserKey, identity.DiskId, identity.FileId);
-                    var phs = PlaceholderCreator.Build(identity.DiskId, identity.FileId, items, out var ids,
-                        readOnly: permission != DirectoryPermission.FullAccess);
-                    return (phs, ids);
-                });
-                if (built && DiagAllowed(nodeKey))
-                    Log?.Invoke($"[DEBUG] 占位已准备 folder={nodeKey} count={count}");
             }
 
             // === 目录占位修改时间推导（2026-10-05）===
@@ -1270,6 +1264,7 @@ public static class Callbacks
 
         if (!hr.Failed && completionStatus == NTStatus.STATUS_SUCCESS)
         {
+            _directoryRefresh?.Schedule(identity, populatedDir);
             var nodeKey = new NodeKey(identity);
             var firstTime = PopulatedFolders.TryAdd(nodeKey, (int)totalCount);
             PopulatedFolders[nodeKey] = (int)totalCount;
@@ -1621,6 +1616,52 @@ public static class Callbacks
         }
     }
 
+    private static void ReconcileRemovedPlaceholders(FileIdentity parent, string localDir,
+        IReadOnlyList<Net.YuWangItem> remoteItems)
+    {
+        var expected = remoteItems.ToDictionary(item => (item.Id, item.IsFolder), item => item.Name);
+        foreach (var path in Directory.EnumerateFileSystemEntries(localDir))
+        {
+            if (!ProviderIdentity.TryReadPlaceholderIdentity(path, out var actual)
+                || actual.DiskId != parent.DiskId || actual.FolderId != parent.FileId)
+                continue;
+            if (expected.TryGetValue((actual.FileId, actual.Type == 0), out var name)
+                && string.Equals(Path.GetFileName(path), name, StringComparison.OrdinalIgnoreCase))
+                continue;
+            RemoveUnhydratedPlaceholder(path, actual);
+        }
+    }
+
+    private static void RemoveUnhydratedPlaceholder(string path, FileIdentity identity)
+    {
+        try
+        {
+            if (identity.Type == 0)
+            {
+                foreach (var child in Directory.EnumerateFileSystemEntries(path))
+                    if (ProviderIdentity.TryReadPlaceholderIdentity(child, out var childIdentity)
+                        && childIdentity.DiskId == identity.DiskId && childIdentity.FolderId == identity.FileId)
+                        RemoveUnhydratedPlaceholder(child, childIdentity);
+                if (Directory.EnumerateFileSystemEntries(path).Any()) return;
+            }
+            else
+            {
+                // Preserve local content and unsynchronized edits. Refresh only removes
+                // stale cloud metadata; it must never discard downloaded/user data.
+                if (!IsHydrationQuiet(identity.FileId, quietMs: 200)
+                    || !PlaceholderUpdater.TryGetPlaceholderDataState(path, out var state)
+                    || state.OnDiskDataSize != 0 || state.InSyncState != CF_IN_SYNC_STATE.CF_IN_SYNC_STATE_IN_SYNC)
+                    return;
+                var attributes = File.GetAttributes(path);
+                if ((attributes & FileAttributes.ReadOnly) != 0)
+                    File.SetAttributes(path, attributes & ~FileAttributes.ReadOnly);
+            }
+            if (PlaceholderUpdater.DeletePlaceholderSafe(path, identity.Type == 0, Log))
+                Log?.Invoke($"[REFRESH] 已移除云端列表中不存在的未下载占位: {path}");
+        }
+        catch (Exception error) { Log?.Invoke($"[REFRESH] 保留无法移除的旧占位 '{path}': {error.Message}"); }
+    }
+
     /// <summary>退出时打印回调统计，用于量化 Explorer 的重复枚举程度</summary>
     public static void LogCallbackStats()
     {
@@ -1685,7 +1726,7 @@ public static class Callbacks
 
     /// <summary>
     /// 目录缓存与自动刷新共用的周期（来自 appsettings 的 FolderCacheMinutes）。
-    /// 过期判断统一基于 SQLite last_listed；到期后打开目录会清理进程快照并触发联网刷新。
+    /// 首次填充与后台预拉取基于 SQLite last_listed 复用缓存；重新开启后的目录枚举会绕过缓存查询云端。
     /// 取值由 Program 归一化到 **1~120 分钟**（无效值 ≤0 或 &gt;120 重置为 30）。
     /// </summary>
     public static TimeSpan FolderCache { get; set; } = TimeSpan.FromMinutes(30);

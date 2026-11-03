@@ -84,6 +84,7 @@ internal static class Program
     private static void StartPinStateWatcher()
     {
         StopPinStateWatcher();
+        Callbacks.StartDirectoryRefresh();
         var watcher = new CloudFilePinStateWatcher(_ctx.SyncRootPath,
             message => Log.Information("{Msg}", message));
         try
@@ -100,6 +101,7 @@ internal static class Program
 
     private static void StopPinStateWatcher()
     {
+        Callbacks.StopDirectoryRefresh();
         var watcher = Interlocked.Exchange(ref _pinStateWatcher, null);
         watcher?.Stop();
     }

@@ -157,7 +157,7 @@ public sealed class SyncRootContext
     /// </summary>
     public string[] LegacySyncRootPaths { get; set; } = [];
     /// <summary>
-    /// 目录缓存与自动刷新的统一周期（分钟）。缓存未过期时复用本地数据；到期后，重进目录会触发云端刷新，
+    /// 首次目录填充与后台预拉取的缓存周期（分钟）；资源管理器重新枚举目录时会绕过该缓存查询云端，
     /// 后台预拉取也使用同一周期去重。合法区间 1~120；无效值启动时重置为 30 分钟并告警。
     /// </summary>
     public int FolderCacheMinutes { get; set; } = 30;

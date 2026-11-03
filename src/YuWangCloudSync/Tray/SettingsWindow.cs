@@ -177,7 +177,7 @@ internal sealed class SettingsWindow : Window
         cacheGrid.ColumnDefinitions[0].Width = new GridLength(LabelColumnWidth * 1.1);
         Add(cacheGrid, NewLabel("目录缓存与自动刷新周期（分钟）"), 0, 0);
         Add(cacheGrid, MinutesInputRow(_folderCache), 0, 1);
-        Add(cacheGrid, NewNote("到期后后台更新，重进目录联网刷新。"), 1, 0, 2);
+        Add(cacheGrid, NewNote("到期后后台更新，重进目录联网刷新，不影响手动刷新。"), 1, 0, 2);
         Add(cacheGrid, NewNote("有效值 1—120 分钟。"), 2, 0, 2);
         AddCard(content, "缓存与刷新", cacheGrid);
 

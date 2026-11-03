@@ -1,6 +1,9 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Reflection;
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
 using System.Runtime.InteropServices;
 using YuWangCloudSync.CloudFiles;
 using YuWangCloudSync.Core;
@@ -47,6 +50,7 @@ CF_CONNECTION_KEY connection = default;
 var counts = new ConcurrentDictionary<ulong, int>();
 var messages = new ConcurrentQueue<string>();
 var hydrationRequests = 0;
+var providerDeleteNotifications = 0;
 using var cache = new SqliteCache(Path.Combine(testBase, "cache.db"));
 Callbacks.Cache = cache;
 Callbacks.Client = null;
@@ -88,7 +92,14 @@ CF_CALLBACK_REGISTRATION[] callbacks =
 [
     new() { Type = CF_CALLBACK_TYPE.CF_CALLBACK_TYPE_FETCH_PLACEHOLDERS, Callback = callback },
     new() { Type = CF_CALLBACK_TYPE.CF_CALLBACK_TYPE_FETCH_DATA, Callback = fetchData },
-    new() { Type = CF_CALLBACK_TYPE.CF_CALLBACK_TYPE_NOTIFY_FILE_OPEN_COMPLETION, Callback = Callbacks.OnNotifyFileOpenCompletion },
+    new() { Type = CF_CALLBACK_TYPE.CF_CALLBACK_TYPE_NOTIFY_DELETE,
+        Callback = (in CF_CALLBACK_INFO info, in CF_CALLBACK_PARAMETERS parameters) =>
+        {
+            Interlocked.Increment(ref providerDeleteNotifications);
+            Callbacks.OnNotifyDelete(info, parameters);
+        } },
+    new() { Type = CF_CALLBACK_TYPE.CF_CALLBACK_TYPE_NOTIFY_DELETE_COMPLETION,
+        Callback = Callbacks.OnNotifyDeleteCompletion },
     CF_CALLBACK_REGISTRATION.CF_CALLBACK_REGISTRATION_END
 ];
 
@@ -203,7 +214,69 @@ try
 
     Check(!messages.Any(message => message.Contains("失败") || message.Contains("异常")), "no provider errors");
     Console.WriteLine("PASS: native CFAPI population, repeated file opens, empty/filtered/absent queries and refresh.");
+
+    // Exercise a real external re-enumeration after population was disabled. No call
+    // to InvalidateFolderListing or TryEnableOnDemandPopulation is made by this test.
+    // The HTTP fixture verifies that a fresh 30-minute cache cannot hide cloud changes.
+    Seed(106, "refresh", [FileItem(1201, "old.txt"), FileItem(1202, "keep.txt")]);
+    var refreshPath = Path.Combine(root, "refresh");
+    RepeatEnumeration(106, "refresh", "*.txt", 2);
+    File.WriteAllText(Path.Combine(refreshPath, "local-only.local"), "Preserve local content.");
+    Check(cache.IsFolderCached(1, 106, TimeSpan.FromMinutes(30)), "refresh starts with a fresh cache");
+    using (var server = new ListingServer())
+    using (var client = new YuWangClient(server.Address, "", "", Callbacks.Log))
+    {
+        Callbacks.Client = client;
+        server.Html = FolderPage("""
+            <a onclick="showItem('F','1201')" title="文件大小：0 B<br>文件名：renamed.txt"></a>
+            <a onclick="showItem('F','1202')" title="文件大小：0 B<br>文件名：keep.txt"></a>
+            <a onclick="showItem('F','1203')" title="文件大小：0 B<br>文件名：added.txt"></a>
+            """);
+        var armedBefore = ArmCount(refreshPath);
+        Callbacks.StartDirectoryRefresh(); // Includes previously populated directories on restart.
+        WaitForArm(refreshPath, armedBefore);
+        var callbacksBefore = counts[106];
+        EnumerateFromApplication(refreshPath, "*.txt", 3);
+        Check(server.ListRequests == 1, "refresh bypasses fresh SQLite and memory caches exactly once");
+        Check(counts[106] == callbacksBefore + 1, "refresh does not restart enumeration within the same query");
+        Check(!File.Exists(Path.Combine(refreshPath, "old.txt"))
+            && File.Exists(Path.Combine(refreshPath, "renamed.txt")), "cloud rename replaces stale unhydrated placeholder");
+        Check(cache.ListCachedItems(1, 106).Count == 3, "authoritative cache snapshot has no stale names");
+
+        armedBefore = ArmCount(refreshPath);
+        server.Html = "<html>unrelated error page</html>";
+        WaitForArm(refreshPath, armedBefore);
+        EnumerateFromApplication(refreshPath, "*.txt", 3);
+        Check(server.ListRequests == 2 && cache.ListCachedItems(1, 106).Count == 3,
+            "invalid cloud page preserves cache and local files");
+
+        armedBefore = ArmCount(refreshPath);
+        server.Html = FolderPage("<a onclick=\"showItem('F','1202')\" title=\"missing name\"></a>");
+        WaitForArm(refreshPath, armedBefore);
+        EnumerateFromApplication(refreshPath, "*.txt", 3);
+        Check(server.ListRequests == 3 && cache.ListCachedItems(1, 106).Count == 3,
+            "partially parsed cloud page cannot delete existing entries");
+
+        var retainedCloudFile = Path.Combine(refreshPath, "keep.txt");
+        File.SetAttributes(retainedCloudFile, File.GetAttributes(retainedCloudFile) & ~FileAttributes.ReadOnly);
+        File.WriteAllText(retainedCloudFile, "Retain downloaded or edited cloud content.");
+        armedBefore = ArmCount(refreshPath);
+        server.Html = FolderPage("");
+        WaitForArm(refreshPath, armedBefore);
+        EnumerateFromApplication(refreshPath, "*.txt", 1);
+        Check(server.ListRequests == 4 && cache.ListCachedItems(1, 106).Count == 0,
+            "empty cloud directory clears stale files from SQLite and disk");
+        Check(File.ReadAllText(retainedCloudFile) == "Retain downloaded or edited cloud content.",
+            "cloud placeholders with local content survive remote deletion");
+        Check(File.ReadAllText(Path.Combine(refreshPath, "local-only.local")) == "Preserve local content.",
+            "local user content is retained during refresh");
+        Check(providerDeleteNotifications == 0, "provider reconciliation does not send cloud delete callbacks");
+        Callbacks.StopDirectoryRefresh();
+        Callbacks.Client = null;
+    }
+    Console.WriteLine("PASS: automatic rearm, fresh-cache HTTP refresh, rename/add/delete, invalid page and local data preservation.");
 }
+
 catch (Exception error)
 {
     Console.Error.WriteLine(error);
@@ -211,6 +284,7 @@ catch (Exception error)
 }
 finally
 {
+    Callbacks.StopDirectoryRefresh();
     if (connected) RequireSuccess(CfDisconnectSyncRoot(connection), "disconnect");
     GC.KeepAlive(callbacks);
     GC.KeepAlive(callback);
@@ -222,6 +296,14 @@ finally
     // Only delete this freshly generated temporary directory, after unregistering it.
     DeleteTestDirectory(testBase);
 }
+
+int ArmCount(string path) => messages.Count(message => message.StartsWith("[POP] 已重开按需填充")
+    && message.EndsWith(": " + path, StringComparison.Ordinal));
+
+void WaitForArm(string path, int previous) => Check(SpinWait.SpinUntil(() => ArmCount(path) > previous, 10_000),
+    "directory automatically rearmed outside the callback: " + path);
+
+static string FolderPage(string items) => "<input name='diskid' value='1'><input name='folderid' value='106'>" + items;
 
 void Seed(ulong folder, string name, IReadOnlyList<YuWangItem> items)
 {
@@ -317,5 +399,65 @@ static class NativeQueries
             return count;
         }
         finally { FindClose(handle); }
+    }
+}
+
+sealed class ListingServer : IDisposable
+{
+    private readonly HttpListener _listener = new();
+    private readonly Task _worker;
+    private volatile string _html = "";
+    private int _listRequests;
+    public string Html { get => _html; set => _html = value; }
+    public int ListRequests => Volatile.Read(ref _listRequests);
+    public string Address { get; }
+
+    public ListingServer()
+    {
+        using var portProbe = new TcpListener(IPAddress.Loopback, 0);
+        portProbe.Start();
+        var port = ((IPEndPoint)portProbe.LocalEndpoint).Port;
+        portProbe.Stop();
+        Address = $"http://127.0.0.1:{port}";
+        _listener.Prefixes.Add(Address + "/");
+        _listener.Start();
+        _worker = Task.Run(async () =>
+        {
+            try
+            {
+                while (_listener.IsListening)
+                {
+                    var request = await _listener.GetContextAsync();
+                    var path = request.Request.Url!.AbsolutePath;
+                    string body;
+                    if (request.Request.QueryString["method"] == "list")
+                    {
+                        Interlocked.Increment(ref _listRequests);
+                        body = Html;
+                    }
+                    else if (request.Request.QueryString["method"] == "beforePaste") body = "forbidden";
+                    else if (path == "/fmsPicPlayerAction.jsx")
+                        body = "upload_dir/sketch/202611/0123456789abcdef0123456789abcdef.png";
+                    else if (path.StartsWith("/upload_dir/file/"))
+                    {
+                        request.Response.StatusCode = 404;
+                        body = "";
+                    }
+                    else throw new InvalidOperationException("Unexpected fixture request: " + request.Request.RawUrl);
+                    var bytes = Encoding.UTF8.GetBytes(body);
+                    request.Response.ContentType = "text/html; charset=utf-8";
+                    request.Response.ContentLength64 = bytes.Length;
+                    if (request.Request.HttpMethod != "HEAD") await request.Response.OutputStream.WriteAsync(bytes);
+                    request.Response.Close();
+                }
+            }
+            catch (Exception error) when (error is HttpListenerException or ObjectDisposedException) { }
+        });
+    }
+
+    public void Dispose()
+    {
+        _listener.Close();
+        _worker.GetAwaiter().GetResult();
     }
 }

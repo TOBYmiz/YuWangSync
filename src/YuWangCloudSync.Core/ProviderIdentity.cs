@@ -53,6 +53,15 @@ public static class ProviderIdentity
             && unchecked((uint)BitConverter.ToInt32(identity, 0)) == FileIdentity.MagicExpected;
     }
 
+    public static bool TryReadPlaceholderIdentity(string path, out FileIdentity identity)
+    {
+        identity = default;
+        var bytes = GetPlaceholderIdentity(path);
+        if (bytes == null || BitConverter.ToUInt32(bytes, 0) != FileIdentity.MagicExpected) return false;
+        identity = FileIdentity.Deserialize(bytes, bytes.Length);
+        return identity.IsValid;
+    }
+
     public static bool OwnsSyncRootPlaceholder(string path)
     {
         try

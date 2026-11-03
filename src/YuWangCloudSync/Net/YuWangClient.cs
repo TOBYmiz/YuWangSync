@@ -265,7 +265,11 @@ public sealed class YuWangClient : IDisposable
                 _log($"[WARN] ListFolder disk={diskId} folder={folderId} 疑似异常页（showItem={showItemCount}, len={html.Length}）");
 
             var items = HtmlParser.ExtractItems(html);
-            var validPage = IsExpectedFolderPage(html, diskId, folderId);
+            // A partial/changed page must not become an authoritative deletion snapshot.
+            // The parser can skip a block whose title/name is missing or malformed.
+            var declaredItems = Regex.Matches(html, @"showItem\('[A-Z]','(\d+)'")
+                .Select(match => match.Groups[1].Value).Distinct(StringComparer.Ordinal).Count();
+            var validPage = IsExpectedFolderPage(html, diskId, folderId) && declaredItems == items.Count;
             var permission = DirectoryPermission.Unknown;
             if (validPage)
             {
