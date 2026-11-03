@@ -19,7 +19,7 @@
 - **隐私保护**：手机号账户名隐藏中间四位
 ## 快速开始
 
-要求：Windows 10 19041+ x64。内置来自 .NET 10 Runtime 的必要文件，主版本也含 Windows App Runtime 依赖。
+要求：Windows 10 17763+ x64。内置来自 .NET 10 Runtime 的必要文件，主版本也含 Windows App Runtime 依赖。
 
 前往 [Release 页面](https://github.com/TOBYmiz/YuWangSync/releases/latest)，下载最新版本安装包。如果已安装 Windows App Runtime 2.5.1+（对应 Windows App SDK 2.5.1+），可以使用 `WinAppSDK_Required` 版本。安装后资源管理器导航窗格出现"育网云"，双击占位文件自动下载并打开。
 
@@ -59,3 +59,4 @@ WinUI 3 主程序使用 `App.xaml` 创建 STA/DispatcherQueue UI 线程，并把
 
 所有隐私数据保存在本地，程序仅在必要时连接你配置的服务器，以及向 GitHub 检查更新。安装时需要管理员权限，会注册资源管理器集成，某些敏感操作可能会被安全软件拦截。
 
+请勿强制删除程序。如强制删除产生残留的同步目录注册，请在重新安装时选择相应位置以清理残留。
