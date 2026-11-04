@@ -210,21 +210,32 @@ internal static class Program
                 "--prepare-syncroot-for-setup", StringComparison.OrdinalIgnoreCase));
             var cleanupSelectedSyncRootForSetupIndex = Array.FindIndex(args, argument => string.Equals(argument,
                 "--cleanup-selected-syncroot-for-setup", StringComparison.OrdinalIgnoreCase));
-            if (prepareSyncRootForSetup || cleanupSelectedSyncRootForSetupIndex >= 0)
+            var unregister = args.Any(argument => string.Equals(argument,
+                "--unregister", StringComparison.OrdinalIgnoreCase));
+            if (prepareSyncRootForSetup || cleanupSelectedSyncRootForSetupIndex >= 0 || unregister)
             {
                 try
                 {
-                    Log.Information("安装同步目录页恢复入口：初始化 WinRT STA");
+                    Log.Information("维护入口：初始化 WinRT STA");
                     var initializeResult = RoInitialize(0); // RO_INIT_SINGLETHREADED
                     if (initializeResult < 0)
                         System.Runtime.InteropServices.Marshal.ThrowExceptionForHR(initializeResult);
-                    Log.Information("安装同步目录页恢复入口：WinRT STA 已初始化（HRESULT=0x{Hresult:X8}）",
+                    Log.Information("维护入口：WinRT STA 已初始化（HRESULT=0x{Hresult:X8}）",
                         initializeResult);
                     try
                     {
                         WinRT.ComWrappersSupport.InitializeComWrappers();
-                        Log.Information("安装同步目录页恢复入口：WinRT COM 包装器已初始化");
-                        if (prepareSyncRootForSetup)
+                        Log.Information("维护入口：WinRT COM 包装器已初始化");
+                        if (unregister)
+                        {
+                            CloudFilesPlatform.EnsureSupported();
+                            using var mutex = new Mutex(true, SingleInstanceMutexName, out var createdNew);
+                            if (!createdNew)
+                                throw new IOException("同步进程仍在运行，请先退出后再卸载。");
+                            try { Environment.ExitCode = UnregisterSyncRoots(args); }
+                            finally { mutex.ReleaseMutex(); }
+                        }
+                        else if (prepareSyncRootForSetup)
                         {
                             Log.Information("安装同步目录页恢复入口：开始检查残留 SyncRoot 注册");
                             Environment.ExitCode = PrepareSyncRootForSetup();
@@ -245,7 +256,7 @@ internal static class Program
                 catch (Exception error)
                 {
                     Environment.ExitCode = 1;
-                    Log.Error(error, "安装同步目录页处理残留 SyncRoot 注册失败");
+                    Log.Error(error, "维护命令处理 SyncRoot 注册失败");
                 }
                 Log.CloseAndFlush();
                 return;
@@ -334,6 +345,98 @@ internal static class Program
             HandleFatalException(error, _startupStage);
             Log.CloseAndFlush();
         }
+    }
+
+    private static int UnregisterSyncRoots(string[] args)
+    {
+        try { LoadConfig(args); }
+        catch (FileNotFoundException error)
+        {
+            // Registration discovery does not require a surviving configuration or folder.
+            Log.Information(error, "卸载配置文件缺失，继续枚举本用户的残留注册");
+        }
+
+        var roots = SyncRootShellRegistration.GetRegisteredRoots().ToList();
+        foreach (var path in new[] { _ctx.SyncRootPath }.Concat(_ctx.LegacySyncRootPaths ?? []))
+        {
+            if (!string.IsNullOrWhiteSpace(path))
+                roots.Add((SyncRootShellRegistration.RegistrationId, Path.GetFullPath(path)));
+        }
+        var groups = roots.GroupBy(root => Path.GetFullPath(root.Path).TrimEnd('\\'),
+            StringComparer.OrdinalIgnoreCase).ToArray();
+        var keepDownloadedFiles = args.Any(argument => string.Equals(argument,
+            "--keep-downloaded-files", StringComparison.OrdinalIgnoreCase));
+        var failures = 0;
+        foreach (var group in groups)
+        {
+            try
+            {
+                UnregisterSyncRoot(group.First().Path,
+                    group.Select(root => root.Id).Distinct(StringComparer.OrdinalIgnoreCase).ToArray(),
+                    keepDownloadedFiles);
+            }
+            catch (Exception error)
+            {
+                failures++;
+                Log.Error(error, "卸载同步目录失败：{Path}", group.First().Path);
+            }
+        }
+
+        var remaining = SyncRootShellRegistration.GetShellRegisteredRoots();
+        var registeredPaths = groups.Select(group => group.First().Path)
+            .Where(path => ProviderIdentity.OwnsRoot(path, allowLegacy: true, providerName: _ctx.ProviderName))
+            .ToArray();
+        if (remaining.Length != 0 || registeredPaths.Length != 0)
+        {
+            Log.Error("卸载后仍有资源管理器注册 {ShellCount} 个、CFAPI 注册 {CloudCount} 个，停止卸载",
+                remaining.Length, registeredPaths.Length);
+            failures++;
+        }
+        if (failures != 0) return 1;
+        Log.Information("已清理全部同步目录注册和资源管理器导航项");
+        return 0;
+    }
+
+    private static void UnregisterSyncRoot(string path, string[] registrationIds, bool keepDownloadedFiles)
+    {
+        var ownsContents = ProviderIdentity.OwnsRoot(path, allowLegacy: true, providerName: _ctx.ProviderName)
+            || ProviderIdentity.OwnsSyncRootPlaceholder(path);
+        if (ownsContents)
+        {
+            // Delete/convert placeholders while the provider is connected. Disconnecting
+            // first can cause cldflt to reject orphan placeholder deletion.
+            var connected = false;
+            try
+            {
+                _callbackTable = CallbackTable.BuildForCleanup();
+                var result = CfConnectSyncRoot(path, _callbackTable, IntPtr.Zero,
+                    CF_CONNECT_FLAGS.CF_CONNECT_FLAG_NONE, out _connectionKey);
+                connected = result.Succeeded;
+                if (!connected)
+                    Log.Warning("连接 SyncRoot 失败，将尝试清理孤儿占位：{Path}; {Result}", path, result);
+                if (CleanupSyncRootContents(path, keepDownloadedFiles) != 0)
+                    throw new IOException("部分占位未能清理，保留 SyncRoot 注册以便重试。");
+            }
+            finally
+            {
+                if (connected)
+                {
+                    var result = CfDisconnectSyncRoot(_connectionKey);
+                    if (result.Failed) Log.Warning("断开 SyncRoot 失败：{Result}", result);
+                }
+            }
+        }
+        else
+        {
+            Log.Information("目录已不存在或不再由本程序持有，继续清理残留导航注册：{Path}", path);
+        }
+
+        foreach (var id in registrationIds)
+            SyncRootRegistrar.UnregisterDiscoveredRoot(path, id, _ctx.ProviderName);
+        if (ProviderIdentity.OwnsRoot(path, allowLegacy: true, providerName: _ctx.ProviderName))
+            throw new IOException($"SyncRoot 仍由本程序持有：{path}");
+        if (ownsContents) RemoveEmptySyncRootDirectory(path);
+        Log.Information("已注销同步目录和导航项：{Path}", path);
     }
 
     private static int PrepareSyncRootForSetup()
@@ -605,33 +708,7 @@ internal static class Program
             || string.Equals(a, "-open-folder", StringComparison.OrdinalIgnoreCase));
         _showAbout = args.Any(a => string.Equals(a, "-about", StringComparison.OrdinalIgnoreCase));
         // 1. 加载配置
-        try
-        {
-            LoadConfig(args);
-        }
-        catch (FileNotFoundException ex) when (args.Any(a =>
-                   string.Equals(a, "--unregister", StringComparison.OrdinalIgnoreCase)))
-        {
-            // 用户数据可能已被提前删除。无配置时不能假设默认路径就是实际挂载点；
-            // 先枚举当前用户中带有本 ProviderId 的注册，再检查默认路径。只有确认两处都没有
-            // 本程序的 SyncRoot 时才把卸载当作已完成，仍发现注册则保留失败状态以免遗留它。
-            var registeredRoots = SyncRootShellRegistration.GetRegisteredRootPaths();
-            var defaultRootRegistered = ProviderIdentity.OwnsRoot(
-                _ctx.SyncRootPath, allowLegacy: true, providerName: _ctx.ProviderName);
-            if (registeredRoots.Length == 0 && !defaultRootRegistered)
-            {
-                Log.Information(ex, "卸载配置文件缺失，且未发现本程序注册的 SyncRoot；跳过清理和反注册");
-                Log.CloseAndFlush();
-                return;
-            }
-
-            var roots = registeredRoots.ToList();
-            if (defaultRootRegistered && !roots.Contains(_ctx.SyncRootPath, StringComparer.OrdinalIgnoreCase))
-                roots.Add(_ctx.SyncRootPath);
-            throw new InvalidOperationException(
-                $"卸载配置文件缺失，但仍发现本程序注册的 SyncRoot（{roots.Count} 个）。请恢复配置或重新安装后再卸载。",
-                ex);
-        }
+        LoadConfig(args);
         // 双模收口：解析运行模式。
         //   --quiet  : 无头模式（无 UI、无控制台、仅文件日志；无会话则直接退出）。
         //   --console: 显式分配调试控制台（控制台日志 + 控制台读验证码）。
@@ -743,104 +820,6 @@ internal static class Program
                 }
                 Log.CloseAndFlush();
             }
-            return;
-        }
-
-        // 1b. --unregister：彻底卸载（常驻注册的逃生开关）
-        //     连接 → 清空占位内容 → 断开 → 反注册。
-        //     关键顺序：清理占位必须在【连接仍建立时】做（见步骤 11 注释）——Provider 仍连接时，
-        //     cldflt 才会把删除路由到栈并放行占位删除；一旦 Unregister/CfDisconnectSyncRoot，
-        //     孤儿重解析点会被 cldflt 拒绝（SAFE_DELETE_FAIL_CLOSED / 0x80070194），清理失效。
-        //     故先连接再清空，最后才反注册（旧版"先 Unregister 再清空"的顺序是错的）。
-        if (args.Any(a => string.Equals(a, "--unregister", StringComparison.OrdinalIgnoreCase)))
-        {
-            if (!ProviderIdentity.OwnsRoot(_ctx.SyncRootPath, allowLegacy: true, providerName: _ctx.ProviderName))
-            {
-                Log.Warning("目标未注册为本程序的 SyncRoot，跳过清理: {Path}", _ctx.SyncRootPath);
-                Log.CloseAndFlush();
-                return;
-            }
-            Log.Information("收到 --unregister：开始彻底卸载 {Path}", _ctx.SyncRootPath);
-            var connected = false;
-            try
-            {
-                _callbackTable = CallbackTable.BuildForCleanup();
-                var hr = CfConnectSyncRoot(_ctx.SyncRootPath, _callbackTable, IntPtr.Zero,
-                    CF_CONNECT_FLAGS.CF_CONNECT_FLAG_NONE, out _connectionKey);
-                if (hr.Failed)
-                    Log.Warning("CfConnectSyncRoot 失败: {Hr}（将尝试以孤儿占位方式清理）", hr);
-                else
-                {
-                    connected = true;
-                    Log.Information("已连接 SyncRoot，开始清空占位内容（Provider 仍连接，删除才会被 cldflt 放行）");
-                }
-            }
-            catch (Exception ex)
-            {
-                Log.Warning(ex, "连接 SyncRoot 异常（将以孤儿占位方式清理）");
-            }
-
-            try
-            {
-                var keepDownloadedFiles = args.Any(a => string.Equals(a, "--keep-downloaded-files", StringComparison.OrdinalIgnoreCase));
-                if (CleanupSyncRootContents(_ctx.SyncRootPath, keepDownloadedFiles) != 0)
-                    throw new IOException("部分占位未能清理，保留 SyncRoot 注册以便重试。");
-                Log.Information("已清空占位内容");
-            }
-            catch (Exception ex)
-            {
-                Log.Warning(ex, "清空占位内容失败");
-                Environment.ExitCode = 1;
-            }
-
-            if (connected)
-            {
-                try
-                {
-                    var d = CfDisconnectSyncRoot(_connectionKey);
-                    if (d.Failed) Log.Warning("CfDisconnectSyncRoot 失败: {Hr}", d);
-                }
-                catch (Exception ex) { Log.Warning(ex, "CfDisconnectSyncRoot 异常（忽略，继续反注册）"); }
-            }
-
-            var syncRootUnregistered = false;
-            if (Environment.ExitCode != 0)
-            {
-                Log.CloseAndFlush();
-                return;
-            }
-            try
-            {
-                if (!ProviderIdentity.OwnsRoot(_ctx.SyncRootPath, allowLegacy: true, providerName: _ctx.ProviderName))
-                {
-                    Log.Information("SyncRoot 已不存在或不再由本程序持有，跳过反注册");
-                }
-                else
-                {
-                    SyncRootRegistrar.Unregister(_ctx.SyncRootPath, _ctx.ProviderName);
-                    syncRootUnregistered = true;
-                    Log.Information("已反注册 SyncRoot");
-                }
-            }
-            catch (Exception ex)
-            {
-                // 反注册期间状态可能已被其他清理流程移除。只有路径仍明确由本程序持有时，
-                // 反注册失败才阻止卸载；未注册或已被移除均视为清理目标已不存在。
-                if (!ProviderIdentity.OwnsRoot(_ctx.SyncRootPath, allowLegacy: true, providerName: _ctx.ProviderName))
-                {
-                    syncRootUnregistered = true;
-                    Log.Information(ex, "反注册时 SyncRoot 已不存在或不再由本程序持有，按已清理处理");
-                }
-                else
-                {
-                    Log.Warning(ex, "反注册失败，SyncRoot 仍由本程序持有");
-                    Environment.ExitCode = 1;
-                }
-            }
-            if (syncRootUnregistered && Environment.ExitCode == 0)
-                RemoveEmptySyncRootDirectory(_ctx.SyncRootPath);
-            Log.Information("卸载完成");
-            Log.CloseAndFlush();
             return;
         }
 

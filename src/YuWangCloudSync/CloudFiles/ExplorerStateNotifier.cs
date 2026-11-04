@@ -23,6 +23,11 @@ internal static class ExplorerStateNotifier
 
     public static void NotifyDirectory(string path) => Notify(path, ShcneUpdateDir);
 
+    // Maintenance commands exit immediately, so do not queue registration changes
+    // on the timer used to coalesce ordinary placeholder updates.
+    public static void NotifyRegistrationChange() =>
+        SHChangeNotify(0x08000000, 0, null, IntPtr.Zero);
+
     private static void Notify(string path, uint eventId)
     {
         try
@@ -64,5 +69,5 @@ internal static class ExplorerStateNotifier
     }
 
     [DllImport("shell32.dll", CharSet = CharSet.Unicode, ExactSpelling = true)]
-    private static extern void SHChangeNotify(uint eventId, uint flags, string item1, IntPtr item2);
+    private static extern void SHChangeNotify(uint eventId, uint flags, string? item1, IntPtr item2);
 }

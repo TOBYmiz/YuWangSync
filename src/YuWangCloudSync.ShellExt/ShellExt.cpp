@@ -136,7 +136,8 @@ STDAPI DllUnregisterServer()
     if (status != ERROR_SUCCESS) return HRESULT_FROM_WIN32(status);
     const ATL::CStringW classKey = ATL::CStringW(L"Classes\\CLSID\\") + ClassId;
     const ATL::CStringW progKey = ATL::CStringW(L"Classes\\") + ProgId;
-    const wchar_t* keys[] = {classKey, progKey, OverlayKey};
+    // machine is already opened at HKLM\SOFTWARE; all paths here are relative.
+    const wchar_t* keys[] = {classKey, progKey, OverlayKey + wcslen(L"SOFTWARE\\")};
     for (const auto* key : keys)
     {
         status = machine.RecurseDeleteKey(key);

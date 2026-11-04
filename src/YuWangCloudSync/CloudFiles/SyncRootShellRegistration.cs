@@ -10,7 +10,7 @@ namespace YuWangCloudSync.CloudFiles;
 
 internal static class SyncRootShellRegistration
 {
-    private static string RegistrationId => ProductIdentity.SyncRootRegistrationPrefix
+    internal static string RegistrationId => ProductIdentity.SyncRootRegistrationPrefix
         + WindowsIdentity.GetCurrent().User!.Value + "!Default";
 
     public static void Update(string syncRootPath, string providerName, string iconPath)
@@ -96,6 +96,7 @@ internal static class SyncRootShellRegistration
         catch { /* 注册表兜底仍可清理残留项。 */ }
 
         RemoveRegistryRegistration(registrationId, syncRootPath);
+        ExplorerStateNotifier.NotifyRegistrationChange();
     }
 
     public static void Remove(string syncRootPath)
@@ -112,42 +113,12 @@ internal static class SyncRootShellRegistration
         var roots = new List<(string Id, string Path)>();
         var sid = WindowsIdentity.GetCurrent().User?.Value;
         if (string.IsNullOrWhiteSpace(sid)) return roots.ToArray();
-        var registrationPrefix = ProductIdentity.SyncRootRegistrationPrefix + sid + "!";
-
         foreach (var hive in new[] { RegistryHive.LocalMachine, RegistryHive.CurrentUser })
         foreach (var view in new[] { RegistryView.Registry64, RegistryView.Registry32 })
         {
-            RegistryKey? baseKey = null;
-            RegistryKey? manager = null;
-            try
-            {
-                baseKey = RegistryKey.OpenBaseKey(hive, view);
-                manager = baseKey.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Explorer\SyncRootManager");
-                if (manager == null) continue;
-
-                foreach (var id in manager.GetSubKeyNames())
-                {
-                    if (!id.StartsWith(registrationPrefix,
-                            StringComparison.OrdinalIgnoreCase))
-                        continue;
-                    using var userRoots = manager.OpenSubKey(id + "\\UserSyncRoots");
-                    var path = userRoots?.GetValue(sid) as string;
-                    if (string.IsNullOrWhiteSpace(path)) continue;
-                    string fullPath;
-                    try { fullPath = Path.GetFullPath(path); }
-                    catch { continue; }
-                    roots.Add((id, fullPath));
-                }
-            }
-            catch
-            {
-                // Registry access can be denied for one view; continue with the others.
-            }
-            finally
-            {
-                manager?.Dispose();
-                baseKey?.Dispose();
-            }
+            using var baseKey = RegistryKey.OpenBaseKey(hive, view);
+            roots.AddRange(SyncRootShellRegistry.ReadRoots(baseKey, sid,
+                includeNamespaces: hive == RegistryHive.CurrentUser));
         }
         return roots.ToArray();
     }
@@ -222,36 +193,15 @@ internal static class SyncRootShellRegistration
     private static void RemoveRegistryRegistration(string registrationId, string syncRootPath)
     {
         var sid = WindowsIdentity.GetCurrent().User?.Value;
-        if (string.IsNullOrWhiteSpace(sid)
-            || !registrationId.StartsWith(ProductIdentity.SyncRootRegistrationPrefix + sid + "!",
-                StringComparison.OrdinalIgnoreCase))
-            return;
+        if (string.IsNullOrWhiteSpace(sid))
+            throw new InvalidOperationException("无法确定当前用户，不能注销资源管理器集成。");
 
         foreach (var hive in new[] { RegistryHive.LocalMachine, RegistryHive.CurrentUser })
         foreach (var view in new[] { RegistryView.Registry64, RegistryView.Registry32 })
         {
-            RegistryKey? baseKey = null;
-            RegistryKey? manager = null;
-            try
-            {
-                baseKey = RegistryKey.OpenBaseKey(hive, view);
-                manager = baseKey.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Explorer\SyncRootManager", writable: true);
-                if (manager == null) continue;
-                string? registeredPath;
-                using (var userRoots = manager.OpenSubKey(registrationId + "\\UserSyncRoots", writable: false))
-                    registeredPath = userRoots?.GetValue(sid) as string;
-                if (string.IsNullOrWhiteSpace(registeredPath) || !PathsEqual(registeredPath, syncRootPath)) continue;
-                manager.DeleteSubKeyTree(registrationId, throwOnMissingSubKey: false);
-            }
-            catch
-            {
-                // A later elevated uninstall can retry if this view is read-only.
-            }
-            finally
-            {
-                manager?.Dispose();
-                baseKey?.Dispose();
-            }
+            using var baseKey = RegistryKey.OpenBaseKey(hive, view);
+            SyncRootShellRegistry.Remove(baseKey, sid, registrationId, syncRootPath,
+                includeNamespaces: hive == RegistryHive.CurrentUser);
         }
     }
 }
