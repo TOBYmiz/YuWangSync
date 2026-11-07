@@ -20,7 +20,7 @@ namespace YuWangCloudSync.Net;
 ///    Cookie 头绕过后 100% 成功，C# 侧沿用同一策略。
 /// 2. 所有请求带 Referer（服务器可能有校验）。
 /// </summary>
-public sealed class YuWangClient : IDisposable
+public sealed partial class YuWangClient : IDisposable
 {
     private readonly HttpClient _http;
     private readonly Action<string> _log;
@@ -49,7 +49,7 @@ public sealed class YuWangClient : IDisposable
 
     public YuWangClient(string server, string username, string password, Action<string>? log = null,
         int requestTimeoutSeconds = 30, int downloadTimeoutMinutes = 10,
-        CancellationToken lifetimeToken = default)
+        CancellationToken lifetimeToken = default, HttpMessageHandler? httpHandler = null)
     {
         Server = server.TrimEnd('/');
         Username = username;
@@ -59,7 +59,7 @@ public sealed class YuWangClient : IDisposable
         _downloadTimeout = TimeSpan.FromMinutes(downloadTimeoutMinutes);
         _lifetimeToken = lifetimeToken;
 
-        var handler = new HttpClientHandler
+        var handler = httpHandler ?? new HttpClientHandler
         {
             UseCookies = false,           // 关键：禁用自动 cookie
             AllowAutoRedirect = true,
@@ -289,10 +289,12 @@ public sealed class YuWangClient : IDisposable
         finally { _folderContextGate.Release(); }
     }
 
-    private async Task<string> FetchFolderHtmlCoreAsync(ulong diskId, ulong folderId)
+    private async Task<string> FetchFolderHtmlCoreAsync(ulong diskId, ulong folderId, bool fresh = false)
     {
         using var req = MakeRequest(HttpMethod.Get,
-            $"/fmsFolderInfoIconAction.do?method=list&diskid={diskId}&folderid={folderId}");
+            $"/fmsFolderInfoIconAction.do?method=list&diskid={diskId}&folderid={folderId}"
+            + (fresh ? "&_=" + Guid.NewGuid().ToString("N") : ""));
+        if (fresh) req.Headers.CacheControl = new CacheControlHeaderValue { NoCache = true, NoStore = true };
         using var resp = await SendAsync(req, _requestTimeout).ConfigureAwait(false);
         CaptureSession(resp);
         resp.EnsureSuccessStatusCode();
@@ -335,6 +337,9 @@ public sealed class YuWangClient : IDisposable
         {
             var sourceHtml = await FetchWritableFolderCoreAsync(diskId, sourceFolderId).ConfigureAwait(false);
             if (sourceHtml is null) return false;
+            var sourceItem = RequireCompleteListing(sourceHtml, diskId, sourceFolderId)
+                .SingleOrDefault(item => item.Id == itemId && item.IsFolder == isFolder);
+            if (sourceItem is null) return false;
             var sourceFields = HtmlParser.ExtractPageFormFields(sourceHtml);
             if (sourceFields.Count == 0) return false;
 
@@ -344,6 +349,8 @@ public sealed class YuWangClient : IDisposable
 
             if (targetFolderId.Value == sourceFolderId)
             {
+                if (RequireCompleteListing(sourceHtml, diskId, sourceFolderId)
+                    .Any(item => item.Id != itemId && item.Name.Equals(newName, StringComparison.OrdinalIgnoreCase))) return false;
                 sourceFields.Add(new KeyValuePair<string, string>("fid", itemId.ToString()));
                 sourceFields.Add(new KeyValuePair<string, string>("newname", newName));
                 var method = isFolder ? "changeFolderName" : "changeFileName";
@@ -351,8 +358,18 @@ public sealed class YuWangClient : IDisposable
                 var response = await PostFormCoreAsync($"{endpoint}?method={method}", sourceFields).ConfigureAwait(false);
                 if (!response.Trim().Equals("true", StringComparison.OrdinalIgnoreCase)) return false;
                 var verifyHtml = await FetchFolderHtmlCoreAsync(diskId, sourceFolderId).ConfigureAwait(false);
-                return HtmlParser.ExtractItems(verifyHtml).Any(item => item.Id == itemId && item.Name == newName);
+                return RequireCompleteListing(verifyHtml, diskId, sourceFolderId)
+                    .Any(item => item.Id == itemId && item.IsFolder == isFolder && item.Name == newName);
             }
+
+            var destinationHtml = await FetchWritableFolderCoreAsync(diskId, targetFolderId.Value).ConfigureAwait(false);
+            if (destinationHtml is null || RequireCompleteListing(destinationHtml, diskId, targetFolderId.Value)
+                .Any(item => item.Name.Equals(newName, StringComparison.OrdinalIgnoreCase)
+                    || item.Name.Equals(sourceItem.Name, StringComparison.OrdinalIgnoreCase))) return false;
+            // Re-enter the source before cutting: navigation context lives in this session.
+            sourceHtml = await FetchWritableFolderCoreAsync(diskId, sourceFolderId).ConfigureAwait(false);
+            if (sourceHtml is null) return false;
+            sourceFields = HtmlParser.ExtractPageFormFields(sourceHtml);
 
             sourceFields.Add(new KeyValuePair<string, string>("checkids", $"{(isFolder ? "D" : "F")}_{itemId};"));
             var cutResponse = await PostFormCoreAsync(
@@ -375,8 +392,17 @@ public sealed class YuWangClient : IDisposable
 
             var destination = await FetchFolderHtmlCoreAsync(diskId, targetFolderId.Value).ConfigureAwait(false);
             var source = await FetchFolderHtmlCoreAsync(diskId, sourceFolderId).ConfigureAwait(false);
-            return HtmlParser.ExtractItems(destination).Any(item => item.Id == itemId)
-                && !HtmlParser.ExtractItems(source).Any(item => item.Id == itemId);
+            if (!RequireCompleteListing(destination, diskId, targetFolderId.Value).Any(item => item.Id == itemId && item.IsFolder == isFolder)
+                || RequireCompleteListing(source, diskId, sourceFolderId).Any(item => item.Id == itemId)) return false;
+            if (sourceItem.Name == newName) return true;
+            // A filesystem rename can change both parent and leaf name in one operation.
+            await FetchFolderHtmlCoreAsync(diskId, targetFolderId.Value).ConfigureAwait(false);
+            var renameEndpoint = isFolder ? "/fmsFolderInfoAction.do?method=changeFolderName" : "/fmsFileInfoAction.do?method=changeFileName";
+            var renamed = await PostFormCoreAsync(renameEndpoint,
+                [new("fid", itemId.ToString()), new("newname", newName)]).ConfigureAwait(false);
+            return renamed.Trim().Equals("true", StringComparison.OrdinalIgnoreCase)
+                && RequireCompleteListing(await FetchFolderHtmlCoreAsync(diskId, targetFolderId.Value).ConfigureAwait(false), diskId, targetFolderId.Value)
+                    .Any(item => item.Id == itemId && item.IsFolder == isFolder && item.Name == newName);
         }
         finally { _folderContextGate.Release(); }
     }
@@ -386,6 +412,9 @@ public sealed class YuWangClient : IDisposable
     {
         var html = alreadyFetchedHtml ?? await FetchWritableFolderCoreAsync(diskId, parentFolderId).ConfigureAwait(false);
         if (html is null) return false;
+        var items = RequireCompleteListing(html, diskId, parentFolderId);
+        if (!items.Any(item => item.Id == itemId)) return true;
+        if (!items.Any(item => item.Id == itemId && item.IsFolder == isFolder)) return false;
         var fields = HtmlParser.ExtractPageFormFields(html);
         if (fields.Count == 0) return false;
         fields.Add(new KeyValuePair<string, string>("checkid", $"{(isFolder ? "D" : "F")}_{itemId}"));
@@ -394,13 +423,12 @@ public sealed class YuWangClient : IDisposable
         if (HtmlParser.IsLoginPage(response) || response.Trim().Equals("forbidden", StringComparison.OrdinalIgnoreCase))
             return false;
         var verifyHtml = await FetchFolderHtmlCoreAsync(diskId, parentFolderId).ConfigureAwait(false);
-        return IsExpectedFolderPage(verifyHtml, diskId, parentFolderId)
-            && !HtmlParser.ExtractItems(verifyHtml).Any(item => item.Id == itemId);
+        return !RequireCompleteListing(verifyHtml, diskId, parentFolderId).Any(item => item.Id == itemId);
     }
 
-    private async Task<string?> FetchWritableFolderCoreAsync(ulong diskId, ulong folderId)
+    private async Task<string?> FetchWritableFolderCoreAsync(ulong diskId, ulong folderId, bool fresh = false)
     {
-        var html = await FetchFolderHtmlCoreAsync(diskId, folderId).ConfigureAwait(false);
+        var html = await FetchFolderHtmlCoreAsync(diskId, folderId, fresh).ConfigureAwait(false);
         if (!IsExpectedFolderPage(html, diskId, folderId)) return null;
         var pasteResponse = await CheckBeforePasteCoreAsync().ConfigureAwait(false);
         return HtmlParser.ParseDirectoryPermission(html, pasteResponse, diskId, folderId)
@@ -420,6 +448,7 @@ public sealed class YuWangClient : IDisposable
         using var req = MakeRequest(HttpMethod.Post, endpoint, content);
         using var resp = await SendAsync(req, _requestTimeout).ConfigureAwait(false);
         CaptureSession(resp);
+        resp.EnsureSuccessStatusCode();
         return await resp.Content.ReadAsStringAsync().ConfigureAwait(false);
     }
 

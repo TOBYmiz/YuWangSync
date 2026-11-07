@@ -32,13 +32,16 @@ internal sealed record UpdateUiState(
     UpdateActivity Activity,
     long DownloadedBytes,
     long TotalBytes,
-    string? ErrorMessage)
+    string? ErrorMessage,
+    bool IsDownloaded = false)
 {
     internal static UpdateUiState Empty { get; } = new(false, null, null, UpdateActivity.Idle, 0, 0, null);
 
     internal int DownloadPercent => TotalBytes <= 0
         ? 0
         : (int)Math.Clamp(DownloadedBytes * 100 / TotalBytes, 0, 100);
+
+    internal string UpdateActionLabel => IsDownloaded ? "重启更新" : "更新";
 }
 
 internal static class UpdateService
@@ -62,6 +65,7 @@ internal static class UpdateService
     private static DateOnly? _lastSuccessfulCheckDate;
     private static CancellationToken _applicationToken;
     private static CancellationTokenSource? _scheduleCancellation;
+    private static CancellationTokenSource? _downloadCancellation;
     private static int _started;
 
     internal static event Action<UpdateUiState>? StateChanged;
@@ -71,7 +75,8 @@ internal static class UpdateService
         get { lock (StateGate) return _state; }
     }
 
-    internal static void Start(bool automaticCheckEnabled, CancellationToken cancellationToken)
+    internal static void Start(bool automaticCheckEnabled, bool automaticDownloadEnabled,
+        CancellationToken cancellationToken)
     {
         if (Interlocked.Exchange(ref _started, 1) != 0) return;
 
@@ -86,6 +91,9 @@ internal static class UpdateService
             Publish(CurrentState);
             Log.Information("更新服务已初始化；安装变体={Variant}；Release 资产={AssetName}", variant, _assetName);
             SetAutomaticCheckEnabled(automaticCheckEnabled);
+            SetAutomaticDownloadEnabled(automaticDownloadEnabled);
+            if (!automaticDownloadEnabled)
+                _ = PrepareUpdateAsync(launchInstaller: false, allowDownload: false, cancellationToken);
         }
         catch (Exception error)
         {
@@ -117,11 +125,50 @@ internal static class UpdateService
         }
     }
 
-    internal static async Task DownloadAndLaunchAsync(CancellationToken cancellationToken)
+    internal static void SetAutomaticDownloadEnabled(bool enabled)
+    {
+        lock (ScheduleGate)
+        {
+            if (Volatile.Read(ref _started) == 0 || _releaseClient is null) return;
+            if (!enabled)
+            {
+                _downloadCancellation?.Cancel();
+                _downloadCancellation?.Dispose();
+                _downloadCancellation = null;
+                return;
+            }
+            _downloadCancellation ??= CancellationTokenSource.CreateLinkedTokenSource(_applicationToken);
+        }
+        PrepareAutomatically();
+    }
+
+    private static void PrepareAutomatically()
+    {
+        CancellationToken token;
+        lock (ScheduleGate)
+        {
+            if (_downloadCancellation is null) return;
+            token = _downloadCancellation.Token;
+        }
+        _ = PrepareUpdateAsync(launchInstaller: false, allowDownload: true, token);
+    }
+
+    internal static Task DownloadAndLaunchAsync(CancellationToken cancellationToken) =>
+        PrepareUpdateAsync(launchInstaller: true, allowDownload: true, cancellationToken);
+
+    private static async Task PrepareUpdateAsync(
+        bool launchInstaller, bool allowDownload, CancellationToken cancellationToken)
     {
         try
         {
-            if (!await UpdateGate.WaitAsync(0, cancellationToken).ConfigureAwait(false)) return;
+            if (launchInstaller)
+            {
+                if (!await UpdateGate.WaitAsync(0, cancellationToken).ConfigureAwait(false)) return;
+            }
+            else
+            {
+                await UpdateGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+            }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -130,11 +177,20 @@ internal static class UpdateService
 
         string? transactionDirectory = null;
         var installerStarted = false;
+        var checkGateHeld = false;
         try
         {
+            await CheckGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+            checkGateHeld = true;
             var current = CurrentState;
             if (!current.IsAvailable || current.Release is null || current.Asset is null || _releaseClient is null)
                 return;
+            if (current.Activity == UpdateActivity.Launching) return;
+
+            transactionDirectory = UpdateTemporaryFiles.GetDownloadDirectory(current.Asset.Sha256!);
+            var installerPath = Path.Combine(transactionDirectory, current.Asset.Name);
+            if (!allowDownload && !File.Exists(installerPath)) return;
+            if (!launchInstaller && current.IsDownloaded && File.Exists(installerPath)) return;
 
             Publish(current with
             {
@@ -142,10 +198,9 @@ internal static class UpdateService
                 DownloadedBytes = 0,
                 TotalBytes = current.Asset.Size,
                 ErrorMessage = null,
+                IsDownloaded = false,
             });
 
-            transactionDirectory = UpdateTemporaryFiles.CreateTransactionDirectory();
-            var installerPath = Path.Combine(transactionDirectory, current.Asset.Name);
             var progress = new InlineProgress<DownloadProgress>(value =>
             {
                 var state = CurrentState;
@@ -156,8 +211,29 @@ internal static class UpdateService
                     TotalBytes = value.TotalBytes,
                 });
             });
-            await _releaseClient.DownloadAndVerifyAsync(current.Asset, installerPath, progress, cancellationToken)
-                .ConfigureAwait(false);
+            if (!await GitHubReleaseClient.IsVerifiedInstallerAsync(current.Asset, installerPath, cancellationToken)
+                    .ConfigureAwait(false))
+            {
+                if (File.Exists(installerPath)) File.Delete(installerPath);
+                if (!allowDownload)
+                {
+                    Publish(CurrentState with { Activity = UpdateActivity.Idle });
+                    return;
+                }
+                await _releaseClient.DownloadAndVerifyAsync(current.Asset, installerPath, progress, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+
+            Publish(CurrentState with
+            {
+                Activity = UpdateActivity.Idle,
+                DownloadedBytes = current.Asset.Size,
+                TotalBytes = current.Asset.Size,
+                ErrorMessage = null,
+                IsDownloaded = true,
+            });
+            if (!launchInstaller) return;
+            cancellationToken.ThrowIfCancellationRequested();
 
             Publish(CurrentState with
             {
@@ -180,14 +256,16 @@ internal static class UpdateService
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
-            if (!installerStarted && transactionDirectory is not null)
+            if (!installerStarted && !CurrentState.IsDownloaded && transactionDirectory is not null)
                 UpdateTemporaryFiles.TryDeleteTransactionDirectory(transactionDirectory);
+            if (checkGateHeld)
+                Publish(CurrentState with { Activity = UpdateActivity.Idle, ErrorMessage = null });
             return;
         }
         catch (Exception error)
         {
             Log.Warning(error, "自动更新下载或启动失败");
-            if (!installerStarted && transactionDirectory is not null)
+            if (!installerStarted && !CurrentState.IsDownloaded && transactionDirectory is not null)
                 UpdateTemporaryFiles.TryDeleteTransactionDirectory(transactionDirectory);
             var state = CurrentState;
             Publish(state with
@@ -200,6 +278,7 @@ internal static class UpdateService
         }
         finally
         {
+            if (checkGateHeld) CheckGate.Release();
             UpdateGate.Release();
         }
     }
@@ -373,8 +452,11 @@ internal static class UpdateService
     {
         WritePersistedState(persisted);
         _lastSuccessfulCheckDate = persisted.LastSuccessfulCheckDate;
+        var previous = CurrentState;
+        var downloaded = isAvailable && previous.IsDownloaded && previous.Asset == asset;
         Publish(new UpdateUiState(isAvailable, release, asset, UpdateActivity.Idle,
-            0, asset?.Size ?? 0, null));
+            downloaded ? asset!.Size : 0, asset?.Size ?? 0, null, downloaded));
+        if (isAvailable) PrepareAutomatically();
     }
 
     private static PersistedUpdateState ReadPersistedState()
@@ -437,7 +519,11 @@ internal static class UpdateService
                     ? "安装器已退出，但当前程序仍在运行。请从托盘重新启动更新。"
                     : $"安装器退出代码：{installer.ExitCode}。";
                 Log.Warning("快速更新安装器在旧程序仍运行时退出：{ExitCode}", installer.ExitCode);
-                Publish(CurrentState with { Activity = UpdateActivity.Idle, ErrorMessage = error });
+                Publish(CurrentState with
+                {
+                    Activity = UpdateActivity.Idle, ErrorMessage = error,
+                    IsDownloaded = false, DownloadedBytes = 0,
+                });
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {

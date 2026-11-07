@@ -134,6 +134,7 @@ using (var http = new HttpClient(new StubHandler(_ => throw new InvalidOperation
     }
 }
 
+await AutomationRegression.RunAsync(Check);
 Console.WriteLine($"All {passed} update regression checks passed.");
 }
 catch (Exception error)

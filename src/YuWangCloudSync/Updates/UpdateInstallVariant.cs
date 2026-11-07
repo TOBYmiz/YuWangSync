@@ -56,17 +56,15 @@ internal static class UpdateTemporaryFiles
     private const int CleanupAttempts = 30;
     private static readonly TimeSpan CleanupRetryDelay = TimeSpan.FromSeconds(1);
 
-    internal static string CreateTransactionDirectory()
+    internal static string GetDownloadDirectory(string digest)
     {
+        if (!GitHubReleaseClient.TryNormalizeDigest(digest, out var normalized))
+            throw new InvalidDataException("更新包缺少有效的 SHA-256 digest。");
         var root = GetRootPath();
         EnsureDirectoryIsNotReparsePoint(root);
-        Directory.CreateDirectory(root);
-        EnsureDirectoryIsNotReparsePoint(root);
-
-        var transaction = Path.Combine(root, "update-" + Guid.NewGuid().ToString("N"));
-        Directory.CreateDirectory(transaction);
-        EnsureDirectoryIsNotReparsePoint(transaction);
-        return transaction;
+        var directory = Path.Combine(root, "update-" + normalized);
+        EnsureDirectoryIsNotReparsePoint(directory);
+        return directory;
     }
 
     internal static async Task CleanupAfterUpdateAsync()

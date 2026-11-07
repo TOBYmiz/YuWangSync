@@ -12,6 +12,45 @@ using static Vanara.PInvoke.CldApi;
 try
 {
     CloudFilesPlatform.EnsureSupported();
+    if (args.Contains("--shell-progress"))
+    {
+        Check(ShellTransferProgress.ValidateNativeAbi(out var abiResult), $"native Shell progress ABI / UInt64 counters / terminal states 0x{abiResult:X8}");
+        var progressBase = Path.GetFullPath(Path.Combine(Environment.CurrentDirectory, "_buildtmp", "shell-progress-regression"));
+        var progressRoot = Path.Combine(progressBase, Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(progressRoot);
+        var progressPath = Path.Combine(progressRoot, "ordinary-upload.bin");
+        var original = new byte[] { 1, 2, 3, 4 };
+        File.WriteAllBytes(progressPath, original);
+        try
+        {
+            using (var locked = new FileStream(progressPath, FileMode.Open, FileAccess.Read, FileShare.Read))
+            {
+                var submitted = ShellTransferProgress.TrySet(progressPath, 10000, 5000,
+                    ShellTransferProgress.Transferring, out var result);
+                if (!submitted && result == unchecked((int)0x80070005))
+                {
+                    Console.WriteLine("BLOCKED: native ABI passed, but this process cannot access the file's volatile Shell property store (E_ACCESSDENIED). File submission/display is not verified.");
+                    Environment.ExitCode = 2;
+                    return;
+                }
+                Check(submitted, $"Shell submit progress while ordinary file is read-locked 0x{result:X8}");
+                Check(ShellTransferProgress.TrySet(progressPath, 10000, 0, ShellTransferProgress.HasError, out result),
+                    $"Shell submit failure state 0x{result:X8}");
+                Check(ShellTransferProgress.TrySet(progressPath, 10000, 0, ShellTransferProgress.Paused, out result),
+                    $"Shell submit cancelled state 0x{result:X8}");
+                Check(ShellTransferProgress.TrySet(progressPath, 10000, 10000, 0, out result),
+                    $"Shell submit completion state 0x{result:X8}");
+            }
+            Check(File.ReadAllBytes(progressPath).SequenceEqual(original), "Shell reporting leaves ordinary file contents unchanged");
+        }
+        finally
+        {
+            if (!Path.GetFullPath(progressRoot).StartsWith(progressBase + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
+                throw new IOException("Unsafe Shell progress test cleanup path.");
+            Directory.Delete(progressRoot, true);
+        }
+        return;
+    }
     Console.WriteLine(CloudFilesPlatform.Describe());
     Check(IntPtr.Size == 8 && Marshal.SizeOf<CF_SYNC_POLICIES>() == 20, "x64 baseline CF_SYNC_POLICIES ABI");
     Check(Marshal.OffsetOf<CF_PLACEHOLDER_STANDARD_INFO>(nameof(CF_PLACEHOLDER_STANDARD_INFO.PinState)).ToInt32() == 32
@@ -32,6 +71,11 @@ try
         "short callback ignores optional tail even when backing array contains data");
     parameters.ParamSize = 31;
     Check(!CloudFilesInterop.TryReadFetchData(parameters, out _), "truncated callback rejected");
+    var flagParameters = new CF_CALLBACK_PARAMETERS { ParamSize = 12, Content = [1, 0, 0, 0] };
+    Check(CloudFilesInterop.TryReadCallbackFlags(flagParameters, out var flags) && flags == 1,
+        "NativeAOT notification flags decoding");
+    flagParameters.ParamSize = 11;
+    Check(!CloudFilesInterop.TryReadCallbackFlags(flagParameters, out _), "truncated notification flags rejected");
     parameters.ParamSize = 64;
     parameters.Content = new byte[23];
     Check(!CloudFilesInterop.TryReadFetchData(parameters, out _), "truncated backing array rejected");

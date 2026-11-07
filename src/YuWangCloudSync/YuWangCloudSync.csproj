@@ -53,6 +53,9 @@
     <PackageReference Include="Vanara.PInvoke.CldApi" Version="5.0.7" />
     <!-- SQLite 元数据缓存 -->
     <PackageReference Include="Microsoft.Data.Sqlite" Version="8.0.8" />
+    <!-- Override the transitive 2.1.6 bundle so the native SQLite library and
+         managed provider stay aligned beyond GHSA-2m69-gcr7-jv3q's affected range. -->
+    <PackageReference Include="SQLitePCLRaw.bundle_e_sqlite3" Version="2.1.14" />
     <!-- 日志 -->
     <PackageReference Include="Serilog" Version="4.0.1" />
     <PackageReference Include="Serilog.Sinks.Console" Version="6.0.0" />

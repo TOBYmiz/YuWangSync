@@ -323,7 +323,11 @@ internal sealed class AboutWindow : Window
     {
         if (_isClosed || !_updateButton.IsEnabled) return;
         var current = UpdateService.CurrentState;
-        if (current.IsAvailable)
+        if (current.IsDownloaded && current.Activity == UpdateActivity.Idle)
+        {
+            await UpdateService.DownloadAndLaunchAsync(Program.ApplicationCancellationToken);
+        }
+        else if (current.IsAvailable)
         {
             await ShowAvailableReleaseDialogAsync(current, force: true);
         }
@@ -387,7 +391,7 @@ internal sealed class AboutWindow : Window
             UpdateActivity.Connecting => "连接中…",
             UpdateActivity.Downloading => "下载中…",
             UpdateActivity.Launching => "启动中…",
-            _ => state.IsAvailable ? "更新" : "检查更新",
+            _ => state.IsAvailable ? state.UpdateActionLabel : "检查更新",
         };
         AutomationProperties.SetName(_updateButton, state.Activity switch
         {
@@ -395,7 +399,7 @@ internal sealed class AboutWindow : Window
             UpdateActivity.Connecting => "正在连接更新服务器",
             UpdateActivity.Downloading => "正在下载更新 " + _updateVisual.Percent.Text,
             UpdateActivity.Launching => "正在启动更新安装器",
-            _ => state.IsAvailable ? "更新到 " + (state.Release?.TagName ?? "最新版本") : "检查更新",
+            _ => state.IsAvailable ? state.UpdateActionLabel + "到 " + (state.Release?.TagName ?? "最新版本") : "检查更新",
         });
 
         if (forceVisuals || _displayedActivity != state.Activity)
@@ -419,6 +423,17 @@ internal sealed class AboutWindow : Window
         var title = state.ErrorMessage.StartsWith("检查更新失败", StringComparison.Ordinal)
             ? "检查更新失败" : "更新失败";
         _ = ShowUpdateMessageAsync(title, state.ErrorMessage);
+    }
+
+    internal bool ValidateDownloadedUpdateForSelfTest()
+    {
+        try
+        {
+            ApplyUpdateState(new UpdateUiState(true, null, null, UpdateActivity.Idle, 1, 1, null, true),
+                forceVisuals: true);
+            return _updateButton.IsEnabled && _updateLabel.Text == "重启更新";
+        }
+        finally { ApplyUpdateState(UpdateService.CurrentState, forceVisuals: true); }
     }
 
     private async Task ShowAvailableReleaseDialogAsync(UpdateUiState state, bool force = false)
@@ -460,7 +475,7 @@ internal sealed class AboutWindow : Window
         {
             Title = "发现新版本",
             Content = content,
-            PrimaryButtonText = "更新",
+            PrimaryButtonText = state.UpdateActionLabel,
             PrimaryButtonStyle = WinUiUiHost.GetStyleResource("AccentButtonStyle"),
             CloseButtonText = "取消",
             DefaultButton = ContentDialogButton.Primary,
@@ -477,7 +492,7 @@ internal sealed class AboutWindow : Window
             }
 
             _releaseDialogUpdateButton.Content = _releaseDialogUpdateVisual.Content;
-            AutomationProperties.SetName(_releaseDialogUpdateButton, "更新");
+            AutomationProperties.SetName(_releaseDialogUpdateButton, state.UpdateActionLabel);
             ApplyReleaseDialogUpdateState(UpdateService.CurrentState);
         };
         dialog.PrimaryButtonClick += (sender, args) =>
@@ -525,7 +540,7 @@ internal sealed class AboutWindow : Window
         {
             UpdateActivity.Checking => "检查中…",
             UpdateActivity.Launching => "启动中…",
-            _ => "更新",
+            _ => state.UpdateActionLabel,
         };
         visual.Percent.Text = state.DownloadPercent.ToString(System.Globalization.CultureInfo.InvariantCulture) + "%";
         if (_releaseDialogUpdateButton is not null)
@@ -537,7 +552,7 @@ internal sealed class AboutWindow : Window
                 UpdateActivity.Connecting => "正在连接更新服务器",
                 UpdateActivity.Downloading => "正在下载更新 " + visual.Percent.Text,
                 UpdateActivity.Launching => "正在启动更新安装器",
-                _ => state.IsAvailable ? "更新到 " + (state.Release?.TagName ?? "最新版本") : "更新",
+                _ => state.IsAvailable ? state.UpdateActionLabel + "到 " + (state.Release?.TagName ?? "最新版本") : "更新",
             });
         }
 
@@ -553,8 +568,8 @@ internal sealed class AboutWindow : Window
 
         if (_releaseDialogStatus is not null)
         {
-            _releaseDialogStatus.Text = state.ErrorMessage ?? "";
-            _releaseDialogStatus.Visibility = string.IsNullOrWhiteSpace(state.ErrorMessage)
+            _releaseDialogStatus.Text = state.ErrorMessage ?? (state.IsDownloaded ? "下载完成，需要手动重启更新。" : "");
+            _releaseDialogStatus.Visibility = string.IsNullOrWhiteSpace(_releaseDialogStatus.Text)
                 ? Visibility.Collapsed
                 : Visibility.Visible;
         }
@@ -574,7 +589,7 @@ internal sealed class AboutWindow : Window
             {
                 if (button.Name.Contains("PrimaryButton", StringComparison.OrdinalIgnoreCase))
                     return button;
-                if (button.Content is string text && string.Equals(text, "更新", StringComparison.Ordinal))
+                if (button.Content is string text && text is "更新" or "重启更新")
                     textMatch = button;
             }
 

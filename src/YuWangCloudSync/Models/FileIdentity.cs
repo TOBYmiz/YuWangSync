@@ -161,6 +161,11 @@ public sealed class SyncRootContext
     /// 后台预拉取也使用同一周期去重。合法区间 1~120；无效值启动时重置为 30 分钟并告警。
     /// </summary>
     public int FolderCacheMinutes { get; set; } = 30;
+    /// <summary>定期释放已同步、未固定的文件缓存。</summary>
+    public bool AutomaticFileCacheCleanup { get; set; }
+    public int FileCacheCleanupHours { get; set; } = 24;
+
+    public static int NormalizeFileCacheCleanupHours(int hours) => hours is 8 or 12 or 24 or 168 ? hours : 24;
     /// <summary>
     /// 是否**常驻** SyncRoot 注册（退出时保留注册与占位内容，下次启动直接复用）。
     ///
@@ -178,6 +183,9 @@ public sealed class SyncRootContext
 
     /// <summary>是否每日自动检查 GitHub Release 更新。</summary>
     public bool AutomaticUpdateCheck { get; set; } = true;
+
+    /// <summary>发现更新后仅下载并校验，由用户手动启动安装。</summary>
+    public bool AutomaticUpdateDownload { get; set; }
 
     /// <summary>有更新时，是否在托盘图标显示角标。</summary>
     public bool TrayUpdateHintEnabled { get; set; } = true;

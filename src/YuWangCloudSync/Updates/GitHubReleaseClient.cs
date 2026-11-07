@@ -315,6 +315,22 @@ internal sealed class GitHubReleaseClient(HttpClient httpClient, string userAgen
             throw new InvalidDataException($"更新分片大小不匹配：期望 {expectedLength} 字节，实际 {totalBytes} 字节。");
     }
 
+    internal static async Task<bool> IsVerifiedInstallerAsync(
+        GitHubReleaseAsset asset, string path, CancellationToken cancellationToken)
+    {
+        if (!TryNormalizeDigest(asset.Sha256, out var expectedDigest) || asset.Size <= 0) return false;
+        try
+        {
+            var file = new FileInfo(path);
+            if (!file.Exists || file.Length != asset.Size || (file.Attributes & FileAttributes.ReparsePoint) != 0)
+                return false;
+            var actualDigest = await ComputeSha256Async(path, cancellationToken).ConfigureAwait(false);
+            return CryptographicOperations.FixedTimeEquals(Convert.FromHexString(actualDigest),
+                Convert.FromHexString(expectedDigest));
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException) { return false; }
+    }
+
     private static async Task<string> ComputeSha256Async(string path, CancellationToken cancellationToken)
     {
         await using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read,

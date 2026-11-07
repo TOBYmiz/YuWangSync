@@ -193,11 +193,11 @@ public static class HtmlParser
 
             var titleMatch = TitlePattern.Match(segment);
             if (!titleMatch.Success) continue;
-            var title = titleMatch.Groups[1].Value;
+            var title = System.Net.WebUtility.HtmlDecode(titleMatch.Groups[1].Value);
 
             var nameMatch = NamePattern.Match(title);
             if (!nameMatch.Success) continue;
-            var name = nameMatch.Groups[1].Value.Trim().TrimEnd(')').Trim();
+            var name = nameMatch.Groups[1].Value.Trim();
             if (string.IsNullOrEmpty(name)) continue;
 
             long? size = null;

@@ -14,6 +14,50 @@ namespace YuWangCloudSync.CloudFiles;
 [SupportedOSPlatform("windows")]
 public static class PlaceholderUpdater
 {
+    [DllImport("cldapi.dll", EntryPoint = "CfUpdatePlaceholder", ExactSpelling = true)]
+    private static extern int UpdateIdentity(IntPtr handle, IntPtr metadata, IntPtr identity, uint identityLength,
+        IntPtr ranges, uint rangeCount, CF_UPDATE_FLAGS flags, ref long usn, IntPtr overlapped);
+
+    /// <summary>Bind verified cloud identity without touching file size or dehydrating local content.</summary>
+    public static bool TryBindIdentity(string path, Models.FileIdentity identity, bool markInSync, Action<string>? log = null,
+        DateTime? cleanWriteTimeUtc = null, long? cleanLength = null)
+    {
+        // A rename may clear in-sync for namespace changes. Preserve a previously clean
+        // stream only while a metadata handle denies writers/deletion and its snapshot matches.
+        var checkClean = cleanWriteTimeUtc is not null && cleanLength is not null;
+        var handle = CreateFileW(path, FILE_READ_ATTRIBUTES | WRITE_DAC, checkClean ? 1u : FILE_SHARE_ALL, IntPtr.Zero,
+            OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, IntPtr.Zero);
+        if (checkClean && (handle == IntPtr.Zero || handle == new IntPtr(-1)))
+        {
+            checkClean = false;
+            handle = CreateFileW(path, FILE_READ_ATTRIBUTES | WRITE_DAC, FILE_SHARE_ALL, IntPtr.Zero,
+                OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, IntPtr.Zero);
+        }
+        if (handle == IntPtr.Zero || handle == new IntPtr(-1)) return false;
+        var bytes = identity.Serialize();
+        var buffer = Marshal.AllocHGlobal(bytes.Length);
+        try
+        {
+            if (checkClean && File.GetLastWriteTimeUtc(path) == cleanWriteTimeUtc && new FileInfo(path).Length == cleanLength)
+                markInSync = true;
+            Marshal.Copy(bytes, 0, buffer, bytes.Length);
+            long usn = 0;
+            HRESULT result;
+            if (Core.ProviderIdentity.TryReadPlaceholderIdentity(path, out _))
+                result = new HRESULT(UpdateIdentity(handle, IntPtr.Zero, buffer, (uint)bytes.Length,
+                    IntPtr.Zero, 0, CF_UPDATE_FLAGS.CF_UPDATE_FLAG_NONE, ref usn, IntPtr.Zero));
+            else
+                result = CfConvertToPlaceholder(new HFILE(handle), buffer, (uint)bytes.Length,
+                    CF_CONVERT_FLAGS.CF_CONVERT_FLAG_NONE, out usn, IntPtr.Zero);
+            if (result.Succeeded && markInSync)
+                result = CfSetInSyncState(new HFILE(handle), CF_IN_SYNC_STATE.CF_IN_SYNC_STATE_IN_SYNC,
+                    CF_SET_IN_SYNC_FLAGS.CF_SET_IN_SYNC_FLAG_NONE, ref usn);
+            if (result.Failed) log?.Invoke($"[WRITE] 绑定云端身份失败 file={identity.FileId} result={result}");
+            return result.Succeeded;
+        }
+        finally { Marshal.FreeHGlobal(buffer); CloseHandle(handle); }
+    }
+
     public readonly record struct PlaceholderDataState(
         long OnDiskDataSize, long ValidatedDataSize, CF_PIN_STATE PinState,
         CF_IN_SYNC_STATE InSyncState, long FileId);
@@ -485,13 +529,16 @@ public static class PlaceholderUpdater
     /// 跳过两类：磁盘上本就没数据的（已是占位）、正在被其它进程占用的（打不开）。
     /// </summary>
     public static (int Total, int Dehydrated, long FreedBytes, int Skipped) DehydrateTree(
-        string rootDir, Action<string>? log = null)
+        string rootDir, Action<string>? log = null, bool automatic = false,
+        CancellationToken cancellationToken = default)
     {
         var total = 0;
         var dehydrated = 0;
         var freed = 0L;
         var skipped = 0;
-        if (!Directory.Exists(rootDir)) return (0, 0, 0, 0);
+        cancellationToken.ThrowIfCancellationRequested();
+        if (!Directory.Exists(rootDir) || (automatic && new DirectoryInfo(rootDir).LinkTarget is not null))
+            return (0, 0, 0, 0);
 
         string[] files;
         try { files = Directory.GetFiles(rootDir); }
@@ -503,7 +550,16 @@ public static class PlaceholderUpdater
 
         foreach (var f in files)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             total++;
+            if (automatic && (!TryGetPlaceholderDataState(f, out var state)
+                || state.InSyncState != CF_IN_SYNC_STATE.CF_IN_SYNC_STATE_IN_SYNC
+                || state.PinState is CF_PIN_STATE.CF_PIN_STATE_PINNED or CF_PIN_STATE.CF_PIN_STATE_EXCLUDED
+                || state.OnDiskDataSize <= 0))
+            {
+                skipped++;
+                continue;
+            }
             if (TryDehydrate(f, out var freedOne, log))
             {
                 dehydrated++;
@@ -521,7 +577,8 @@ public static class PlaceholderUpdater
 
         foreach (var d in subs)
         {
-            var r = DehydrateTree(d, log);
+            cancellationToken.ThrowIfCancellationRequested();
+            var r = DehydrateTree(d, log, automatic, cancellationToken);
             total += r.Total;
             dehydrated += r.Dehydrated;
             freed += r.FreedBytes;

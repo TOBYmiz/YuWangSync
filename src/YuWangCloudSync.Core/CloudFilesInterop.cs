@@ -36,6 +36,14 @@ public static class CloudFilesInterop
         return target == IntPtr.Zero ? null : Marshal.PtrToStringUni(target);
     }
 
+    public static bool TryReadCallbackFlags(in CF_CALLBACK_PARAMETERS parameters, out uint flags)
+    {
+        flags = 0;
+        if (!TryGetContent(parameters, sizeof(uint), out var content)) return false;
+        flags = MemoryMarshal.Read<uint>(content);
+        return true;
+    }
+
     private static bool TryGetContent(in CF_CALLBACK_PARAMETERS parameters, int minimumLength,
         out ReadOnlySpan<byte> content)
     {

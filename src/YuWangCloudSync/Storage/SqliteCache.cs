@@ -110,8 +110,32 @@ public sealed class SqliteCache : IDisposable
                 probed_at INTEGER NOT NULL,
                 PRIMARY KEY (user_key, disk_id, folder_id)
             );
+            CREATE TABLE IF NOT EXISTS writeback_receipts (
+                user_key TEXT NOT NULL, local_path TEXT NOT NULL COLLATE NOCASE,
+                content_hash TEXT NOT NULL, disk_id INTEGER NOT NULL, folder_id INTEGER NOT NULL,
+                remote_name TEXT NOT NULL, remote_id INTEGER NOT NULL DEFAULT 0, old_id INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(user_key, local_path, content_hash)
+            );
             """;
         cmd.ExecuteNonQuery();
+
+        // An upload can be published under a server-assigned name before local verification.
+        // Keep its evidence in the existing account/path/hash receipt across retries/restarts.
+        var receiptColumns = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        using (var columns = _conn.CreateCommand())
+        {
+            columns.CommandText = "PRAGMA table_info(writeback_receipts)";
+            using var reader = columns.ExecuteReader();
+            while (reader.Read()) receiptColumns.Add(reader.GetString(1));
+        }
+        foreach (var (name, type) in new[] { ("upload_before_ids", "TEXT"),
+            ("upload_may_commit", "INTEGER NOT NULL DEFAULT 0"), ("upload_candidate_id", "INTEGER NOT NULL DEFAULT 0") })
+        {
+            if (receiptColumns.Contains(name)) continue;
+            using var migration = _conn.CreateCommand();
+            migration.CommandText = $"ALTER TABLE writeback_receipts ADD COLUMN {name} {type}";
+            migration.ExecuteNonQuery();
+        }
 
         // 迁移：老库没有 real_size 列（育网云列表页只给向下取整到整 MB 的大小，
         // 真实大小要等整文件下载完才知道，这里持久化下来供下次创建占位使用）
@@ -146,6 +170,29 @@ public sealed class SqliteCache : IDisposable
             cmd.Parameters.AddWithValue("@sz", realSize);
             cmd.Parameters.AddWithValue("@fid", (long)fileId);
             cmd.ExecuteNonQuery();
+        }
+    }
+
+    public void SaveContentHash(ulong fileId, byte[] hash)
+    {
+        lock (_sync)
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = "UPDATE files SET content_hash=@hash WHERE file_id=@id";
+            cmd.Parameters.AddWithValue("@hash", hash);
+            cmd.Parameters.AddWithValue("@id", (long)fileId);
+            cmd.ExecuteNonQuery();
+        }
+    }
+
+    public byte[]? GetContentHash(ulong fileId)
+    {
+        lock (_sync)
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = "SELECT content_hash FROM files WHERE file_id=@id";
+            cmd.Parameters.AddWithValue("@id", (long)fileId);
+            return cmd.ExecuteScalar() as byte[];
         }
     }
 
@@ -309,7 +356,9 @@ public sealed class SqliteCache : IDisposable
                 VALUES(@fid, @pfolder, @disk, @name, @size, @ut, 0)
                 ON CONFLICT(file_id) DO UPDATE SET
                     folder_id=excluded.folder_id, disk_id=excluded.disk_id,
-                    name=excluded.name, size=excluded.size, upload_time=excluded.upload_time;
+                    name=excluded.name, size=excluded.size, upload_time=excluded.upload_time,
+                    content_hash=CASE WHEN COALESCE(files.upload_time,'')=COALESCE(excluded.upload_time,'')
+                        THEN files.content_hash ELSE NULL END;
                 """;
             cmd.Parameters.AddWithValue("@fid", (long)fileId);
             cmd.Parameters.AddWithValue("@pfolder", (long)folderId);
@@ -376,7 +425,9 @@ public sealed class SqliteCache : IDisposable
                     VALUES(@fid, @pfolder, @disk, @name, @size, @ut, 0)
                     ON CONFLICT(file_id) DO UPDATE SET
                         folder_id=excluded.folder_id, disk_id=excluded.disk_id,
-                        name=excluded.name, size=excluded.size, upload_time=excluded.upload_time;
+                        name=excluded.name, size=excluded.size, upload_time=excluded.upload_time,
+                        content_hash=CASE WHEN COALESCE(files.upload_time,'')=COALESCE(excluded.upload_time,'')
+                            THEN files.content_hash ELSE NULL END;
                     """;
                 cmd.Parameters.AddWithValue("@fid", (long)item.Id);
                 cmd.Parameters.AddWithValue("@pfolder", (long)folderId);
@@ -737,6 +788,158 @@ public sealed class SqliteCache : IDisposable
             var value = cmd.ExecuteScalar();
             return value is long number && Enum.IsDefined(typeof(DirectoryPermission), (int)number)
                 ? (DirectoryPermission)(int)number : DirectoryPermission.Unknown;
+        }
+    }
+
+    public (ulong Disk, ulong Folder, string Name, ulong Id, ulong OldId)? GetWritebackReceipt(string user, string path, string hash)
+    {
+        lock (_sync)
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = "SELECT disk_id, folder_id, remote_name, remote_id, old_id FROM writeback_receipts WHERE user_key=@u AND local_path=@p AND content_hash=@h";
+            cmd.Parameters.AddWithValue("@u", user);
+            cmd.Parameters.AddWithValue("@p", path);
+            cmd.Parameters.AddWithValue("@h", hash);
+            using var reader = cmd.ExecuteReader();
+            return reader.Read() ? ((ulong)reader.GetInt64(0), (ulong)reader.GetInt64(1), reader.GetString(2), (ulong)reader.GetInt64(3), (ulong)reader.GetInt64(4)) : null;
+        }
+    }
+
+    public void SaveWritebackReceipt(string user, string path, string hash, ulong disk, ulong folder, string name, ulong id, ulong oldId = 0)
+    {
+        lock (_sync)
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = """
+                INSERT INTO writeback_receipts(user_key, local_path, content_hash, disk_id, folder_id, remote_name, remote_id, old_id)
+                VALUES(@u,@p,@h,@d,@f,@n,@i,@old)
+                ON CONFLICT(user_key,local_path,content_hash) DO UPDATE SET remote_id=excluded.remote_id;
+                """;
+            cmd.Parameters.AddWithValue("@u", user);
+            cmd.Parameters.AddWithValue("@p", path);
+            cmd.Parameters.AddWithValue("@h", hash);
+            cmd.Parameters.AddWithValue("@d", (long)disk);
+            cmd.Parameters.AddWithValue("@f", (long)folder);
+            cmd.Parameters.AddWithValue("@n", name);
+            cmd.Parameters.AddWithValue("@i", (long)id);
+            cmd.Parameters.AddWithValue("@old", (long)oldId);
+            cmd.ExecuteNonQuery();
+        }
+    }
+
+    public void RemoveWritebackReceipt(string user, string path, string hash)
+    {
+        lock (_sync)
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = "DELETE FROM writeback_receipts WHERE user_key=@u AND local_path=@p AND content_hash=@h";
+            cmd.Parameters.AddWithValue("@u", user);
+            cmd.Parameters.AddWithValue("@p", path);
+            cmd.Parameters.AddWithValue("@h", hash);
+            cmd.ExecuteNonQuery();
+        }
+    }
+
+    public UploadAttempt? GetUploadAttempt(string user, string path, string hash)
+    {
+        lock (_sync)
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = "SELECT upload_before_ids,upload_may_commit,upload_candidate_id FROM writeback_receipts WHERE user_key=@u AND local_path=@p AND content_hash=@h";
+            cmd.Parameters.AddWithValue("@u", user);
+            cmd.Parameters.AddWithValue("@p", path);
+            cmd.Parameters.AddWithValue("@h", hash);
+            using var reader = cmd.ExecuteReader();
+            if (!reader.Read() || reader.IsDBNull(0)) return null;
+            var ids = new List<ulong>();
+            foreach (var value in reader.GetString(0).Split(',', StringSplitOptions.RemoveEmptyEntries))
+            {
+                if (!ulong.TryParse(value, System.Globalization.NumberStyles.None,
+                    System.Globalization.CultureInfo.InvariantCulture, out var id))
+                    throw new IOException("上传目录快照记录损坏，停止重复上传。");
+                ids.Add(id);
+            }
+            return new(ids.ToArray(), reader.GetInt64(1) != 0, (ulong)reader.GetInt64(2));
+        }
+    }
+
+    public void SaveUploadAttempt(string user, string path, string hash, UploadAttempt attempt)
+    {
+        lock (_sync)
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = "UPDATE writeback_receipts SET upload_before_ids=@ids,upload_may_commit=@may,upload_candidate_id=@id WHERE user_key=@u AND local_path=@p AND content_hash=@h";
+            cmd.Parameters.AddWithValue("@u", user);
+            cmd.Parameters.AddWithValue("@p", path);
+            cmd.Parameters.AddWithValue("@h", hash);
+            cmd.Parameters.AddWithValue("@ids", string.Join(',', attempt.BeforeIds.Select(id => id.ToString(System.Globalization.CultureInfo.InvariantCulture))));
+            cmd.Parameters.AddWithValue("@may", attempt.MayHaveCommitted ? 1 : 0);
+            cmd.Parameters.AddWithValue("@id", (long)attempt.CandidateId);
+            if (cmd.ExecuteNonQuery() != 1) throw new IOException("上传记录未能持久化，停止发送数据。");
+        }
+    }
+
+    public bool HasOtherPendingWriteback(string user, string path, string hash)
+    {
+        lock (_sync)
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = "SELECT EXISTS(SELECT 1 FROM writeback_receipts WHERE user_key=@u AND local_path=@p AND content_hash<>@h)";
+            cmd.Parameters.AddWithValue("@u", user);
+            cmd.Parameters.AddWithValue("@p", path);
+            cmd.Parameters.AddWithValue("@h", hash);
+            return Convert.ToInt64(cmd.ExecuteScalar()) != 0;
+        }
+    }
+
+    public void CompleteBoundWriteback(string user, string path, ulong id, string? preserveHash = null)
+    {
+        lock (_sync)
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = "DELETE FROM writeback_receipts WHERE user_key=@u AND local_path=@p AND remote_id=@id AND remote_id<>0 AND (@keep IS NULL OR content_hash<>@keep)";
+            cmd.Parameters.AddWithValue("@u", user);
+            cmd.Parameters.AddWithValue("@p", path);
+            cmd.Parameters.AddWithValue("@id", (long)id);
+            cmd.Parameters.AddWithValue("@keep", (object?)preserveHash ?? DBNull.Value);
+            cmd.ExecuteNonQuery();
+        }
+    }
+
+    /// <summary>Commit the verified move and keep every cached descendant path consistent.</summary>
+    public void ApplyRemoteRename(FileIdentity identity, ulong targetFolder, string newName, string targetPath)
+    {
+        lock (_sync)
+        {
+            var oldPath = identity.Type == 0 ? GetFolderLocalPath(identity.DiskId, identity.FileId) : null;
+            using var tx = _conn.BeginTransaction();
+            using var cmd = _conn.CreateCommand();
+            cmd.Transaction = tx;
+            if (identity.Type == 1)
+                cmd.CommandText = "UPDATE files SET folder_id=@parent,name=@name WHERE disk_id=@disk AND file_id=@item";
+            else
+            {
+                if (oldPath is not null)
+                {
+                    using var descendants = _conn.CreateCommand();
+                    descendants.Transaction = tx;
+                    // Compare a literal prefix: LIKE would treat '%' and '_' in names as wildcards.
+                    descendants.CommandText = "UPDATE folders SET local_path=@new || substr(local_path,length(@old)+1) WHERE disk_id=@disk AND substr(local_path,1,length(@prefix))=@prefix COLLATE NOCASE";
+                    descendants.Parameters.AddWithValue("@new", targetPath);
+                    descendants.Parameters.AddWithValue("@old", oldPath);
+                    descendants.Parameters.AddWithValue("@prefix", oldPath.TrimEnd('\\') + "\\");
+                    descendants.Parameters.AddWithValue("@disk", (long)identity.DiskId);
+                    descendants.ExecuteNonQuery();
+                }
+                cmd.CommandText = "UPDATE folders SET parent_folder_id=@parent,name=@name,local_path=@path WHERE disk_id=@disk AND folder_id=@item";
+                cmd.Parameters.AddWithValue("@path", targetPath);
+            }
+            cmd.Parameters.AddWithValue("@disk", (long)identity.DiskId);
+            cmd.Parameters.AddWithValue("@item", (long)identity.FileId);
+            cmd.Parameters.AddWithValue("@parent", (long)targetFolder);
+            cmd.Parameters.AddWithValue("@name", newName);
+            cmd.ExecuteNonQuery();
+            tx.Commit();
         }
     }
 

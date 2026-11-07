@@ -35,9 +35,22 @@ internal sealed class SettingsWindow : Window
     };
     private readonly TextBox _path = new() { Name = "SyncRootPathTextBox", Height = SettingsTextBoxHeight };
     private readonly TextBox _folderCache = NewMinutesInput(30, "FolderCacheTextBox");
+    private readonly CheckBox _automaticFileCacheCleanup = new()
+    {
+        Name = "AutomaticFileCacheCleanupCheckBox",
+        VerticalAlignment = VerticalAlignment.Center,
+    };
+    private readonly ComboBox _fileCacheCleanupInterval = new()
+    {
+        Name = "FileCacheCleanupIntervalComboBox",
+        HorizontalAlignment = HorizontalAlignment.Stretch,
+        VerticalAlignment = VerticalAlignment.Center,
+        MinWidth = 0,
+    };
     private readonly CheckBox _persist = new() { Name = "PersistSyncRootCheckBox" };
     private readonly CheckBox _automaticUpdateCheck = new() { Name = "AutomaticUpdateCheckCheckBox" };
     private readonly CheckBox _trayUpdateHint = new() { Name = "TrayUpdateHintCheckBox" };
+    private readonly CheckBox _automaticUpdateDownload = new() { Name = "AutomaticUpdateDownloadCheckBox" };
     private readonly TextBox _containerTypeId = new()
     {
         Name = "ContainerTypeIdTextBox",
@@ -173,12 +186,17 @@ internal sealed class SettingsWindow : Window
         Add(pathGrid, NewNote("请选择空目录，更换后旧目录会被清理。"), 1, 0, 2);
         AddCard(content, "挂载位置", pathGrid);
 
-        var cacheGrid = NewGrid(RowHeight, 0, 0);
+        var cacheGrid = NewGrid(RowHeight, 0, 0, RowHeight);
         cacheGrid.ColumnDefinitions[0].Width = new GridLength(LabelColumnWidth * 1.1);
         Add(cacheGrid, NewLabel("目录缓存与自动刷新周期（分钟）"), 0, 0);
         Add(cacheGrid, MinutesInputRow(_folderCache), 0, 1);
         Add(cacheGrid, NewNote("到期后后台更新，重进目录联网刷新，不影响手动刷新。"), 1, 0, 2);
         Add(cacheGrid, NewNote("有效值 1—120 分钟。"), 2, 0, 2);
+        _automaticFileCacheCleanup.Content = "自动清理文件缓存";
+        foreach (var (text, hours) in new[] { ("每 8 小时", 8), ("每 12 小时", 12), ("每天", 24), ("每 7 天", 168) })
+            _fileCacheCleanupInterval.Items.Add(new ComboBoxItem { Content = text, Tag = hours });
+        Add(cacheGrid, _automaticFileCacheCleanup, 3, 0);
+        Add(cacheGrid, _fileCacheCleanupInterval, 3, 1);
         AddCard(content, "缓存与刷新", cacheGrid);
 
         _persist.Content = "退出后保留同步目录";
@@ -203,11 +221,14 @@ internal sealed class SettingsWindow : Window
 
         _automaticUpdateCheck.Content = "自动检查更新";
         _trayUpdateHint.Content = "托盘图标更新提示";
-        var updateGrid = NewGrid(RowHeight, 0, RowHeight, 0);
+        _automaticUpdateDownload.Content = "自动下载更新";
+        var updateGrid = NewGrid(RowHeight, 0, RowHeight, 0, RowHeight, 0);
         AddCheck(updateGrid, _automaticUpdateCheck, 0);
         Add(updateGrid, NewNote("每日检查，有更新时在托盘菜单提示。"), 1, 0, 2);
         AddCheck(updateGrid, _trayUpdateHint, 2);
         Add(updateGrid, NewNote("有更新时，在托盘图标显示角标提示。"), 3, 0, 2);
+        AddCheck(updateGrid, _automaticUpdateDownload, 4);
+        Add(updateGrid, NewNote("需要手动重启更新。"), 5, 0, 2);
         AddCard(content, "更新", updateGrid);
 
         var footer = new Grid { ColumnSpacing = 8 };
@@ -248,11 +269,16 @@ internal sealed class SettingsWindow : Window
                 StringComparison.OrdinalIgnoreCase))
             ?? _accountSelector.Items.FirstOrDefault();
         _folderCache.Text = ClampMinutes(snapshot.FolderCacheMinutes).ToString();
+        _automaticFileCacheCleanup.IsChecked = snapshot.AutomaticFileCacheCleanup;
+        _fileCacheCleanupInterval.SelectedItem = _fileCacheCleanupInterval.Items.OfType<ComboBoxItem>()
+            .First(item => (int)item.Tag == SyncRootContext.NormalizeFileCacheCleanupHours(snapshot.FileCacheCleanupHours));
+        _fileCacheCleanupInterval.IsEnabled = snapshot.AutomaticFileCacheCleanup;
         _containerTypeId.Text = snapshot.RootContainerTypeId.ToString();
         _providerName.Text = snapshot.ProviderName;
         _persist.IsChecked = snapshot.PersistSyncRoot;
         _automaticUpdateCheck.IsChecked = snapshot.AutomaticUpdateCheck;
         _trayUpdateHint.IsChecked = snapshot.TrayUpdateHintEnabled;
+        _automaticUpdateDownload.IsChecked = snapshot.AutomaticUpdateDownload;
         WireDirty();
 
         Root.Loaded += (_, _) => _loaded.TrySetResult(true);
@@ -685,9 +711,12 @@ internal sealed class SettingsWindow : Window
             DownloadTimeoutMinutes = _source.DownloadTimeoutMinutes,
             LegacySyncRootPaths = _source.LegacySyncRootPaths,
             FolderCacheMinutes = cacheMinutes,
+            AutomaticFileCacheCleanup = _automaticFileCacheCleanup.IsChecked == true,
+            FileCacheCleanupHours = (_fileCacheCleanupInterval.SelectedItem as ComboBoxItem)?.Tag as int? ?? 24,
             PersistSyncRoot = _persist.IsChecked == true,
             AutomaticUpdateCheck = _automaticUpdateCheck.IsChecked == true,
             TrayUpdateHintEnabled = _trayUpdateHint.IsChecked == true,
+            AutomaticUpdateDownload = _automaticUpdateDownload.IsChecked == true,
         };
         return null;
     }
@@ -722,6 +751,22 @@ internal sealed class SettingsWindow : Window
             _containerTypeId.Text = originalTypeId;
             _folderCache.Text = originalFolderCache;
         }
+    }
+
+    internal bool ValidateAutomationOptionsForSelfTest()
+    {
+        var original = _automaticFileCacheCleanup.IsChecked;
+        try
+        {
+            if (!_fileCacheCleanupInterval.Items.OfType<ComboBoxItem>().Select(item => (int)item.Tag)
+                    .SequenceEqual(new[] { 8, 12, 24, 168 })) return false;
+            if (_automaticUpdateDownload.Content as string != "自动下载更新") return false;
+            _automaticFileCacheCleanup.IsChecked = false;
+            if (_fileCacheCleanupInterval.IsEnabled) return false;
+            _automaticFileCacheCleanup.IsChecked = true;
+            return _fileCacheCleanupInterval.IsEnabled;
+        }
+        finally { _automaticFileCacheCleanup.IsChecked = original; }
     }
 
     private async Task CommitAsync(bool close)
@@ -988,6 +1033,9 @@ internal sealed class SettingsWindow : Window
         _accountSelector.SelectionChanged += (_, _) => MarkDirty();
         _path.TextChanged += (_, _) => MarkDirty();
         _folderCache.TextChanged += (_, _) => MarkDirty();
+        _automaticFileCacheCleanup.Checked += (_, _) => UpdateFileCacheCleanupEnabled();
+        _automaticFileCacheCleanup.Unchecked += (_, _) => UpdateFileCacheCleanupEnabled();
+        _fileCacheCleanupInterval.SelectionChanged += (_, _) => MarkDirty();
         _containerTypeId.TextChanged += (_, _) => MarkDirty();
         _providerName.TextChanged += (_, _) => MarkDirty();
         _persist.Checked += (_, _) => MarkDirty();
@@ -996,6 +1044,14 @@ internal sealed class SettingsWindow : Window
         _automaticUpdateCheck.Unchecked += (_, _) => MarkDirty();
         _trayUpdateHint.Checked += (_, _) => MarkDirty();
         _trayUpdateHint.Unchecked += (_, _) => MarkDirty();
+        _automaticUpdateDownload.Checked += (_, _) => MarkDirty();
+        _automaticUpdateDownload.Unchecked += (_, _) => MarkDirty();
+    }
+
+    private void UpdateFileCacheCleanupEnabled()
+    {
+        _fileCacheCleanupInterval.IsEnabled = _automaticFileCacheCleanup.IsChecked == true;
+        MarkDirty();
     }
 
     private void MarkDirty()

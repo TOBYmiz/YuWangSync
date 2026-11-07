@@ -433,6 +433,8 @@ internal static class WinUiUiHost
         Check("Settings single instance", ReferenceEquals(settings, duplicate), "Repeated request activates the existing settings window.");
         Check("Settings validation", settings.ValidateForSelfTest(),
             "Invalid TypeId is rejected by the same value validation used before applying settings.");
+        Check("Settings automation options", settings.ValidateAutomationOptionsForSelfTest(),
+            "Cache cleanup has four intervals and follows the checkbox enabled state; automatic download is present.");
         Check("NativeAOT WinUI resource projections",
             GetStyleResource("DefaultButtonStyle") is not null
                 && GetStyleResource("DefaultContentDialogStyle") is not null
@@ -488,6 +490,8 @@ internal static class WinUiUiHost
         var aboutHandle = about is null ? IntPtr.Zero : WindowNative.GetWindowHandle(about);
         Check("Tray about callback", about is not null && IsWindowVisible(aboutHandle),
             "The Win32 PopupMenu about item opens the WinUI about window.");
+        Check("About downloaded update action", about?.ValidateDownloadedUpdateForSelfTest() == true,
+            "A downloaded update displays the enabled restart update action without launching an installer.");
         try { about?.Close(); } catch { }
         await Task.Delay(100);
 

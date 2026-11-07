@@ -30,6 +30,7 @@ internal static class Program
     // 但回调是进程生命周期的，数组本身不能被 GC 回收，因此存为静态字段。
     private static CF_CALLBACK_REGISTRATION[]? _callbackTable;
     private static CloudFilePinStateWatcher? _pinStateWatcher;
+    private static FileCacheCleanupService? _fileCacheCleanup;
     private static readonly CancellationTokenSource _cts = new();
     internal static CancellationToken ApplicationCancellationToken => _cts.Token;
 
@@ -85,6 +86,8 @@ internal static class Program
     {
         StopPinStateWatcher();
         Callbacks.StartDirectoryRefresh();
+        try { Callbacks.StartWriteback(); }
+        catch (Exception ex) { Log.Error(ex, "无法启动新文件上传监视"); }
         var watcher = new CloudFilePinStateWatcher(_ctx.SyncRootPath,
             message => Log.Information("{Msg}", message));
         try
@@ -97,11 +100,22 @@ internal static class Program
             watcher.Stop();
             Log.Warning(ex, "无法监视 SyncRoot 固定/释放属性变化；右键操作可能不会执行水化/脱水");
         }
+        var rootPath = _ctx.SyncRootPath;
+        _fileCacheCleanup = new FileCacheCleanupService(token =>
+        {
+            var result = PlaceholderUpdater.DehydrateTree(rootPath,
+                message => Log.Debug("{Msg}", message), automatic: true, cancellationToken: token);
+            Log.Information("自动清理文件缓存完成：还原 {Count} 个文件，释放 {Bytes} 字节，跳过 {Skipped} 个",
+                result.Dehydrated, result.FreedBytes, result.Skipped);
+        }, message => Log.Warning("{Msg}", message));
+        _fileCacheCleanup.Configure(_ctx.AutomaticFileCacheCleanup, _ctx.FileCacheCleanupHours);
     }
 
     private static void StopPinStateWatcher()
     {
+        Interlocked.Exchange(ref _fileCacheCleanup, null)?.Stop();
         Callbacks.StopDirectoryRefresh();
+        Callbacks.StopWriteback();
         var watcher = Interlocked.Exchange(ref _pinStateWatcher, null);
         watcher?.Stop();
     }
@@ -842,7 +856,7 @@ internal static class Program
         TrayHost.WaitForUiReady();
         if (!_quiet)
         {
-            UpdateService.Start(_ctx.AutomaticUpdateCheck, _cts.Token);
+            UpdateService.Start(_ctx.AutomaticUpdateCheck, _ctx.AutomaticUpdateDownload, _cts.Token);
             if (_showAbout) WinUiUiHost.ShowAbout();
         }
 
@@ -863,6 +877,8 @@ internal static class Program
         // （上次退出可能清了占位但缓存还在，否则会命中缓存跳过创建 → 目录为空）
         Callbacks.Cache = _cache;
         Callbacks.ContainerTypeId = _ctx.RootContainerTypeId;
+        _ctx.FileCacheCleanupHours = SyncRootContext.NormalizeFileCacheCleanupHours(_ctx.FileCacheCleanupHours);
+        _fileCacheCleanup?.Configure(_ctx.AutomaticFileCacheCleanup, _ctx.FileCacheCleanupHours);
         Callbacks.UserKey = CurrentUserKey();
         // 统一设置 SyncRootPath（关键修复）：
         // SyncRootPath 仅在 SyncRootRegistrar.Register 内设置（CloudFilesBridge.cs line 67），
@@ -1762,18 +1778,11 @@ internal static class Program
         try
         {
             var sw = System.Diagnostics.Stopwatch.StartNew();
-            // 从 disk_tree 递归构造每个磁盘的 localPath（SyncRoot\容器名\磁盘名）
-            var diskPaths = new List<(ulong diskId, string localPath)>();
-            void WalkTree(ulong parentId, string parentPath)
-            {
-                foreach (var n in _cache!.ListChildNodes(CurrentUserKey(), parentId))
-                {
-                    var p = Path.Combine(parentPath, n.LocalName);
-                    if (n.IsDisk) diskPaths.Add((n.Id, p));
-                    else WalkTree(n.Id, p);  // 容器递归
-                }
-            }
-            WalkTree(_ctx.RootContainerTypeId, _ctx.SyncRootPath);
+            // Materialize every virtual ancestor and the known cached directory tree before
+            // issuing HTTP. A SQLite local_path does not imply that its parent exists on disk.
+            var directoryTree = new PlaceholderDirectoryTree(_ctx.SyncRootPath, _cache!, CurrentUserKey(),
+                _ctx.RootContainerTypeId, message => Log.Information("{Msg}", message));
+            var diskPaths = directoryTree.PrepareCachedTree(ct);
             if (diskPaths.Count == 0)
             {
                 Log.Warning("[PREFETCH] disk_tree 无磁盘节点，跳过预拉取（直接对账）");
@@ -1795,22 +1804,31 @@ internal static class Program
                 while (queue.Count > 0 && !ct.IsCancellationRequested)
                 {
                     var (folderId, parentId, localPath) = queue.Dequeue();
-                    // 去重：已缓存且未过期（统一周期内）则跳过 HTTP，但从 DB 读子项继续 BFS
-                    if (_cache!.IsFolderCached(diskId, folderId, CloudFiles.Callbacks.FolderCache))
-                    {
-                        skipped++;
-                        foreach (var sub in _cache.ListCachedItems(diskId, folderId).Where(i => i.isFolder))
-                            queue.Enqueue((sub.id, folderId, Path.Combine(localPath, sub.name)));
-                        continue;
-                    }
                     try
                     {
+                        directoryTree.EnsureDirectory(diskId, folderId, localPath, ct);
+                        // A valid HTTP cache can still have missing local placeholders after
+                        // restart or a directory deletion. Repair locally even on a cache hit.
+                        if (_cache!.IsFolderCached(diskId, folderId, CloudFiles.Callbacks.FolderCache))
+                        {
+                            skipped++;
+                            var cached = _cache.ListCachedItems(diskId, folderId);
+                            directoryTree.PopulateDirectory(diskId, folderId, localPath, cached, ct);
+                            foreach (var sub in cached.Where(i => i.isFolder))
+                            {
+                                var path = Path.Combine(localPath, sub.name);
+                                _cache.SaveSubFolder(diskId, sub.id, folderId, sub.name, path);
+                                queue.Enqueue((sub.id, folderId, path));
+                            }
+                            continue;
+                        }
                         var listing = await _client!.ListFolderWithPermissionsAsync(diskId, folderId);
                         if (!listing.IsValidPage) throw new InvalidDataException("服务器没有返回请求的目录页面。");
                         var items = listing.Items.ToList();
                         _cache.SaveDirectoryPermission(CurrentUserKey(), diskId, folderId, listing.Permission);
                         _cache.SaveFolder(diskId, folderId, parentId,
                             Path.GetFileName(localPath.TrimEnd('\\')), localPath, items);
+                        Callbacks.ReconcileDirectorySnapshot(diskId, folderId, localPath, items);
                         totalFolders++;
                         totalFiles += items.Count(i => !i.IsFolder);
                         // 子文件夹：SaveSubFolder（含 local_path，供下次对账反查）+ 入队继续递归
@@ -1826,9 +1844,7 @@ internal static class Program
                         try
                         {
                             var cachedItems = _cache.ListCachedItems(diskId, folderId);
-                            var permission = _cache.GetDirectoryPermission(CurrentUserKey(), diskId, folderId);
-                            var created = PlaceholderCreator.CreateBatch(localPath, diskId, folderId, cachedItems,
-                                readOnly: permission != DirectoryPermission.FullAccess);
+                            var created = directoryTree.PopulateDirectory(diskId, folderId, localPath, cachedItems, ct);
                             if (created > 0)
                             {
                                 ExplorerStateNotifier.NotifyDirectory(localPath);
@@ -2379,6 +2395,8 @@ internal static class Program
         Callbacks.SyncRootPath = Path.GetFullPath(_ctx.SyncRootPath);
         Callbacks.UserKey = CurrentUserKey();
         Callbacks.ContainerTypeId = _ctx.RootContainerTypeId;
+        _ctx.FileCacheCleanupHours = SyncRootContext.NormalizeFileCacheCleanupHours(_ctx.FileCacheCleanupHours);
+        _fileCacheCleanup?.Configure(_ctx.AutomaticFileCacheCleanup, _ctx.FileCacheCleanupHours);
     }
 
     /// <summary>
@@ -2425,6 +2443,7 @@ internal static class Program
             // 3) 先落盘
             SaveConfig();
             UpdateService.SetAutomaticCheckEnabled(_ctx.AutomaticUpdateCheck);
+            UpdateService.SetAutomaticDownloadEnabled(_ctx.AutomaticUpdateDownload);
             TrayHost.SetTrayUpdateHintEnabled(_ctx.TrayUpdateHintEnabled);
 
             // 4) 重建 SyncRoot

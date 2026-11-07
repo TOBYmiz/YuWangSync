@@ -63,7 +63,8 @@ public static class SyncRootRegistrar
                 Population = new CF_POPULATION_POLICY
                 {
                     Primary = CF_POPULATION_POLICY_PRIMARY.CF_POPULATION_POLICY_PARTIAL
-                }
+                },
+                InSync = CF_INSYNC_POLICY.CF_INSYNC_POLICY_TRACK_FILE_LAST_WRITE_TIME
             };
 
             if (update && !ProviderIdentity.OwnsRoot(syncRootPath, allowLegacy: true, providerName: providerName))
@@ -267,6 +268,8 @@ public static class PlaceholderCreator
     public static int CreatePlaceholders(string syncRootPath, CF_PLACEHOLDER_CREATE_INFO[] placeholders)
     {
         if (placeholders.Length == 0) return 0;
+        if (!Directory.Exists(syncRootPath))
+            throw new DirectoryNotFoundException($"占位父目录尚未准备好，需先补齐目录层级: {syncRootPath}");
 
         // 预检查：跳过已存在的占位
         var toCreate = new List<CF_PLACEHOLDER_CREATE_INFO>();
@@ -427,6 +430,11 @@ public static class CallbackTable
 public static class Callbacks
 {
     private static DirectoryPopulationRefresh? _directoryRefresh;
+    private static CloudFileWriteback? _writeback;
+    private static int _writesStopping;
+    private static long _writeTaskId;
+    private static readonly object WriteTaskGate = new();
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<long, Task> WriteTasks = new();
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<NodeKey, object> ListingGates = new();
 
     public static void StartDirectoryRefresh()
@@ -438,6 +446,78 @@ public static class Callbacks
 
     public static void StopDirectoryRefresh()
         => Interlocked.Exchange(ref _directoryRefresh, null)?.Dispose();
+
+    public static void StartWriteback()
+    {
+        StopWriteback();
+        Volatile.Write(ref _writesStopping, 0);
+        if (Client is { } client && Cache is { } cache)
+            _writeback = new CloudFileWriteback(SyncRootPath, UserKey, client, cache, Log);
+    }
+
+    public static void StopWriteback()
+    {
+        Task[] tasks;
+        lock (WriteTaskGate)
+        {
+            Volatile.Write(ref _writesStopping, 1);
+            tasks = WriteTasks.Values.ToArray();
+        }
+        Interlocked.Exchange(ref _writeback, null)?.Dispose();
+        try { Task.WhenAll(tasks).GetAwaiter().GetResult(); }
+        catch (Exception error) { Log?.Invoke($"[WRITE] 停止回调写回时发生错误: {error.GetType().Name}"); }
+        PendingRenameTargets.Clear();
+        PendingDeletes.Clear();
+    }
+
+    private static void RunWriteTask(Func<Task> action)
+    {
+        lock (WriteTaskGate)
+        {
+            if (Volatile.Read(ref _writesStopping) != 0) return;
+            var id = Interlocked.Increment(ref _writeTaskId);
+            var task = Task.Run(action);
+            WriteTasks[id] = task;
+            _ = task.ContinueWith(completed => { WriteTasks.TryRemove(id, out _); },
+                CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+        }
+    }
+
+    internal static bool IsWriteMutationPending(string path)
+    {
+        RemoveAbortedRenameRequests();
+        return PendingRenameTargets.Values.Any(p =>
+            path.Equals(p.Target, StringComparison.OrdinalIgnoreCase) || path.Equals(p.Source, StringComparison.OrdinalIgnoreCase)
+            || path.StartsWith(p.Target.TrimEnd('\\') + "\\", StringComparison.OrdinalIgnoreCase)
+            || path.StartsWith(p.Source.TrimEnd('\\') + "\\", StringComparison.OrdinalIgnoreCase)
+            || p.Target.StartsWith(path.TrimEnd('\\') + "\\", StringComparison.OrdinalIgnoreCase)
+            || p.Source.StartsWith(path.TrimEnd('\\') + "\\", StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static void RemoveAbortedRenameRequests()
+    {
+        foreach (var entry in PendingRenameTargets)
+        {
+            if (Volatile.Read(ref entry.Value.Started) != 0 || Environment.TickCount64 - entry.Value.RequestedAt < 5000)
+                continue;
+            // An acknowledged local rename may fail before completion (name collision,
+            // sharing violation). Only expire it while the same source identity still exists.
+            if (ProviderIdentity.TryReadPlaceholderIdentity(entry.Value.Source, out var source)
+                && new NodeKey(source).Equals(entry.Key))
+                ((ICollection<KeyValuePair<NodeKey, PendingRename>>)PendingRenameTargets).Remove(entry);
+        }
+    }
+
+    private static DirectoryPermission ResolveDirectoryPermission(ulong disk, ulong folder)
+    {
+        var permission = Cache?.GetDirectoryPermission(UserKey, disk, folder) ?? DirectoryPermission.Unknown;
+        if (permission == DirectoryPermission.Unknown && Client is { } client)
+        {
+            permission = client.ProbeDirectoryPermissionAsync(disk, folder).GetAwaiter().GetResult();
+            Cache?.SaveDirectoryPermission(UserKey, disk, folder, permission);
+        }
+        return permission;
+    }
 
     public static void OnCleanupFetchPlaceholders(in CF_CALLBACK_INFO info, in CF_CALLBACK_PARAMETERS parameters)
     {
@@ -534,7 +614,14 @@ public static class Callbacks
 
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<ulong, HydrationActivity> Hydration = new();
 
-    private static readonly System.Collections.Concurrent.ConcurrentDictionary<NodeKey, string> PendingRenameTargets = new();
+    private sealed record PendingRename(string Source, string Target, ulong? TargetFolder,
+        DateTime? CleanWriteTime, long? CleanLength)
+    {
+        public int Started;
+        public readonly long RequestedAt = Environment.TickCount64;
+    }
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<NodeKey, PendingRename> PendingRenameTargets = new();
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<NodeKey, bool> PendingDeletes = new();
 
     private static readonly NTStatus CloudFileAccessDenied = new(unchecked((int)0xC000CF18));
 
@@ -543,7 +630,10 @@ public static class Callbacks
         try
         {
             var identity = ReadIdentity(info);
-            Log?.Invoke($"[WRITE] close-completed identity={identity.DiskId}/{identity.FolderId}/{identity.FileId}");
+            if (CloudFilesInterop.TryReadCallbackFlags(parameters, out var closeFlags)
+                && (closeFlags & (uint)CF_CALLBACK_CLOSE_COMPLETION_FLAGS.CF_CALLBACK_CLOSE_COMPLETION_FLAG_DELETED) != 0) return;
+            if (identity.Type == 1 && !SuppressDeleteRecovery)
+                _writeback?.Enqueue(ResolveFilePath(identity, info) ?? GetLocalPath(info));
         }
         catch (Exception error) { Log?.Invoke($"[WRITE] close completion 解析失败: {error.Message}"); }
     }
@@ -553,12 +643,22 @@ public static class Callbacks
         // Explorer's "Free up space" only removes the local data stream. It does not write to
         // the cloud, so both read-only and writable directories may dehydrate successfully.
         ulong fileId = 0;
-        try { fileId = ReadIdentity(info).FileId; } catch { }
+        var status = CloudFileAccessDenied;
+        try
+        {
+            var identity = ReadIdentity(info);
+            fileId = identity.FileId;
+            var path = GetLocalPath(info);
+            if (SuppressDeleteRecovery || (PlaceholderUpdater.TryGetPlaceholderDataState(path, out var state)
+                && state.InSyncState == CF_IN_SYNC_STATE.CF_IN_SYNC_STATE_IN_SYNC && !IsWriteMutationPending(path)))
+                status = NTStatus.STATUS_SUCCESS;
+        }
+        catch { }
         Log?.Invoke($"[HYDRATION] dehydrate-request file={fileId} identityLength={info.FileIdentityLength} size={info.FileSize}");
         var ack = new CF_OPERATION_PARAMETERS.ACKDEHYDRATE
         {
             Flags = CF_OPERATION_ACK_DEHYDRATE_FLAGS.CF_OPERATION_ACK_DEHYDRATE_FLAG_NONE,
-            CompletionStatus = NTStatus.STATUS_SUCCESS,
+            CompletionStatus = status,
             FileIdentity = info.FileIdentity,
             FileIdentityLength = info.FileIdentityLength,
         };
@@ -583,13 +683,20 @@ public static class Callbacks
         try
         {
             identity = ReadIdentity(info);
-            var permission = Cache?.GetDirectoryPermission(UserKey, identity.DiskId, identity.FolderId)
-                ?? DirectoryPermission.Unknown;
+            var permission = !SuppressDeleteRecovery && !identity.IsVirtual && identity.FileId != 0
+                ? ResolveDirectoryPermission(identity.DiskId, identity.FolderId)
+                : DirectoryPermission.Unknown;
             // Read-only delete and drag-out operations are allowed to finish locally. The
             // completion callback restores the cloud placeholder metadata without hydrating data.
             // Full-access deletions are confirmed against the server after local completion.
-            if (SuppressDeleteRecovery || permission is DirectoryPermission.ReadOnly or DirectoryPermission.FullAccess)
+            if (SuppressDeleteRecovery || (Volatile.Read(ref _writesStopping) == 0 && !identity.IsVirtual && identity.FileId != 0
+                && permission is DirectoryPermission.ReadOnly or DirectoryPermission.FullAccess))
                 status = NTStatus.STATUS_SUCCESS;
+            if (!SuppressDeleteRecovery && status == NTStatus.STATUS_SUCCESS)
+                // Windows may retry a directory delete after a child/sharing failure,
+                // without sending completion for the previous attempt. ACK retries and
+                // let TryRemove in completion coalesce the actual cloud write.
+                PendingDeletes[new NodeKey(identity)] = permission == DirectoryPermission.FullAccess;
             Log?.Invoke($"[WRITE] delete-request file={identity.FileId} directory={identity.Type == 0} permission={permission} ack={status}");
         }
         catch (Exception error)
@@ -597,30 +704,32 @@ public static class Callbacks
             Log?.Invoke($"[WRITE] delete notification failed closed: {error.Message}");
         }
 
-        Execute(info, CF_OPERATION_TYPE.CF_OPERATION_TYPE_ACK_DELETE,
+        var result = Execute(info, CF_OPERATION_TYPE.CF_OPERATION_TYPE_ACK_DELETE,
             new CF_OPERATION_PARAMETERS.ACKDELETE
             {
                 Flags = CF_OPERATION_ACK_DELETE_FLAGS.CF_OPERATION_ACK_DELETE_FLAG_NONE,
                 CompletionStatus = status,
             });
+        if (result.Failed && identity.IsValid) PendingDeletes.TryRemove(new NodeKey(identity), out _);
     }
 
     public static void OnNotifyDeleteCompletion(in CF_CALLBACK_INFO info, in CF_CALLBACK_PARAMETERS parameters)
     {
         if (SuppressDeleteRecovery) return;
+        if (Volatile.Read(ref _writesStopping) != 0) return;
         try
         {
             var identity = ReadIdentity(info);
+            if (identity.IsVirtual || identity.FileId == 0) return;
             var pathHint = GetLocalPath(info);
-            var permission = Cache?.GetDirectoryPermission(UserKey, identity.DiskId, identity.FolderId)
-                ?? DirectoryPermission.Unknown;
-            if (permission != DirectoryPermission.FullAccess)
+            if (!PendingDeletes.TryRemove(new NodeKey(identity), out var fullAccess)) return;
+            if (!fullAccess)
             {
-                _ = Task.Run(() => RestoreDeletedPlaceholder(identity, pathHint));
+                RunWriteTask(() => { RestoreDeletedPlaceholder(identity, pathHint); return Task.CompletedTask; });
                 return;
             }
 
-            _ = Task.Run(async () =>
+            RunWriteTask(async () =>
             {
                 try
                 {
@@ -654,24 +763,66 @@ public static class Callbacks
         try
         {
             var identity = ReadIdentity(info);
-            var permission = Cache?.GetDirectoryPermission(UserKey, identity.DiskId, identity.FolderId)
-                ?? DirectoryPermission.Unknown;
-            if (permission == DirectoryPermission.FullAccess)
+            RemoveAbortedRenameRequests();
+            var permission = !SuppressDeleteRecovery && !identity.IsVirtual && identity.FileId != 0
+                ? ResolveDirectoryPermission(identity.DiskId, identity.FolderId)
+                : DirectoryPermission.Unknown;
+            if (Volatile.Read(ref _writesStopping) == 0 && !SuppressDeleteRecovery && !identity.IsVirtual && identity.FileId != 0
+                && permission == DirectoryPermission.FullAccess)
             {
-                PendingRenameTargets[new NodeKey(identity)] = ResolveTargetPath(info,
-                    CloudFilesInterop.ReadRenameTarget(parameters));
-                status = NTStatus.STATUS_SUCCESS;
+                var targetPath = ResolveTargetPath(info, CloudFilesInterop.ReadRenameTarget(parameters));
+                var root = Path.GetFullPath(SyncRootPath).TrimEnd('\\') + "\\";
+                ulong? targetFolder = null;
+                if (targetPath.StartsWith(root, StringComparison.OrdinalIgnoreCase))
+                {
+                    var parentPath = Path.GetDirectoryName(targetPath)!;
+                    if (!ProviderIdentity.TryReadPlaceholderIdentity(parentPath, out var parentIdentity))
+                    {
+                        // A single-disk provider can map its SyncRoot directly to a real
+                        // folder; the root itself does not expose ordinary placeholder info.
+                        var rootFolder = Cache?.TryGetFolderByLocalPath(parentPath);
+                        if (!parentPath.Equals(Path.GetFullPath(SyncRootPath).TrimEnd('\\'), StringComparison.OrdinalIgnoreCase)
+                            || rootFolder is null || rootFolder.Value.diskId == 0)
+                            throw new IOException($"移动目标不是已绑定云端身份的目录: {parentPath}");
+                        parentIdentity = new FileIdentity(rootFolder.Value.diskId, 0, rootFolder.Value.folderId, 0);
+                    }
+                    if (parentIdentity.Type != 0 || parentIdentity.IsVirtual)
+                        throw new IOException($"移动目标不是可写入的真实云端目录: {parentPath}");
+                    if (parentIdentity.DiskId != identity.DiskId)
+                        throw new IOException($"不支持跨磁盘移动 sourceDisk={identity.DiskId} targetDisk={parentIdentity.DiskId}");
+                    var targetPermission = ResolveDirectoryPermission(parentIdentity.DiskId, parentIdentity.FileId);
+                    if (targetPermission != DirectoryPermission.FullAccess)
+                        throw new IOException($"移动目标目录不具备已确认的写入权限 disk={parentIdentity.DiskId} folder={parentIdentity.FileId} permission={targetPermission}");
+                    Cache?.EnsureFolderRow(parentIdentity.DiskId, parentIdentity.FileId);
+                    Cache?.SetFolderLocalPath(parentIdentity.DiskId, parentIdentity.FileId, parentPath);
+                    targetFolder = parentIdentity.FileId;
+                }
+                var sourcePath = GetLocalPath(info);
+                DateTime? cleanWriteTime = null;
+                long? cleanLength = null;
+                if (identity.Type == 1 && PlaceholderUpdater.TryGetPlaceholderDataState(sourcePath, out var sourceState)
+                    && sourceState.InSyncState == CF_IN_SYNC_STATE.CF_IN_SYNC_STATE_IN_SYNC)
+                {
+                    cleanWriteTime = File.GetLastWriteTimeUtc(sourcePath);
+                    cleanLength = new FileInfo(sourcePath).Length;
+                }
+                if (PendingRenameTargets.TryAdd(new NodeKey(identity), new(sourcePath, targetPath, targetFolder, cleanWriteTime, cleanLength)))
+                    status = NTStatus.STATUS_SUCCESS;
             }
             Log?.Invoke($"[WRITE] rename-request file={identity.FileId} permission={permission} ack={status}");
         }
         catch (Exception error) { Log?.Invoke($"[WRITE] rename notification failed closed: {error.Message}"); }
 
-        Execute(info, CF_OPERATION_TYPE.CF_OPERATION_TYPE_ACK_RENAME,
+        var result = Execute(info, CF_OPERATION_TYPE.CF_OPERATION_TYPE_ACK_RENAME,
             new CF_OPERATION_PARAMETERS.ACKRENAME
             {
                 Flags = CF_OPERATION_ACK_RENAME_FLAGS.CF_OPERATION_ACK_RENAME_FLAG_NONE,
                 CompletionStatus = status,
             });
+        if (result.Failed)
+        {
+            try { PendingRenameTargets.TryRemove(new NodeKey(ReadIdentity(info)), out _); } catch { }
+        }
     }
 
     public static void OnNotifyRenameCompletion(in CF_CALLBACK_INFO info, in CF_CALLBACK_PARAMETERS parameters)
@@ -679,27 +830,23 @@ public static class Callbacks
         try
         {
             var identity = ReadIdentity(info);
-            if (!PendingRenameTargets.TryRemove(new NodeKey(identity), out var targetPath)) return;
-            _ = Task.Run(() => SyncCompletedRenameAsync(identity, targetPath));
+            if (!PendingRenameTargets.TryGetValue(new NodeKey(identity), out var pending)) return;
+            if (Interlocked.CompareExchange(ref pending.Started, 1, 0) != 0) return;
+            RunWriteTask(async () =>
+            {
+                try { await SyncCompletedRenameAsync(identity, pending).ConfigureAwait(false); }
+                finally { PendingRenameTargets.TryRemove(new NodeKey(identity), out _); }
+            });
         }
         catch (Exception error) { Log?.Invoke($"[WRITE] rename completion 处理失败: {error.Message}"); }
     }
 
-    private static async Task SyncCompletedRenameAsync(FileIdentity identity, string targetPath)
+    private static async Task SyncCompletedRenameAsync(FileIdentity identity, PendingRename pending)
     {
+        var targetPath = pending.Target;
         try
         {
-            var targetFolderId = (ulong?)null;
-            var root = Path.GetFullPath(SyncRootPath).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
-            var isInsideRoot = targetPath.StartsWith(root, StringComparison.OrdinalIgnoreCase);
-            if (isInsideRoot)
-            {
-                var targetParent = Path.GetDirectoryName(targetPath)
-                    ?? throw new InvalidDataException("移动目标没有父目录。");
-                targetFolderId = Cache?.TryGetFolderByLocalPath(targetParent)?.folderId;
-                if (targetFolderId is null)
-                    throw new InvalidDataException($"移动目标目录尚未映射到云端: {targetParent}");
-            }
+            var targetFolderId = pending.TargetFolder;
 
             var newName = Path.GetFileName(targetPath.TrimEnd(Path.DirectorySeparatorChar));
             var ok = await (Client ?? throw new InvalidOperationException("Cloud client 尚未初始化"))
@@ -711,15 +858,40 @@ public static class Callbacks
             InvalidateFolderListing(identity.DiskId, identity.FolderId);
             if (targetFolderId is { } target)
             {
+                // Do not mark dirty file contents in sync just because their name changed.
+                if (!PlaceholderUpdater.TryBindIdentity(targetPath,
+                    new FileIdentity(identity.DiskId, target, identity.FileId, identity.Type), false, Log,
+                    pending.CleanWriteTime, pending.CleanLength))
+                    throw new IOException("云端移动已完成，本地占位身份尚未更新。");
+                Cache?.ApplyRemoteRename(identity, target, newName, targetPath);
                 Cache?.InvalidateFolderListing(identity.DiskId, target);
                 InvalidateFolderListing(identity.DiskId, target);
+                _writeback?.Enqueue(targetPath);
+                // A concurrent prefetch/refresh can have recreated the old metadata while
+                // the server move was in flight. Remove only a clean, empty old identity;
+                // the existing helper preserves downloaded bytes and ordinary local files.
+                if (!pending.Source.Equals(targetPath, StringComparison.OrdinalIgnoreCase)
+                    && ProviderIdentity.TryReadPlaceholderIdentity(pending.Source, out var old)
+                    && new NodeKey(old).Equals(new NodeKey(identity)))
+                    RemoveUnhydratedPlaceholder(pending.Source, old);
             }
+            else Cache?.RemoveCachedItem(identity);
             Log?.Invoke($"[WRITE] 云端重命名/移动已确认 file={identity.FileId}");
         }
         catch (Exception error)
         {
-            Log?.Invoke($"[WRITE] 云端重命名/移动失败，尝试还原源占位 file={identity.FileId}: {error.Message}");
-            RestoreDeletedPlaceholder(identity);
+            Log?.Invoke($"[WRITE] 云端重命名/移动未完成，保留本地内容并重新对账 file={identity.FileId}: {error.Message}");
+            Cache?.InvalidateFolderListing(identity.DiskId, identity.FolderId);
+            InvalidateFolderListing(identity.DiskId, identity.FolderId);
+            // Only restore the source if a complete cloud listing confirms it still exists.
+            // A failed final response may mean the server has already committed the move.
+            try
+            {
+                var listing = await Client!.ListFolderWithPermissionsAsync(identity.DiskId, identity.FolderId).ConfigureAwait(false);
+                if (listing.IsValidPage && listing.Items.Any(i => i.Id == identity.FileId))
+                    RestoreDeletedPlaceholder(identity);
+            }
+            catch { }
         }
     }
 
@@ -900,6 +1072,9 @@ public static class Callbacks
             {
                 var emptyPath = ResolveFilePath(identity, info)
                     ?? throw new IOException($"file={identity.FileId} 已确认远端无内容，但无法定位本地占位");
+                if (PlaceholderUpdater.TryGetPlaceholderDataState(emptyPath, out var emptyState)
+                    && emptyState.InSyncState != CF_IN_SYNC_STATE.CF_IN_SYNC_STATE_IN_SYNC)
+                    throw new IOException("本地存在未同步修改，拒绝按云端空内容缩小文件。");
                 if (info.FileSize != 0 && !PlaceholderUpdater.TryUpdateFileSize(emptyPath, 0, Log))
                     throw new IOException($"file={identity.FileId} 已确认远端无内容，但无法把占位大小改为 0 B");
 
@@ -1603,7 +1778,7 @@ public static class Callbacks
                     || !Callbacks.IsHydrationQuiet(item.id, quietMs: 200))
                     continue;
                 if (!PlaceholderUpdater.TryGetPlaceholderDataState(path, out var state)
-                    || state.OnDiskDataSize != 0)
+                    || state.OnDiskDataSize != 0 || state.InSyncState != CF_IN_SYNC_STATE.CF_IN_SYNC_STATE_IN_SYNC)
                     continue;
                 if (new FileInfo(path).Length == item.size.Value) continue;
                 if (PlaceholderUpdater.TryUpdateFileSize(path, item.size.Value, Log))
@@ -1616,12 +1791,17 @@ public static class Callbacks
         }
     }
 
+    public static void ReconcileDirectorySnapshot(ulong disk, ulong folder, string localDir,
+        IReadOnlyList<Net.YuWangItem> remoteItems)
+        => ReconcileRemovedPlaceholders(new FileIdentity(disk, 0, folder, 0), localDir, remoteItems);
+
     private static void ReconcileRemovedPlaceholders(FileIdentity parent, string localDir,
         IReadOnlyList<Net.YuWangItem> remoteItems)
     {
         var expected = remoteItems.ToDictionary(item => (item.Id, item.IsFolder), item => item.Name);
         foreach (var path in Directory.EnumerateFileSystemEntries(localDir))
         {
+            if (IsWriteMutationPending(path)) continue;
             if (!ProviderIdentity.TryReadPlaceholderIdentity(path, out var actual)
                 || actual.DiskId != parent.DiskId || actual.FolderId != parent.FileId)
                 continue;
