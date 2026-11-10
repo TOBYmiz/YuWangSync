@@ -28,6 +28,9 @@ internal static class TrayHost
     private static bool _trayUpdateHintEnabled = true;
     private static bool _trayCreated;
     private static readonly ManualResetEventSlim ShutdownComplete = new(false);
+    private static readonly CancellationTokenSource TrayLifetime = new();
+    private static readonly SemaphoreSlim TrayRecoveryRequested = new(0, 1);
+    private static Guid? _trayIdOverride;
 
     internal static bool IsTrayCreated => Volatile.Read(ref _trayCreated);
 
@@ -36,6 +39,7 @@ internal static class TrayHost
     private const int ShellReadyGraceMs = 500;
     private const int TrayCreateMaxAttempts = 5;
     private const int TrayCreateRetryDelayMs = 3_000;
+    private const int TrayHealthCheckIntervalMs = 30_000;
 
     private const uint ImageIcon = 1;
     private const uint LoadFromFile = 0x00000010;
@@ -58,6 +62,13 @@ internal static class TrayHost
 
     [DllImport("user32.dll", SetLastError = true)]
     private static extern bool DestroyIcon(IntPtr icon);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern uint RegisterWindowMessage(string message);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool ChangeWindowMessageFilterEx(IntPtr window, uint message, uint action, IntPtr changeInfo);
 
     [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Auto)]
     private static extern ushort RegisterClassEx(ref WndClassEx windowClass);
@@ -106,13 +117,14 @@ internal static class TrayHost
     private static WindowProcDelegate? _shutdownWindowProc;
     private static IntPtr _shutdownWindow;
 
-    public static void Start(bool showUi, bool showTrayUpdateHint = true)
+    public static void Start(bool showUi, bool showTrayUpdateHint = true, Guid? trayIdOverride = null)
     {
         lock (Gate)
         {
             if (_started) return;
             _started = true;
             _showUi = showUi;
+            _trayIdOverride = trayIdOverride;
             Volatile.Write(ref _trayUpdateHintEnabled, showTrayUpdateHint);
             if (_showUi) UpdateService.StateChanged += OnUpdateStateChanged;
             if (!WinUiUiHost.IsReady)
@@ -129,6 +141,7 @@ internal static class TrayHost
             {
                 try
                 {
+                    if (TrayLifetime.IsCancellationRequested) return;
                     if (_showUi) BuildTrayIcon();
                     CreateShutdownMonitor();
                 }
@@ -159,11 +172,18 @@ internal static class TrayHost
 
     public static void Shutdown()
     {
+        // Cancel before posting disposal so an already queued recovery cannot recreate the icon.
+        TrayLifetime.Cancel();
+        if (_showUi) UpdateService.StateChanged -= OnUpdateStateChanged;
         if (!WinUiUiHost.Post(() =>
         {
             try
             {
-                if (_tray != null) _tray.MessageWindow.MouseEventReceived -= OnTrayMouseEvent;
+                if (_tray != null)
+                {
+                    _tray.MessageWindow.MouseEventReceived -= OnTrayMouseEvent;
+                    _tray.MessageWindow.TaskbarCreated -= OnTaskbarCreated;
+                }
                 _tray?.Dispose();
             }
             catch { }
@@ -232,11 +252,19 @@ internal static class TrayHost
         menu.Items.Add(new PopupMenuSeparator());
         menu.Items.Add(new PopupMenuItem("退出", (_, _) => RequestExit()));
 
-        _tray = new TrayIcon(ProductIdentity.DisplayNameZh)
+        _tray = new TrayIcon(_trayIdOverride ?? TrayIcon.CreateUniqueGuidFromString(ProductIdentity.DisplayNameZh))
         {
             ToolTip = ProductIdentity.DisplayNameZh,
         };
         _tray.MessageWindow.MouseEventReceived += OnTrayMouseEvent;
+        _tray.MessageWindow.TaskbarCreated += OnTaskbarCreated;
+        _tray.MessageWindow.Create();
+        // Setup starts us elevated; Explorer normally runs at medium integrity. Allow just
+        // this registered broadcast through UIPI on our own tray message window.
+        var taskbarCreated = RegisterWindowMessage("TaskbarCreated");
+        if (taskbarCreated == 0 || !ChangeWindowMessageFilterEx(
+                _tray.MessageWindow.Handle, taskbarCreated, 1 /* MSGFLT_ALLOW */, IntPtr.Zero))
+            Log.Warning("允许 TaskbarCreated 消息失败（错误 {Error}），将由后台检查恢复托盘", Marshal.GetLastWin32Error());
         _trayContextMenu = menu;
 
         var iconPath = ResolveTrayIconPath("yw_tray.ico");
@@ -295,26 +323,41 @@ internal static class TrayHost
         {
             try
             {
-                var stopwatch = Stopwatch.StartNew();
-                while (!IsShellReady())
+                Stopwatch? shellWait = null;
+                var failures = 0;
+                var shellWaitLogged = false;
+                while (!TrayLifetime.IsCancellationRequested)
                 {
-                    if (stopwatch.ElapsedMilliseconds >= ShellWaitTimeoutMs)
+                    if (!IsShellReady())
                     {
-                        Log.Warning("等待 Windows Shell 就绪超时（{Sec}s），放弃创建托盘图标", ShellWaitTimeoutMs / 1000);
-                        return;
+                        shellWait ??= Stopwatch.StartNew();
+                        Volatile.Write(ref _trayCreated, false);
+                        if (!shellWaitLogged && shellWait.ElapsedMilliseconds >= ShellWaitTimeoutMs)
+                        {
+                            shellWaitLogged = true;
+                            Log.Warning("等待 Windows Shell 就绪超过 {Sec}s，继续后台等待并恢复托盘", ShellWaitTimeoutMs / 1000);
+                        }
+                        await TrayRecoveryRequested.WaitAsync(shellWaitLogged
+                            ? TrayHealthCheckIntervalMs : ShellPollIntervalMs, TrayLifetime.Token).ConfigureAwait(false);
+                        continue;
                     }
-                    await Task.Delay(ShellPollIntervalMs).ConfigureAwait(false);
-                }
 
-                await Task.Delay(ShellReadyGraceMs).ConfigureAwait(false);
-                for (var attempt = 1; attempt <= TrayCreateMaxAttempts; attempt++)
-                {
-                    if (await TryCreateOnUiThreadAsync().ConfigureAwait(false)) return;
-                    if (attempt < TrayCreateMaxAttempts)
-                        await Task.Delay(TrayCreateRetryDelayMs).ConfigureAwait(false);
+                    shellWait = null;
+                    shellWaitLogged = false;
+
+                    if (!IsTrayCreated)
+                        await Task.Delay(ShellReadyGraceMs, TrayLifetime.Token).ConfigureAwait(false);
+                    var healthy = await TryCreateOnUiThreadAsync(TrayLifetime.Token).ConfigureAwait(false);
+                    failures = healthy ? 0 : failures + 1;
+                    if (failures == TrayCreateMaxAttempts)
+                        Log.Warning("托盘图标创建连续失败 {Count} 次，继续每 {Seconds}s 后台重试",
+                            failures, TrayHealthCheckIntervalMs / 1000);
+                    var delay = healthy || failures >= TrayCreateMaxAttempts
+                        ? TrayHealthCheckIntervalMs : TrayCreateRetryDelayMs;
+                    await TrayRecoveryRequested.WaitAsync(delay, TrayLifetime.Token).ConfigureAwait(false);
                 }
-                Log.Error("托盘图标创建失败（已重试 {Count} 次）", TrayCreateMaxAttempts);
             }
+            catch (OperationCanceledException) when (TrayLifetime.IsCancellationRequested) { }
             catch (Exception ex)
             {
                 Log.Error(ex, "托盘图标创建流程异常（引擎继续运行）");
@@ -322,21 +365,43 @@ internal static class TrayHost
         });
     }
 
-    private static Task<bool> TryCreateOnUiThreadAsync()
+    private static async Task<bool> TryCreateOnUiThreadAsync(CancellationToken cancellationToken)
     {
         var completion = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
         if (!WinUiUiHost.Post(() =>
             {
                 try
                 {
-                    if (_tray == null) { completion.TrySetResult(false); return; }
+                    if (cancellationToken.IsCancellationRequested || _tray == null || _tray.IsDisposed)
+                    {
+                        completion.TrySetResult(false);
+                        return;
+                    }
+                    if (_tray.IsCreated)
+                    {
+                        // IsCreated is only the library's cached flag. NIM_MODIFY checks
+                        // whether Explorer still owns the icon, even if a broadcast was missed.
+                        try
+                        {
+                            _tray.UpdateToolTip(ProductIdentity.DisplayNameZh);
+                            Volatile.Write(ref _trayCreated, true);
+                            completion.TrySetResult(true);
+                            return;
+                        }
+                        catch (Exception error)
+                        {
+                            Log.Warning(error, "托盘图标已丢失，正在重新创建");
+                            _tray.TryRemove(); // Clears the library's stale IsCreated flag, even when NIM_DELETE fails.
+                        }
+                    }
                     _tray.Create();
-                    Volatile.Write(ref _trayCreated, true);
+                    Volatile.Write(ref _trayCreated, _tray.IsCreated);
                     Log.Information("托盘图标已创建（原生 Win32 PopupMenu 模式）");
                     completion.TrySetResult(true);
                 }
                 catch (Exception ex)
                 {
+                    Volatile.Write(ref _trayCreated, false);
                     Log.Warning(ex, "托盘图标创建失败");
                     completion.TrySetResult(false);
                 }
@@ -344,23 +409,25 @@ internal static class TrayHost
         {
             completion.TrySetResult(false);
         }
-        return completion.Task;
+        return await completion.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    private static void OnTaskbarCreated(object? sender, EventArgs args)
+    {
+        if (TrayLifetime.IsCancellationRequested) return;
+        Volatile.Write(ref _trayCreated, false);
+        _tray?.TryRemove();
+        Log.Information("收到 TaskbarCreated，Windows 托盘已重建，正在恢复图标");
+        if (TrayRecoveryRequested.CurrentCount == 0) TrayRecoveryRequested.Release();
     }
 
     private static bool IsShellReady()
     {
         try
         {
-            if (FindWindow("Shell_TrayWnd", null) == IntPtr.Zero) return false;
-            var sessionId = Process.GetCurrentProcess().SessionId;
-            foreach (var process in Process.GetProcessesByName("explorer"))
-            {
-                using (process)
-                {
-                    try { if (process.SessionId == sessionId) return true; }
-                    catch { }
-                }
-            }
+            // FindWindow searches this desktop. A taskbar window is sufficient to try
+            // NIM_ADD; enumerating Explorer processes can fail under restricted tokens.
+            return FindWindow("Shell_TrayWnd", null) != IntPtr.Zero;
         }
         catch { }
         return false;
@@ -507,6 +574,9 @@ internal static class TrayHost
 
     internal static void OpenSettingsForSelfTest() => OnSettingsMenuSelected();
     internal static void OpenAboutForSelfTest() => OnAboutMenuSelected();
+    internal static (Guid Id, IntPtr Window) TrayIdentityForSelfTest
+        => _tray is { } tray ? (tray.Id, tray.WindowHandle)
+            : throw new InvalidOperationException("Self-test tray has not been initialized.");
 
     private static void RequestExit() => Program.RequestShutdownFromUi();
 }

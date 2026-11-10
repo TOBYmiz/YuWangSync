@@ -401,13 +401,21 @@ internal static class WinUiUiHost
         Check("Temporary config isolation", temporaryConfigIsolated,
             $"Config={configPath}; fake SyncRoot was not created.");
 
-        TrayHost.Start(showUi: true, showTrayUpdateHint: Program.SnapshotConfig().TrayUpdateHintEnabled);
+        // A self-test must never remove the installed provider's icon with the same GUID.
+        TrayHost.Start(showUi: true, showTrayUpdateHint: Program.SnapshotConfig().TrayUpdateHintEnabled,
+            trayIdOverride: Guid.NewGuid());
         await Task.Run(() => TrayHost.WaitForUiReady(15_000));
         var trayDeadline = DateTime.UtcNow + TimeSpan.FromSeconds(15);
         while (DateTime.UtcNow < trayDeadline && !TrayHost.IsTrayCreated)
             await Task.Delay(100);
         Check("Native Win32 tray", TrayHost.IsTrayCreated,
             TrayHost.IsTrayCreated ? "H.NotifyIcon.Core TrayIcon/PopupMenu created." : "Tray icon did not become ready within 15 seconds.");
+
+        if (TrayHost.IsTrayCreated)
+        {
+            checks.Add(await CheckTrayRecoveryAsync(taskbarBroadcast: true));
+            checks.Add(await CheckTrayRecoveryAsync(taskbarBroadcast: false));
+        }
 
         var fakeConfig = Program.SnapshotConfig();
 
@@ -606,6 +614,78 @@ internal static class WinUiUiHost
             root.Children.Remove(referenceHost);
         }
         return checks;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct NotifyIconIdentifier
+    {
+        internal uint Size;
+        internal IntPtr Window;
+        internal uint Id;
+        internal Guid Guid;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct NativeRect
+    {
+        internal int Left;
+        internal int Top;
+        internal int Right;
+        internal int Bottom;
+    }
+
+    // The main application targets x64. Only the fields required for NIM_DELETE are used.
+    [StructLayout(LayoutKind.Explicit, Size = 976)]
+    private struct NotifyIconDeleteData
+    {
+        [FieldOffset(0)] internal uint Size;
+        [FieldOffset(20)] internal uint Flags;
+        [FieldOffset(952)] internal Guid Guid;
+    }
+
+    [DllImport("shell32.dll", ExactSpelling = true)]
+    private static extern int Shell_NotifyIconGetRect(ref NotifyIconIdentifier identifier, out NativeRect rect);
+
+    [DllImport("shell32.dll", ExactSpelling = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool Shell_NotifyIconW(uint message, ref NotifyIconDeleteData data);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, ExactSpelling = true)]
+    private static extern uint RegisterWindowMessageW(string message);
+
+    private static async Task<UiSelfTestCheck> CheckTrayRecoveryAsync(bool taskbarBroadcast)
+    {
+        var (id, window) = TrayHost.TrayIdentityForSelfTest;
+        var identifier = new NotifyIconIdentifier
+        {
+            Size = (uint)Marshal.SizeOf<NotifyIconIdentifier>(),
+            Guid = id,
+        };
+        var data = new NotifyIconDeleteData
+        {
+            Size = (uint)Marshal.SizeOf<NotifyIconDeleteData>(),
+            Flags = 0x20, // NIF_GUID
+            Guid = id,
+        };
+        var name = taskbarBroadcast ? "Tray recovery after TaskbarCreated" : "Tray recovery without broadcast";
+        // Delete only our isolated icon in Shell, deliberately leaving the library's IsCreated stale.
+        if (!Shell_NotifyIconW(2 /* NIM_DELETE */, ref data)
+            || Shell_NotifyIconGetRect(ref identifier, out _) >= 0)
+            return new(name, false, "Could not simulate loss of the isolated self-test icon.");
+        if (taskbarBroadcast)
+        {
+            var message = RegisterWindowMessageW("TaskbarCreated");
+            if (message == 0 || !PostMessageW(window, message, IntPtr.Zero, IntPtr.Zero))
+                return new(name, false, "Could not deliver TaskbarCreated to the self-test tray window.");
+        }
+        var deadline = DateTime.UtcNow.AddSeconds(taskbarBroadcast ? 10 : 40);
+        do
+        {
+            await Task.Delay(100);
+            if (TrayHost.IsTrayCreated && Shell_NotifyIconGetRect(ref identifier, out _) >= 0)
+                return new(name, true, "Shell confirms the deleted icon was recreated with its original GUID.");
+        } while (DateTime.UtcNow < deadline);
+        return new(name, false, "The deleted icon was not restored within the recovery interval.");
     }
 
     private static async Task SaveWindowPngAsync(FrameworkElement element, string name, string testRoot)
