@@ -12,6 +12,69 @@ using static Vanara.PInvoke.CldApi;
 try
 {
     CloudFilesPlatform.EnsureSupported();
+    if (args.Contains("--search-progress"))
+    {
+        var fixtureBase = Path.GetFullPath(args.ElementAtOrDefault(Array.IndexOf(args, "--search-progress") + 1)
+            ?? Path.Combine(Path.GetPathRoot(Environment.CurrentDirectory)!, "YuWangCloudSync-search-progress-regression"));
+        var fixture = Path.Combine(fixtureBase, Guid.NewGuid().ToString("N"));
+        var searchRoot = Path.Combine(fixture, "索引 空格 # %");
+        var child = Path.Combine(searchRoot, "子目录");
+        var exclusionAdded = false;
+        Directory.CreateDirectory(child);
+        try
+        {
+            var rootUrl = SyncRootSearchIndex.FolderUrl(searchRoot);
+            var childUrl = SyncRootSearchIndex.FolderUrl(child);
+            Check(rootUrl.EndsWith(Path.DirectorySeparatorChar) && rootUrl.Contains("索引 空格 # %"), "search scope uses a fully decoded file URL and directory boundary");
+            using (var scope = new SyncRootSearchIndex.SearchScope())
+            {
+                var initial = scope.Contains(rootUrl);
+                Console.WriteLine($"Initial search scope: included={initial.included} reason={initial.reason}");
+                Check(initial == (false, 0), "isolated root starts outside the search scope");
+            }
+            Check(SyncRootSearchIndex.Ensure(searchRoot, Console.WriteLine), "register an unindexed root for Explorer progress");
+            Check(SyncRootSearchIndex.Ensure(searchRoot, Console.WriteLine), "index registration is repeatable");
+            Check(SyncRootSearchIndex.Ensure(child, Console.WriteLine), "child reuses inherited index inclusion");
+            Check(SyncRootSearchIndex.Remove(child, Console.WriteLine), "unowned inherited inclusion is preserved");
+            using (var scope = new SyncRootSearchIndex.SearchScope())
+            {
+                Check(scope.Contains(rootUrl).included && scope.Contains(childUrl).included, "root and child stay indexed after unowned cleanup");
+                Check(!scope.Contains(SyncRootSearchIndex.FolderUrl(searchRoot + "-sibling")).included, "index rule does not include a similarly named sibling");
+            }
+            Check(SyncRootSearchIndex.Remove(searchRoot, Console.WriteLine), "remove only the journaled default rule");
+            Check(SyncRootSearchIndex.Remove(searchRoot, Console.WriteLine), "search cleanup is repeatable");
+            using (var scope = new SyncRootSearchIndex.SearchScope())
+            {
+                Check(scope.Contains(rootUrl) == (false, 0) && scope.Contains(childUrl) == (false, 0), "root and child search scope restored");
+                exclusionAdded = true;
+                scope.Add(rootUrl, include: false);
+            }
+            Check(!SyncRootSearchIndex.Ensure(searchRoot, Console.WriteLine), "explicit index exclusion is not overridden");
+            Check(SyncRootSearchIndex.Remove(searchRoot, Console.WriteLine), "unowned exclusion cleanup is a no-op");
+            using (var scope = new SyncRootSearchIndex.SearchScope())
+            {
+                Check(scope.Contains(rootUrl) == (false, 1), "explicit default exclusion is preserved");
+                scope.Remove(rootUrl);
+                exclusionAdded = false;
+                Check(scope.Contains(rootUrl) == (false, 0), "fixture exclusion rule removed");
+            }
+        }
+        finally
+        {
+            if (!SyncRootSearchIndex.Remove(searchRoot, Console.WriteLine))
+                throw new IOException("Temporary search rule cleanup failed: " + searchRoot);
+            if (exclusionAdded)
+            {
+                using var scope = new SyncRootSearchIndex.SearchScope();
+                scope.Remove(SyncRootSearchIndex.FolderUrl(searchRoot));
+            }
+            var allowedPrefix = Path.EndsInDirectorySeparator(fixtureBase) ? fixtureBase : fixtureBase + Path.DirectorySeparatorChar;
+            if (!fixture.StartsWith(allowedPrefix, StringComparison.OrdinalIgnoreCase))
+                throw new IOException("Unsafe search progress fixture cleanup path.");
+            Directory.Delete(fixture, true);
+        }
+        return;
+    }
     if (args.Contains("--shell-progress"))
     {
         Check(ShellTransferProgress.ValidateNativeAbi(out var abiResult), $"native Shell progress ABI / UInt64 counters / terminal states 0x{abiResult:X8}");

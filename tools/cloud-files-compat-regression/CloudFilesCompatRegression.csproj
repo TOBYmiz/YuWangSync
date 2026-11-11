@@ -14,5 +14,6 @@
     <Compile Include="../../src/YuWangCloudSync/CloudFiles/PlaceholderUpdater.cs" Link="PlaceholderUpdater.cs" />
     <Compile Include="../../src/YuWangCloudSync/CloudFiles/ExplorerStateNotifier.cs" Link="ExplorerStateNotifier.cs" />
     <Compile Include="../../src/YuWangCloudSync/CloudFiles/ShellTransferProgress.cs" Link="ShellTransferProgress.cs" />
+    <Compile Include="../../src/YuWangCloudSync/CloudFiles/SyncRootSearchIndex.cs" Link="SyncRootSearchIndex.cs" />
   </ItemGroup>
 </Project>

@@ -96,6 +96,7 @@ internal static class SyncRootShellRegistration
         catch { /* 注册表兜底仍可清理残留项。 */ }
 
         RemoveRegistryRegistration(registrationId, syncRootPath);
+        SyncRootSearchIndex.Remove(syncRootPath, Callbacks.Log);
         ExplorerStateNotifier.NotifyRegistrationChange();
     }
 

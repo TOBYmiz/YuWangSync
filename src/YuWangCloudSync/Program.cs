@@ -85,6 +85,10 @@ internal static class Program
     private static void StartPinStateWatcher()
     {
         StopPinStateWatcher();
+        // Also run when reusing an existing root after an upgrade: successful
+        // volatile-property submission alone does not make Explorer show progress.
+        if (ProviderIdentity.OwnsRoot(_ctx.SyncRootPath))
+            SyncRootSearchIndex.Ensure(_ctx.SyncRootPath, message => Log.Information("{Msg}", message));
         Callbacks.StartDirectoryRefresh();
         try { Callbacks.StartWriteback(); }
         catch (Exception ex) { Log.Error(ex, "无法启动新文件上传监视"); }
