@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Security.Cryptography;
+using System.Threading.Channels;
 using YuWangCloudSync.Core;
 using YuWangCloudSync.Models;
 using YuWangCloudSync.Net;
@@ -10,20 +11,48 @@ namespace YuWangCloudSync.CloudFiles;
 
 /// <summary>
 /// CFAPI close notifications cover placeholders; ordinary new files require a directory watcher.
-/// Both feed one serial queue. Every write rechecks the destination permission and preserves local
-/// bytes on failure. Durable receipts close the gap between remote completion and local binding.
+/// Both feed per-path debounce and exclusive-open confirmation, followed by one serial upload queue.
+/// Every write rechecks destination permission and preserves local bytes on failure. Durable receipts
+/// close the gap between remote completion and local binding.
 /// </summary>
 internal sealed class CloudFileWriteback : IDisposable
 {
+    private const long DebounceMilliseconds = 1_500;
+    private const long MaximumConfirmationWaitMilliseconds = 60_000;
+    private const int MaximumPendingEntries = 10_000;
+    private const int ConfirmationConcurrency = 12;
+    private const int MaximumScanQueueCapacity = 1_000;
+    private const long MinimumFullScanIntervalMilliseconds = 30_000;
+    private const long PeriodicFullScanIntervalMilliseconds = 5 * 60_000;
+    private static readonly int[] BusyRetryDelaysMilliseconds = [2_000, 4_000, 8_000, 16_000, 30_000];
+
     private readonly string _root, _prefix, _user;
     private readonly YuWangClient _client;
     private readonly SqliteCache _cache;
     private readonly Action<string>? _log;
     private readonly FileSystemWatcher _watcher;
     private readonly CancellationTokenSource _stop = new();
-    private readonly ConcurrentDictionary<string, long> _pending = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, PendingChange> _pending = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, string> _lastFailure = new(StringComparer.OrdinalIgnoreCase);
-    private readonly Task _worker;
+    private readonly ConcurrentDictionary<string, byte> _confirming = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, byte> _readyPaths = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, byte> _needsReconciliation = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<long, Task> _confirmationTasks = new();
+    private readonly SemaphoreSlim _confirmationSlots = new(ConfirmationConcurrency, ConfirmationConcurrency);
+    private readonly Channel<ConfirmedPath> _readyQueue = Channel.CreateBounded<ConfirmedPath>(
+        new BoundedChannelOptions(MaximumScanQueueCapacity)
+        {
+            FullMode = BoundedChannelFullMode.Wait,
+            SingleReader = true,
+            SingleWriter = false
+        });
+    private readonly AutoResetEvent _scanSignal = new(false);
+    private readonly Thread _scanThread;
+    private readonly Task _scheduler;
+    private readonly Task _uploadWorker;
+    private int _scanRequested;
+    private int _pendingLimitWarning;
+    private long _confirmationTaskId;
 
     public CloudFileWriteback(string root, string user, YuWangClient client, SqliteCache cache, Action<string>? log)
     {
@@ -35,29 +64,155 @@ internal sealed class CloudFileWriteback : IDisposable
         _log = log;
         _watcher = new FileSystemWatcher(_root)
         {
+            Filter = "*.*",
             IncludeSubdirectories = true,
-            NotifyFilter = NotifyFilters.FileName | NotifyFilters.DirectoryName | NotifyFilters.LastWrite | NotifyFilters.Size,
-            InternalBufferSize = 64 * 1024
+            NotifyFilter = NotifyFilters.FileName | NotifyFilters.DirectoryName | NotifyFilters.LastWrite,
+            InternalBufferSize = 65_536,
+            EnableRaisingEvents = false
         };
         _watcher.Created += OnChanged;
         _watcher.Changed += OnChanged;
-        _watcher.Renamed += (_, e) => Enqueue(e.FullPath);
-        _watcher.Error += (_, _) => { _log?.Invoke("[WRITE] 目录监视溢出，将重新扫描本地待上传内容。"); Discover(_root); };
+        _watcher.Renamed += OnRenamed;
+        _watcher.Error += OnWatcherError;
         _watcher.EnableRaisingEvents = true;
-        _worker = Task.Run(RunAsync);
+
+        _scanThread = new Thread(ScanLoop)
+        {
+            IsBackground = true,
+            Name = "YuWang writeback directory scan",
+            Priority = ThreadPriority.BelowNormal
+        };
+        _scanThread.Start();
+        _scheduler = Task.Run(RunSchedulerAsync);
+        _uploadWorker = Task.Run(RunUploadWorkerAsync);
+        RequestFullScan();
     }
 
     private void OnChanged(object sender, FileSystemEventArgs args) => Enqueue(args.FullPath);
 
+    private void OnRenamed(object sender, RenamedEventArgs args) => Enqueue(args.FullPath);
+
+    private void OnWatcherError(object sender, ErrorEventArgs args)
+    {
+        _log?.Invoke($"[WRITE] 目录监视器异常 ({args.GetException().GetType().Name})，请求全量扫描。");
+        RequestFullScan();
+    }
+
     public void Enqueue(string path)
     {
         if (_stop.IsCancellationRequested || string.IsNullOrWhiteSpace(path)) return;
-        path = Path.GetFullPath(path);
-        if (path.StartsWith(_prefix, StringComparison.OrdinalIgnoreCase))
-            _pending[path] = Environment.TickCount64 + 2000;
+        try { path = Path.GetFullPath(path); }
+        catch (Exception error) when (error is ArgumentException or NotSupportedException or PathTooLongException) { return; }
+        if (!path.StartsWith(_prefix, StringComparison.OrdinalIgnoreCase) || IsTemporaryPath(path)) return;
+
+        SchedulePending(path, fromScan: false);
     }
 
-    private void Discover(string path)
+    private void SchedulePending(string path, bool fromScan)
+    {
+        if (fromScan)
+        {
+            var stopHandle = _stop.Token.WaitHandle;
+            while (!_pending.ContainsKey(path)
+                   && _pending.Count >= MaximumPendingEntries && !_stop.IsCancellationRequested)
+            {
+                if (stopHandle.WaitOne(100)) return;
+            }
+        }
+        if (_stop.IsCancellationRequested) return;
+
+        var firstObserved = Environment.TickCount64;
+        _pending.AddOrUpdate(path,
+            _ => new PendingChange(firstObserved, firstObserved, firstObserved + DebounceMilliseconds, 0),
+            (_, current) =>
+            {
+                var now = Environment.TickCount64;
+                var due = now + DebounceMilliseconds;
+                if (current.BusyRetries > 0) due = Math.Max(due, current.DueTick);
+                return current with { LastEventTick = now, DueTick = due };
+            });
+    }
+
+    private void EnforcePendingLimit()
+    {
+        var count = _pending.Count;
+        if (count <= MaximumPendingEntries)
+        {
+            if (count < MaximumPendingEntries * 3 / 4)
+                Interlocked.Exchange(ref _pendingLimitWarning, 0);
+            return;
+        }
+
+        if (Interlocked.Exchange(ref _pendingLimitWarning, 1) == 0)
+            _log?.Invoke($"[WRITE] 待处理路径超过 {MaximumPendingEntries} 条，清理最久未更新项并请求全量扫描。");
+        RequestFullScan();
+
+        var removeCount = count - MaximumPendingEntries;
+        foreach (var entry in _pending.OrderBy(pair => pair.Value.LastEventTick).Take(removeCount))
+        {
+            ((ICollection<KeyValuePair<string, PendingChange>>)_pending).Remove(entry);
+        }
+    }
+
+    private void RequestFullScan()
+    {
+        if (_stop.IsCancellationRequested) return;
+        Interlocked.Exchange(ref _scanRequested, 1);
+        try { _scanSignal.Set(); }
+        catch (ObjectDisposedException) { }
+    }
+
+    private void ScanLoop()
+    {
+        var stopHandle = _stop.Token.WaitHandle;
+        var waitHandles = new WaitHandle[] { _scanSignal, stopHandle };
+        var lastScan = long.MinValue;
+        var nextPeriodicScan = Environment.TickCount64 + PeriodicFullScanIntervalMilliseconds;
+
+        while (!_stop.IsCancellationRequested)
+        {
+            var now = Environment.TickCount64;
+            if (now >= nextPeriodicScan) Interlocked.Exchange(ref _scanRequested, 1);
+
+            if (Volatile.Read(ref _scanRequested) == 0)
+            {
+                var waitMilliseconds = (int)Math.Clamp(nextPeriodicScan - now, 1, 30_000);
+                if (WaitHandle.WaitAny(waitHandles, waitMilliseconds) == 1) return;
+                continue;
+            }
+
+            now = Environment.TickCount64;
+            if (lastScan != long.MinValue && now - lastScan < MinimumFullScanIntervalMilliseconds)
+            {
+                var waitMilliseconds = (int)Math.Clamp(
+                    MinimumFullScanIntervalMilliseconds - (now - lastScan), 1, 30_000);
+                if (WaitHandle.WaitAny(waitHandles, waitMilliseconds) == 1) return;
+                continue;
+            }
+
+            if (Interlocked.Exchange(ref _scanRequested, 0) == 0) continue;
+            try
+            {
+                Discover(_root, waitForCapacity: true);
+                foreach (var path in _needsReconciliation.Keys)
+                {
+                    if (File.Exists(path) || Directory.Exists(path)) SchedulePending(path, fromScan: true);
+                    _needsReconciliation.TryRemove(path, out _);
+                }
+            }
+            catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+            {
+                _log?.Invoke($"[WRITE] 全量扫描未完成 ({error.GetType().Name})。");
+            }
+            finally
+            {
+                lastScan = Environment.TickCount64;
+                nextPeriodicScan = lastScan + PeriodicFullScanIntervalMilliseconds;
+            }
+        }
+    }
+
+    private void Discover(string path, bool waitForCapacity = false)
     {
         if (_stop.IsCancellationRequested) return;
         try
@@ -65,60 +220,278 @@ internal sealed class CloudFileWriteback : IDisposable
             foreach (var child in Directory.EnumerateFileSystemEntries(path))
             {
                 if (_stop.IsCancellationRequested) break;
-                var attributes = File.GetAttributes(child);
+                FileAttributes attributes;
+                try { attributes = File.GetAttributes(child); }
+                catch (IOException) { continue; }
+                catch (UnauthorizedAccessException) { continue; }
+
                 var owned = ProviderIdentity.TryReadPlaceholderIdentity(child, out _);
                 if ((attributes & FileAttributes.ReparsePoint) != 0 && !owned) continue;
                 if (IsTemporary(child, attributes)) continue;
-                _pending.TryAdd(child, Environment.TickCount64 + 2000);
-                if ((attributes & FileAttributes.Directory) != 0) Discover(child);
+                SchedulePending(child, fromScan: waitForCapacity);
+                _needsReconciliation.TryRemove(child, out _);
+                if ((attributes & FileAttributes.Directory) != 0) Discover(child, waitForCapacity);
             }
         }
         catch (IOException) { }
         catch (UnauthorizedAccessException) { }
     }
 
-    private async Task RunAsync()
+    private async Task RunSchedulerAsync()
     {
-        long nextScan = 0;
         try
         {
-            using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(500));
+            using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(100));
             while (await timer.WaitForNextTickAsync(_stop.Token).ConfigureAwait(false))
             {
-                if (Environment.TickCount64 >= nextScan)
+                EnforcePendingLimit();
+                var now = Environment.TickCount64;
+                foreach (var entry in _pending)
                 {
-                    Discover(_root);
-                    nextScan = Environment.TickCount64 + 30_000;
-                }
-                foreach (var entry in _pending.OrderBy(pair => pair.Key.Length))
-                {
-                    if (entry.Value > Environment.TickCount64) continue;
-                    if (!((ICollection<KeyValuePair<string, long>>)_pending).Remove(entry)) continue;
-                    _stop.Token.ThrowIfCancellationRequested();
-                    try
+                    if (_stop.IsCancellationRequested) break;
+                    if (now - entry.Value.FirstEventTick >= MaximumConfirmationWaitMilliseconds)
                     {
-                        await ProcessAsync(entry.Key).ConfigureAwait(false);
-                        _lastFailure.TryRemove(entry.Key, out _);
+                        if (!((ICollection<KeyValuePair<string, PendingChange>>)_pending).Remove(entry)) continue;
+                        _needsReconciliation.TryAdd(entry.Key, 0);
+                        _log?.Invoke($"[WRITE] 独占确认等待超过 60 秒，移交全量扫描 path={entry.Key}");
+                        RequestFullScan();
+                        continue;
                     }
-                    catch (OperationCanceledException) when (_stop.IsCancellationRequested) { throw; }
-                    catch (Exception error)
+
+                    if (entry.Value.DueTick > now
+                        || _confirming.ContainsKey(entry.Key)
+                        || _readyPaths.ContainsKey(entry.Key)) continue;
+                    if (!_confirmationSlots.Wait(0)) break;
+                    if (!_confirming.TryAdd(entry.Key, 0))
                     {
-                        // Do not log HttpRequestException.Message: upload URLs contain tokens.
-                        var reason = error is HttpRequestException ? "HTTP 请求失败" : error is IOException or UnauthorizedAccessException
-                            ? error.Message : error.GetType().Name;
-                        if (!_lastFailure.TryGetValue(entry.Key, out var previous) || previous != reason)
-                            _log?.Invoke($"[WRITE] 保留本地内容，写回未完成 path={entry.Key} reason={reason}");
-                        _lastFailure[entry.Key] = reason;
-                        _pending.TryAdd(entry.Key, Environment.TickCount64 + 30_000);
+                        _confirmationSlots.Release();
+                        continue;
                     }
+                    if (!((ICollection<KeyValuePair<string, PendingChange>>)_pending).Remove(entry))
+                    {
+                        _confirming.TryRemove(entry.Key, out _);
+                        _confirmationSlots.Release();
+                        continue;
+                    }
+                    StartConfirmation(entry.Key, entry.Value);
                 }
             }
         }
         catch (OperationCanceledException) when (_stop.IsCancellationRequested) { }
     }
 
+    private void StartConfirmation(string path, PendingChange pending)
+    {
+        var id = Interlocked.Increment(ref _confirmationTaskId);
+        var task = Task.Run(() => ConfirmAndQueueAsync(path, pending));
+        _confirmationTasks[id] = task;
+        _ = task.ContinueWith(completed =>
+        {
+            _confirmationTasks.TryRemove(id, out _);
+        },
+            CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+    }
+
+    private async Task ConfirmAndQueueAsync(string path, PendingChange pending)
+    {
+        try
+        {
+            _stop.Token.ThrowIfCancellationRequested();
+            if (!CanConfirmWriteback(path))
+            {
+                _lastFailure.TryRemove(path, out _);
+                return;
+            }
+
+            if (!Directory.Exists(path))
+            {
+                using var exclusive = OpenExclusiveRead(path);
+            }
+
+            if (!_readyPaths.TryAdd(path, 0)) return;
+            try
+            {
+                var now = Environment.TickCount64;
+                var confirmed = pending with
+                {
+                    FirstEventTick = now,
+                    LastEventTick = now,
+                    DueTick = now,
+                    BusyRetries = 0
+                };
+                await _readyQueue.Writer.WriteAsync(new ConfirmedPath(path, confirmed), _stop.Token)
+                    .ConfigureAwait(false);
+                _needsReconciliation.TryRemove(path, out _);
+            }
+            catch
+            {
+                _readyPaths.TryRemove(path, out _);
+                throw;
+            }
+        }
+        catch (FileBusyException error)
+        {
+            ScheduleBusyRetry(path, pending, error.Message);
+        }
+        catch (FileNotFoundException) { _lastFailure.TryRemove(path, out _); }
+        catch (DirectoryNotFoundException) { _lastFailure.TryRemove(path, out _); }
+        catch (OperationCanceledException) when (_stop.IsCancellationRequested) { }
+        catch (Exception error)
+        {
+            LogWritebackFailure(path, error);
+            ScheduleGenericRetry(path, pending);
+        }
+        finally
+        {
+            _confirming.TryRemove(path, out _);
+            _confirmationSlots.Release();
+        }
+    }
+
+    private bool CanConfirmWriteback(string path)
+    {
+        if (!File.Exists(path) && !Directory.Exists(path)) return false;
+        if (Callbacks.IsWriteMutationPending(path)) return false;
+
+        var attributes = File.GetAttributes(path);
+        if (IsTemporary(path, attributes)) return false;
+        var owned = ProviderIdentity.TryReadPlaceholderIdentity(path, out var identity);
+        if ((attributes & FileAttributes.ReparsePoint) != 0 && !owned) return false;
+
+        var directory = (attributes & FileAttributes.Directory) != 0;
+        if (owned && (directory || identity.IsVirtual)) return false;
+        if (owned)
+        {
+            if (!PlaceholderUpdater.TryGetPlaceholderDataState(path, out var state)
+                || state.InSyncState == CF_IN_SYNC_STATE.CF_IN_SYNC_STATE_IN_SYNC)
+                return false;
+            if (!Callbacks.IsHydrationQuiet(identity.FileId, 2_000))
+                throw new FileBusyException("文件仍在水化，稍后重新确认。");
+        }
+        return true;
+    }
+
+    private async Task RunUploadWorkerAsync()
+    {
+        try
+        {
+            await foreach (var ready in _readyQueue.Reader.ReadAllAsync(_stop.Token).ConfigureAwait(false))
+            {
+                try
+                {
+                    await ProcessAsync(ready.Path).ConfigureAwait(false);
+                    _lastFailure.TryRemove(ready.Path, out _);
+                }
+                catch (OperationCanceledException) when (_stop.IsCancellationRequested) { throw; }
+                catch (FileNotFoundException) { _lastFailure.TryRemove(ready.Path, out _); }
+                catch (DirectoryNotFoundException) { _lastFailure.TryRemove(ready.Path, out _); }
+                catch (FileBusyException error)
+                {
+                    ScheduleBusyRetry(ready.Path, ready.Pending, error.Message);
+                }
+                catch (Exception error)
+                {
+                    LogWritebackFailure(ready.Path, error);
+                    ScheduleGenericRetry(ready.Path, ready.Pending);
+                }
+                finally
+                {
+                    _readyPaths.TryRemove(ready.Path, out _);
+                }
+            }
+        }
+        catch (OperationCanceledException) when (_stop.IsCancellationRequested) { }
+    }
+
+    private void ScheduleBusyRetry(string path, PendingChange failed, string reason)
+    {
+        var now = Environment.TickCount64;
+        var firstEvent = failed.FirstEventTick;
+        var nextRetry = Math.Min(failed.BusyRetries, BusyRetryDelaysMilliseconds.Length - 1);
+        var due = now + BusyRetryDelaysMilliseconds[nextRetry];
+        var retry = failed with
+        {
+            FirstEventTick = firstEvent,
+            LastEventTick = now,
+            DueTick = due,
+            BusyRetries = Math.Min(failed.BusyRetries + 1, BusyRetryDelaysMilliseconds.Length)
+        };
+
+        if (now - firstEvent >= MaximumConfirmationWaitMilliseconds)
+        {
+            _needsReconciliation.TryAdd(path, 0);
+            _log?.Invoke($"[WRITE] 独占确认等待超过 60 秒，移交全量扫描 path={path}");
+            RequestFullScan();
+            return;
+        }
+
+        _pending.AddOrUpdate(path, retry, (_, current) =>
+        {
+            if (current.LastEventTick <= failed.LastEventTick) return retry;
+            return current with
+            {
+                FirstEventTick = Math.Min(current.FirstEventTick, failed.FirstEventTick),
+                DueTick = Math.Max(current.DueTick, due),
+                BusyRetries = Math.Max(current.BusyRetries, retry.BusyRetries)
+            };
+        });
+
+        if (!_lastFailure.TryGetValue(path, out var previous) || previous != reason)
+            _log?.Invoke($"[WRITE] 文件仍被占用，按退避间隔重新确认 path={path} retry={retry.BusyRetries}");
+        _lastFailure[path] = reason;
+    }
+
+    private void ScheduleGenericRetry(string path, PendingChange failed)
+    {
+        var now = Environment.TickCount64;
+        var retry = new PendingChange(now, now, now + 30_000, 0);
+        _pending.AddOrUpdate(path, retry,
+            (_, current) => current.LastEventTick <= failed.LastEventTick ? retry : current);
+    }
+
+    private void LogWritebackFailure(string path, Exception error)
+    {
+        // Do not log HttpRequestException.Message: upload URLs contain tokens.
+        var reason = error is HttpRequestException ? "HTTP 请求失败"
+            : error is IOException or UnauthorizedAccessException ? error.Message
+            : error.GetType().Name;
+        if (!_lastFailure.TryGetValue(path, out var previous) || previous != reason)
+            _log?.Invoke($"[WRITE] 保留本地内容，写回未完成 path={path} reason={reason}");
+        _lastFailure[path] = reason;
+    }
+
+    private static FileStream OpenExclusiveRead(string path)
+    {
+        try
+        {
+            return new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.None,
+                128 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan);
+        }
+        catch (FileNotFoundException) { throw; }
+        catch (DirectoryNotFoundException) { throw; }
+        catch (IOException error) { throw new FileBusyException("文件仍被其他进程占用。", error); }
+        catch (UnauthorizedAccessException error) { throw new FileBusyException("文件当前不可独占打开。", error); }
+    }
+
+    private static FileStream OpenUploadRead(string path)
+    {
+        try
+        {
+            return new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read,
+                128 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan);
+        }
+        catch (FileNotFoundException) { throw; }
+        catch (DirectoryNotFoundException) { throw; }
+        catch (IOException error) { throw new FileBusyException("文件在确认后又被占用。", error); }
+        catch (UnauthorizedAccessException error) { throw new FileBusyException("文件当前不可读取。", error); }
+    }
+
+    private static bool IsTemporaryPath(string path) =>
+        Path.GetFileName(path).StartsWith("~$", StringComparison.Ordinal)
+        || Path.GetExtension(path).Equals(".tmp", StringComparison.OrdinalIgnoreCase);
+
     private static bool IsTemporary(string path, FileAttributes attributes) =>
-        (attributes & FileAttributes.Temporary) != 0 || Path.GetFileName(path).StartsWith("~$", StringComparison.Ordinal);
+        (attributes & FileAttributes.Temporary) != 0 || IsTemporaryPath(path);
 
     private void ValidateScope(string path)
     {
@@ -154,8 +527,9 @@ internal sealed class CloudFileWriteback : IDisposable
         }
         // A hydration close is never an upload request. Dirty partially hydrated content must
         // first finish hydration; reading it here could otherwise recursively enter FETCH_DATA.
-        if (owned && !Callbacks.IsHydrationQuiet(identity.FileId, 2000))
-            throw new IOException("文件仍在水化，稍后重试写回。");
+        if (owned && !Callbacks.IsHydrationQuiet(identity.FileId, 2_000))
+            throw new FileBusyException("文件仍在水化，稍后重试写回。");
+
         var parentPath = Path.GetDirectoryName(path)!;
         var parent = _cache.TryGetFolderByLocalPath(parentPath);
         if (parent is null && parentPath.Length > _root.Length)
@@ -214,10 +588,10 @@ internal sealed class CloudFileWriteback : IDisposable
             return;
         }
 
-        // Holding this handle denies new writers and deletion for the entire hash/upload/bind
-        // transaction. A file still open for writing fails here and is retried after it closes.
-        await using var file = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read,
-            128 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan);
+        // Exclusive-open confirmation has already succeeded. Re-open with the provider's existing
+        // read-sharing mode for hashing/upload; it blocks new writers while remaining compatible
+        // with the later CFAPI placeholder conversion.
+        await using var file = OpenUploadRead(path);
         using var uploadProgress = new UploadProgressReporter(path, file.Length, _log, _stop.Token);
         var modified = File.GetLastWriteTimeUtc(path);
         var hash = await SHA256.HashDataAsync(file, _stop.Token).ConfigureAwait(false);
@@ -298,9 +672,39 @@ internal sealed class CloudFileWriteback : IDisposable
 
     public void Dispose()
     {
+        _watcher.EnableRaisingEvents = false;
         _watcher.Dispose();
         _stop.Cancel();
-        try { _worker.GetAwaiter().GetResult(); }
-        finally { _stop.Dispose(); }
+        _scanSignal.Set();
+        _readyQueue.Writer.TryComplete();
+
+        try { _scheduler.GetAwaiter().GetResult(); }
+        catch (OperationCanceledException) { }
+        try { _uploadWorker.GetAwaiter().GetResult(); }
+        catch (OperationCanceledException) { }
+        _scanThread.Join();
+
+        while (_confirmationTasks.Count > 0)
+        {
+            var tasks = _confirmationTasks.Values.ToArray();
+            if (tasks.Length == 0) break;
+            try { Task.WhenAll(tasks).GetAwaiter().GetResult(); }
+            catch (OperationCanceledException) { }
+        }
+
+        _confirmationSlots.Dispose();
+        _scanSignal.Dispose();
+        _stop.Dispose();
+    }
+
+    private readonly record struct PendingChange(
+        long FirstEventTick, long LastEventTick, long DueTick, int BusyRetries);
+
+    private readonly record struct ConfirmedPath(string Path, PendingChange Pending);
+
+    private sealed class FileBusyException : IOException
+    {
+        public FileBusyException(string message) : base(message) { }
+        public FileBusyException(string message, Exception innerException) : base(message, innerException) { }
     }
 }
