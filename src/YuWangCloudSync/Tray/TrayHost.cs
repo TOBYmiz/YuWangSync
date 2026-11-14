@@ -22,6 +22,7 @@ internal static class TrayHost
     private static TrayIcon? _tray;
     private static PopupMenu? _trayContextMenu;
     private static PopupMenuItem? _aboutMenuItem;
+    private static PopupMenuItem? _refreshFilesMenuItem;
     private static IntPtr _trayIconHandle;
     private static IntPtr _trayUpdateIconHandle;
     private static IntPtr _activeTrayIconHandle;
@@ -241,7 +242,9 @@ internal static class TrayHost
     private static void BuildTrayIcon()
     {
         var menu = new PopupMenu();
-        menu.Items.Add(new PopupMenuItem("打开同步文件夹", (_, _) => OpenSyncFolder()));
+        menu.Items.Add(new PopupMenuItem("打开同步目录", (_, _) => OpenSyncDirectory()));
+        _refreshFilesMenuItem = new PopupMenuItem("立即刷新文件", (_, _) => RefreshFilesNow());
+        menu.Items.Add(_refreshFilesMenuItem);
         menu.Items.Add(new PopupMenuItem("打开日志目录", (_, _) => OpenLogFolder()));
         menu.Items.Add(new PopupMenuItem("清理已缓存文件", (_, _) => _ = ConfirmAndDehydrateCacheAsync()));
         menu.Items.Add(new PopupMenuItem("设置", (_, _) => OnSettingsMenuSelected()));
@@ -498,13 +501,30 @@ internal static class TrayHost
         }
     }
 
-    private static void OpenSyncFolder()
+    private static void OpenSyncDirectory()
     {
         try
         {
             Process.Start(new ProcessStartInfo("explorer.exe", $"\"{Program.SyncRootPath}\"") { UseShellExecute = true });
         }
-        catch (Exception ex) { Log.Warning(ex, "打开同步文件夹失败"); }
+        catch (Exception ex) { Log.Warning(ex, "打开同步目录失败"); }
+    }
+
+    private static void RefreshFilesNow()
+    {
+        if (!Program.QueueManualFileRefreshFromUi())
+            Log.Debug("立即刷新文件请求未排队：已有刷新任务，或同步服务尚未就绪/正在退出");
+    }
+
+    internal static void SetManualFileRefreshInProgress(bool inProgress)
+    {
+        if (!WinUiUiHost.Post(() =>
+            {
+                if (_refreshFilesMenuItem is null) return;
+                _refreshFilesMenuItem.Text = inProgress ? "文件刷新中" : "立即刷新文件";
+                _refreshFilesMenuItem.Enabled = !inProgress;
+            }))
+            Log.Debug("无法更新托盘文件刷新菜单项：WinUI UI 线程不可用");
     }
 
     private static void OpenLogFolder()

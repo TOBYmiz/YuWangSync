@@ -142,9 +142,9 @@ public static class PlaceholderUpdater
 
     /// <summary>
     /// 重开目录的按需填充（与 TryDisableOnDemandPopulation 对称，flag 取反）。
-    /// 用途：填充后关闭按需的目录，用户重新进入/刷新时若缓存过期，在此重开 →
+    /// 用途：填充后关闭按需的目录，在自动刷新周期到期时重开；
     ///   cfapi 下次列举触发 FETCH_PLACEHOLDERS → OnFetchPlaceholders 刷新（HTTP 重新拉取）
-    ///   → 填充完成回执直接关闭按需。闭环实现"关闭按需下仍可刷新"。
+    ///   → 填充完成回执直接关闭按需，避免每次重新开启后立刻再次刷新。
     /// </summary>
     public static bool TryEnableOnDemandPopulation(string dirPath, Action<string>? log = null)
     {

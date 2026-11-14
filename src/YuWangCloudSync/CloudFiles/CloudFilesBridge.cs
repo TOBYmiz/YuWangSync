@@ -441,7 +441,7 @@ public static class Callbacks
     {
         StopDirectoryRefresh();
         if (Cache is { } cache)
-            _directoryRefresh = new DirectoryPopulationRefresh(cache, SyncRootPath, Log);
+            _directoryRefresh = new DirectoryPopulationRefresh(cache, SyncRootPath, () => FolderCache, Log);
     }
 
     public static void StopDirectoryRefresh()
@@ -1439,6 +1439,9 @@ public static class Callbacks
 
         if (!hr.Failed && completionStatus == NTStatus.STATUS_SUCCESS)
         {
+            // Re-enabling population immediately after each enumeration makes an open
+            // Explorer folder enumerate again, creating a one-second refresh loop.
+            // Keep the initial startup arm short, then honor the configured refresh cadence.
             _directoryRefresh?.Schedule(identity, populatedDir);
             var nodeKey = new NodeKey(identity);
             var firstTime = PopulatedFolders.TryAdd(nodeKey, (int)totalCount);

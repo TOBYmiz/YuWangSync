@@ -31,7 +31,9 @@ internal static class Program
     private static CF_CALLBACK_REGISTRATION[]? _callbackTable;
     private static CloudFilePinStateWatcher? _pinStateWatcher;
     private static FileCacheCleanupService? _fileCacheCleanup;
+    private static readonly SemaphoreSlim _preFetchGate = new(1, 1);
     private static readonly CancellationTokenSource _cts = new();
+    private static int _manualRefreshQueued;
     internal static CancellationToken ApplicationCancellationToken => _cts.Token;
 
     // ============== 控制台控制事件（关闭窗口 / 停止进程 / 注销 / 关机）==============
@@ -1763,8 +1765,47 @@ internal static class Program
         Log.Information("根目录（磁盘树）占位对账完成：{Count} 个顶层容器", topNodes.Count);
     }
 
+    /// <summary>从托盘排队一次强制全盘目录刷新；重复点击会合并。</summary>
+    internal static bool QueueManualFileRefreshFromUi()
+    {
+        if (_cts.IsCancellationRequested || _cache is null || _client is null)
+            return false;
+        if (Interlocked.Exchange(ref _manualRefreshQueued, 1) != 0)
+            return false;
+
+        try
+        {
+            TrayHost.SetManualFileRefreshInProgress(true);
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    Log.Information("[PREFETCH] 收到托盘请求：立即刷新全部文件列表");
+                    await PreFetchAllDisksAsync(_cts.Token, forceRefresh: true);
+                }
+                catch (Exception error)
+                {
+                    Log.Error(error, "[PREFETCH] 托盘立即刷新失败");
+                }
+                finally
+                {
+                    Volatile.Write(ref _manualRefreshQueued, 0);
+                    TrayHost.SetManualFileRefreshInProgress(false);
+                }
+            });
+            return true;
+        }
+        catch (Exception error)
+        {
+            Volatile.Write(ref _manualRefreshQueued, 0);
+            TrayHost.SetManualFileRefreshInProgress(false);
+            Log.Error(error, "[PREFETCH] 无法排队托盘文件刷新");
+            return false;
+        }
+    }
+
     /// <summary>
-    /// 后台预拉取全部磁盘的目录结构入库（开机启动场景）。
+    /// 后台预拉取全部磁盘的目录结构入库；启动时复用新鲜缓存，托盘手动刷新会强制查询云端。
     /// 递归 ListFolder 每个磁盘的每个目录，入库 folders（含 local_path）+ files。
     /// 完成后触发 ReconcileDirectoryTimes（此时 files/folders 有数据，对账有效）。
     ///
@@ -1773,14 +1814,17 @@ internal static class Program
     ///   预拉取让启动对账立即有全盘数据，开机后所有目录时间一次到位。
     ///
     /// **不阻塞主循环**：后台 Task 跑，用户可立即用 Explorer 浏览（回调照常工作）。
-    ///   预拉取与回调可能请求同一目录：IsFolderCached 去重（预拉取前 + 回调前都检查）避免重复 HTTP。
+    ///   启动预拉取与回调可能请求同一目录：IsFolderCached 去重；托盘强制刷新绕过缓存，且与其他预拉取串行。
     /// **限流**：每目录间 100ms，避免服务器封禁（育网云限速 ~3.5MB/s，ListFolder 响应 30~80KB）。
     /// **容错**：单目录失败 log + 继续；整体异常也兜底调一次对账。
     /// </summary>
-    private static async Task PreFetchAllDisksAsync(CancellationToken ct)
+    private static async Task PreFetchAllDisksAsync(CancellationToken ct, bool forceRefresh = false)
     {
+        var gateAcquired = false;
         try
         {
+            await _preFetchGate.WaitAsync(ct);
+            gateAcquired = true;
             var sw = System.Diagnostics.Stopwatch.StartNew();
             // Materialize every virtual ancestor and the known cached directory tree before
             // issuing HTTP. A SQLite local_path does not imply that its parent exists on disk.
@@ -1793,7 +1837,9 @@ internal static class Program
                 ReconcileDirectoryTimes();
                 return;
             }
-            Log.Information("[PREFETCH] 开始预拉取 {N} 个磁盘的目录结构（后台填充，不阻塞浏览）", diskPaths.Count);
+            Log.Information(forceRefresh
+                ? "[PREFETCH] 开始立即刷新 {N} 个磁盘的目录结构"
+                : "[PREFETCH] 开始预拉取 {N} 个磁盘的目录结构（后台填充，不阻塞浏览）", diskPaths.Count);
 
             var totalFolders = 0;
             var totalFiles = 0;
@@ -1813,7 +1859,7 @@ internal static class Program
                         directoryTree.EnsureDirectory(diskId, folderId, localPath, ct);
                         // A valid HTTP cache can still have missing local placeholders after
                         // restart or a directory deletion. Repair locally even on a cache hit.
-                        if (_cache!.IsFolderCached(diskId, folderId, CloudFiles.Callbacks.FolderCache))
+                        if (!forceRefresh && _cache!.IsFolderCached(diskId, folderId, CloudFiles.Callbacks.FolderCache))
                         {
                             skipped++;
                             var cached = _cache.ListCachedItems(diskId, folderId);
@@ -1877,11 +1923,18 @@ internal static class Program
                 totalFolders, totalFiles, skipped, failed, sw.Elapsed.TotalSeconds);
             ReconcileDirectoryTimes();  // 预拉取完成后对账（此时 files/folders 有数据）
         }
-        catch (OperationCanceledException) { /* 退出时正常，不调对账 */ }
+        catch (OperationCanceledException)
+        {
+            // 退出时正常，不调对账。
+        }
         catch (Exception ex)
         {
             Log.Warning(ex, "[PREFETCH] 预拉取异常（不影响运行，浏览期 self Force 仍工作）；尝试用已有数据对账");
             try { ReconcileDirectoryTimes(); } catch { /* 对账失败不影响运行 */ }
+        }
+        finally
+        {
+            if (gateAcquired) _preFetchGate.Release();
         }
     }
 
@@ -2050,7 +2103,7 @@ internal static class Program
     /// <summary>供托盘菜单"退出"项调用：引到与 Ctrl+C 完全一致的优雅退出链。</summary>
     internal static void RequestShutdownFromUi() => RequestShutdown(CtrlType.CTRL_C_EVENT);
 
-    /// <summary>供托盘菜单"打开同步文件夹"读取同步根目录路径。</summary>
+    /// <summary>供托盘菜单"打开同步目录"读取同步根目录路径。</summary>
     internal static string SyncRootPath => _ctx.SyncRootPath;
 
     /// <summary>
