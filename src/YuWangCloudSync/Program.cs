@@ -1775,13 +1775,14 @@ internal static class Program
 
         try
         {
-            TrayHost.SetManualFileRefreshInProgress(true);
+            TrayHost.SetManualFileRefreshProgress(0);
             _ = Task.Run(async () =>
             {
                 try
                 {
                     Log.Information("[PREFETCH] 收到托盘请求：立即刷新全部文件列表");
-                    await PreFetchAllDisksAsync(_cts.Token, forceRefresh: true);
+                    await PreFetchAllDisksAsync(_cts.Token, forceRefresh: true,
+                        TrayHost.SetManualFileRefreshProgress).ConfigureAwait(false);
                 }
                 catch (Exception error)
                 {
@@ -1790,7 +1791,7 @@ internal static class Program
                 finally
                 {
                     Volatile.Write(ref _manualRefreshQueued, 0);
-                    TrayHost.SetManualFileRefreshInProgress(false);
+                    TrayHost.SetManualFileRefreshProgress(null);
                 }
             });
             return true;
@@ -1798,7 +1799,7 @@ internal static class Program
         catch (Exception error)
         {
             Volatile.Write(ref _manualRefreshQueued, 0);
-            TrayHost.SetManualFileRefreshInProgress(false);
+            TrayHost.SetManualFileRefreshProgress(null);
             Log.Error(error, "[PREFETCH] 无法排队托盘文件刷新");
             return false;
         }
@@ -1818,17 +1819,19 @@ internal static class Program
     /// **限流**：每目录间 100ms，避免服务器封禁（育网云限速 ~3.5MB/s，ListFolder 响应 30~80KB）。
     /// **容错**：单目录失败 log + 继续；整体异常也兜底调一次对账。
     /// </summary>
-    private static async Task PreFetchAllDisksAsync(CancellationToken ct, bool forceRefresh = false)
+    private static async Task PreFetchAllDisksAsync(CancellationToken ct, bool forceRefresh = false,
+        Action<int?>? reportProgress = null)
     {
         var gateAcquired = false;
         try
         {
-            await _preFetchGate.WaitAsync(ct);
+            await _preFetchGate.WaitAsync(ct).ConfigureAwait(false);
             gateAcquired = true;
             var sw = System.Diagnostics.Stopwatch.StartNew();
+            var cache = _cache ?? throw new InvalidOperationException("同步缓存尚未初始化。");
             // Materialize every virtual ancestor and the known cached directory tree before
             // issuing HTTP. A SQLite local_path does not imply that its parent exists on disk.
-            var directoryTree = new PlaceholderDirectoryTree(_ctx.SyncRootPath, _cache!, CurrentUserKey(),
+            var directoryTree = new PlaceholderDirectoryTree(_ctx.SyncRootPath, cache, CurrentUserKey(),
                 _ctx.RootContainerTypeId, message => Log.Information("{Msg}", message));
             var diskPaths = directoryTree.PrepareCachedTree(ct);
             if (diskPaths.Count == 0)
@@ -1837,12 +1840,29 @@ internal static class Program
                 ReconcileDirectoryTimes();
                 return;
             }
+
+            var totalFolders = diskPaths.Count;
+            var totalFiles = 0L;
+            long completedFolders = 0;
+            long completedFiles = 0;
+            var lastReportedProgress = -1;
+
+            void ReportProgress()
+            {
+                var totalItems = totalFolders + totalFiles;
+                var completedItems = completedFolders + completedFiles;
+                var percentage = totalItems <= 0
+                    ? 0
+                    : (int)Math.Clamp(completedItems * 100 / totalItems, 0, 99);
+                if (percentage <= lastReportedProgress) return;
+                lastReportedProgress = percentage;
+                reportProgress?.Invoke(percentage);
+            }
+
             Log.Information(forceRefresh
                 ? "[PREFETCH] 开始立即刷新 {N} 个磁盘的目录结构"
                 : "[PREFETCH] 开始预拉取 {N} 个磁盘的目录结构（后台填充，不阻塞浏览）", diskPaths.Count);
 
-            var totalFolders = 0;
-            var totalFiles = 0;
             var skipped = 0;
             var failed = 0;
             foreach (var (diskId, diskLocalPath) in diskPaths)
@@ -1850,6 +1870,7 @@ internal static class Program
                 if (ct.IsCancellationRequested) break;
                 // BFS 从磁盘根 folderId=0 开始
                 var queue = new Queue<(ulong folderId, ulong parentId, string localPath)>();
+                var visitedFolders = new HashSet<ulong> { 0 };
                 queue.Enqueue((0, 0, diskLocalPath));
                 while (queue.Count > 0 && !ct.IsCancellationRequested)
                 {
@@ -1859,33 +1880,61 @@ internal static class Program
                         directoryTree.EnsureDirectory(diskId, folderId, localPath, ct);
                         // A valid HTTP cache can still have missing local placeholders after
                         // restart or a directory deletion. Repair locally even on a cache hit.
-                        if (!forceRefresh && _cache!.IsFolderCached(diskId, folderId, CloudFiles.Callbacks.FolderCache))
+                        if (!forceRefresh && cache.IsFolderCached(diskId, folderId, CloudFiles.Callbacks.FolderCache))
                         {
                             skipped++;
-                            var cached = _cache.ListCachedItems(diskId, folderId);
-                            directoryTree.PopulateDirectory(diskId, folderId, localPath, cached, ct);
-                            foreach (var sub in cached.Where(i => i.isFolder))
+                            var cached = cache.ListCachedItems(diskId, folderId);
+                            var cachedFiles = cached.LongCount(item => !item.isFolder);
+                            totalFiles += cachedFiles;
+                            completedFiles += cachedFiles;
+                            var safeChildFolderIds = new HashSet<ulong>();
+                            var safeCachedItems = cached.Where(item =>
                             {
+                                if (!item.isFolder) return true;
+                                if (visitedFolders.Contains(item.id) || !safeChildFolderIds.Add(item.id))
+                                {
+                                    Log.Warning("[PREFETCH] 跳过重复或循环目录 disk={Disk} folder={Folder} parent={Parent}",
+                                        diskId, item.id, folderId);
+                                    return false;
+                                }
+                                return true;
+                            }).ToList();
+                            directoryTree.PopulateDirectory(diskId, folderId, localPath, safeCachedItems, ct);
+                            foreach (var sub in safeCachedItems.Where(i => i.isFolder))
+                            {
+                                visitedFolders.Add(sub.id);
                                 var path = Path.Combine(localPath, sub.name);
-                                _cache.SaveSubFolder(diskId, sub.id, folderId, sub.name, path);
+                                cache.SaveSubFolder(diskId, sub.id, folderId, sub.name, path);
+                                totalFolders++;
                                 queue.Enqueue((sub.id, folderId, path));
                             }
                             continue;
                         }
-                        var listing = await _client!.ListFolderWithPermissionsAsync(diskId, folderId);
+                        var listing = await _client!.ListFolderWithPermissionsAsync(diskId, folderId)
+                            .ConfigureAwait(false);
                         if (!listing.IsValidPage) throw new InvalidDataException("服务器没有返回请求的目录页面。");
                         var items = listing.Items.ToList();
-                        _cache.SaveDirectoryPermission(CurrentUserKey(), diskId, folderId, listing.Permission);
-                        _cache.SaveFolder(diskId, folderId, parentId,
+                        EnsureUniqueChildFolders(items.Where(item => item.IsFolder).Select(item => item.Id),
+                            visitedFolders, diskId, folderId);
+                        var listedFiles = items.LongCount(item => !item.IsFolder);
+                        totalFiles += listedFiles;
+                        completedFiles += listedFiles;
+                        cache.SaveDirectoryPermission(CurrentUserKey(), diskId, folderId, listing.Permission);
+                        cache.SaveFolder(diskId, folderId, parentId,
                             Path.GetFileName(localPath.TrimEnd('\\')), localPath, items);
                         Callbacks.ReconcileDirectorySnapshot(diskId, folderId, localPath, items);
-                        totalFolders++;
-                        totalFiles += items.Count(i => !i.IsFolder);
                         // 子文件夹：SaveSubFolder（含 local_path，供下次对账反查）+ 入队继续递归
                         foreach (var sub in items.Where(i => i.IsFolder))
                         {
+                            if (!visitedFolders.Add(sub.Id))
+                            {
+                                Log.Warning("[PREFETCH] 跳过重复或循环目录 disk={Disk} folder={Folder} parent={Parent}",
+                                    diskId, sub.Id, folderId);
+                                continue;
+                            }
                             var subPath = Path.Combine(localPath, sub.Name);
-                            _cache.SaveSubFolder(diskId, sub.Id, folderId, sub.Name, subPath);
+                            cache.SaveSubFolder(diskId, sub.Id, folderId, sub.Name, subPath);
+                            totalFolders++;
                             queue.Enqueue((sub.Id, folderId, subPath));
                         }
                         // 清内存/CFAPI 快照后立即把新增项落成真实占位。仅清缓存不够：
@@ -1893,7 +1942,7 @@ internal static class Program
                         Callbacks.InvalidateFolderListing(diskId, folderId);
                         try
                         {
-                            var cachedItems = _cache.ListCachedItems(diskId, folderId);
+                            var cachedItems = cache.ListCachedItems(diskId, folderId);
                             var created = directoryTree.PopulateDirectory(diskId, folderId, localPath, cachedItems, ct);
                             if (created > 0)
                             {
@@ -1916,12 +1965,18 @@ internal static class Program
                         failed++;
                         Log.Warning("[PREFETCH] 拉取失败 disk={Disk} folder={Folder}: {Msg}", diskId, folderId, ex.Message);
                     }
-                    await Task.Delay(100, ct);  // 限流：每目录 100ms 间隔
+                    finally
+                    {
+                        completedFolders++;
+                        ReportProgress();
+                    }
+                    await Task.Delay(100, ct).ConfigureAwait(false);  // 限流：每目录 100ms 间隔
                 }
             }
             Log.Information("[PREFETCH] 完成：{F} 目录 / {Fl} 文件 / 跳过{S} / 失败{Fa}，用时{T:F1}s → 触发目录时间对账",
                 totalFolders, totalFiles, skipped, failed, sw.Elapsed.TotalSeconds);
             ReconcileDirectoryTimes();  // 预拉取完成后对账（此时 files/folders 有数据）
+            reportProgress?.Invoke(100);
         }
         catch (OperationCanceledException)
         {
@@ -1935,6 +1990,18 @@ internal static class Program
         finally
         {
             if (gateAcquired) _preFetchGate.Release();
+        }
+    }
+
+    private static void EnsureUniqueChildFolders(IEnumerable<ulong> childFolderIds,
+        HashSet<ulong> visitedFolders, ulong diskId, ulong parentFolderId)
+    {
+        var currentListingFolders = new HashSet<ulong>();
+        foreach (var childFolderId in childFolderIds)
+        {
+            if (visitedFolders.Contains(childFolderId) || !currentListingFolders.Add(childFolderId))
+                throw new InvalidDataException(
+                    $"目录树中出现重复或循环目录 disk={diskId} folder={childFolderId} parent={parentFolderId}。");
         }
     }
 

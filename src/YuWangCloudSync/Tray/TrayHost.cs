@@ -516,15 +516,20 @@ internal static class TrayHost
             Log.Debug("立即刷新文件请求未排队：已有刷新任务，或同步服务尚未就绪/正在退出");
     }
 
-    internal static void SetManualFileRefreshInProgress(bool inProgress)
+    internal static void SetManualFileRefreshProgress(int? percentage)
     {
+        if (percentage is { } value)
+            percentage = Math.Clamp(value, 0, 100);
+
         if (!WinUiUiHost.Post(() =>
             {
                 if (_refreshFilesMenuItem is null) return;
-                _refreshFilesMenuItem.Text = inProgress ? "文件刷新中" : "立即刷新文件";
-                _refreshFilesMenuItem.Enabled = !inProgress;
+                _refreshFilesMenuItem.Text = percentage is { } value
+                    ? $"文件刷新中 - {value}%"
+                    : "立即刷新文件";
+                _refreshFilesMenuItem.Enabled = percentage is null;
             }))
-            Log.Debug("无法更新托盘文件刷新菜单项：WinUI UI 线程不可用");
+            Log.Debug("无法更新托盘文件刷新进度：WinUI UI 线程不可用");
     }
 
     private static void OpenLogFolder()
