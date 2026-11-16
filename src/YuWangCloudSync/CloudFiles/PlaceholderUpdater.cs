@@ -303,12 +303,14 @@ public static class PlaceholderUpdater
         }
     }
 
-    /// <summary>
-    /// 把目录占位的修改时间改为 fileTimeUtc。
-    /// 走 CfUpdatePlaceholder 官方路径：BasicInfo 非零字段更新、FileSize=0 表示不动（目录无大小语义）。
-    /// 供 File.SetLastWriteTimeUtc 被 cldflt 拦截时的兜底（占位目录时间修正）。
-    /// </summary>
+    public static bool TryUpdateFileLastWriteTime(string localPath, long fileTimeUtc, Action<string>? log = null)
+        => TryUpdateLastWriteTime(localPath, fileTimeUtc, "[TIME]", log);
+
+    /// <summary>目录时间修正的 CfUpdatePlaceholder 兜底路径。</summary>
     public static bool TryUpdateDirTimes(string localPath, long fileTimeUtc, Action<string>? log = null)
+        => TryUpdateLastWriteTime(localPath, fileTimeUtc, "[DIRTIME]", log);
+
+    private static bool TryUpdateLastWriteTime(string localPath, long fileTimeUtc, string tag, Action<string>? log)
     {
         if (string.IsNullOrEmpty(localPath)) return false;
 
@@ -319,7 +321,7 @@ public static class PlaceholderUpdater
 
         if (h == IntPtr.Zero || h == new IntPtr(-1))
         {
-            log?.Invoke($"[DIRTIME] 打开目录失败: {localPath} Win32={Marshal.GetLastWin32Error()}");
+            log?.Invoke($"{tag} 打开占位失败: {localPath} Win32={Marshal.GetLastWin32Error()}");
             return false;
         }
 
@@ -343,14 +345,14 @@ public static class PlaceholderUpdater
                 null, 0, CF_UPDATE_FLAGS.CF_UPDATE_FLAG_MARK_IN_SYNC, ref usn, IntPtr.Zero);
             if (hr.Failed)
             {
-                log?.Invoke($"[DIRTIME] CfUpdatePlaceholder 失败: {hr} path={localPath}");
+                log?.Invoke($"{tag} CfUpdatePlaceholder 失败: {hr} path={localPath}");
                 return false;
             }
             return true;
         }
         catch (Exception ex)
         {
-            log?.Invoke($"[DIRTIME] CfUpdatePlaceholder 异常: {ex.Message} path={localPath}");
+            log?.Invoke($"{tag} CfUpdatePlaceholder 异常: {ex.Message} path={localPath}");
             return false;
         }
         finally

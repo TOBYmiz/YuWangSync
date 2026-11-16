@@ -153,6 +153,16 @@ public static class PlaceholderCreator
     /// </summary>
     private static readonly DateTime UnknownFolderTime = new(1601, 1, 1, 0, 0, 0, DateTimeKind.Unspecified);
 
+    /// <summary>把服务器提供的 GMT+8 本地时刻转换为 UTC FILETIME。</summary>
+    public static long UploadTimeToFileTimeUtc(DateTime uploadTime)
+    {
+        if (uploadTime == UnknownFolderTime) return 0;
+        var utc = uploadTime.Kind == DateTimeKind.Unspecified
+            ? new DateTimeOffset(uploadTime, TimeSpan.FromHours(8)).UtcDateTime
+            : uploadTime;
+        return utc.ToFileTimeUtc();
+    }
+
     /// <summary>
     /// 构造 CF_PLACEHOLDER_CREATE_INFO 数组 + 待释放的 identity buffer 列表。
     /// 不调用 CfCreatePlaceholders，调用方负责：
@@ -192,7 +202,7 @@ public static class PlaceholderCreator
                 stamp = siblingMaxKnown ? siblingMax : UnknownFolderTime;
             else
                 stamp = DateTime.UtcNow;
-            var timestamp = ToFileTime(stamp.ToFileTimeUtc());
+            var timestamp = ToFileTime(UploadTimeToFileTimeUtc(stamp));
 
             // MARK_IN_SYNC：占位元数据取自云端目录响应，创建时与云端状态一致
             //   → Explorer 显示正常图标（不是"正在同步"），并减少 cfapi 的重复状态查询
@@ -346,7 +356,7 @@ public static class PlaceholderCreator
 
         var placeholders = new CF_PLACEHOLDER_CREATE_INFO[nodes.Count];
         // 虚拟节点（容器/磁盘）无服务器时间：低位哨兵，待列举磁盘根/启动对账时上浮到真实推导值
-        var timestamp = ToFileTime(UnknownFolderTime.ToFileTimeUtc());
+        var timestamp = ToFileTime(UploadTimeToFileTimeUtc(UnknownFolderTime));
         var flags = CF_PLACEHOLDER_CREATE_FLAGS.CF_PLACEHOLDER_CREATE_FLAG_MARK_IN_SYNC;
 
         for (var index = 0; index < nodes.Count; index++)
@@ -1364,6 +1374,7 @@ public static class Callbacks
                             readOnly: permission != DirectoryPermission.FullAccess);
                         return (phs, ids);
                     });
+                    ReconcileExistingPlaceholderTimes(localDir, items);
                     if (built && DiagAllowed(nodeKey))
                         Log?.Invoke($"[DEBUG] 占位已准备 folder={nodeKey} count={count}");
                 }
@@ -1392,7 +1403,7 @@ public static class Callbacks
             }
             if (derivedTime is { } dt)
             {
-                var ft = dt.ToFileTimeUtc();   // 与 PlaceholderCreator.Build 相同的时间语义（本地时刻 → FILETIME）
+                var ft = PlaceholderCreator.UploadTimeToFileTimeUtc(dt);
                 // self + 祖先链均用 raise-only（force=false）：
                 // 浏览期 derivedTime 是"直接子文件最大上传时间"（≤ 对账用的"全后代最大"），
                 // 用 raise-only 只增不减——若对账已设更大的全后代最大值，浏览不覆盖（current≥target 跳过）；
@@ -1790,6 +1801,34 @@ public static class Callbacks
             catch (Exception ex)
             {
                 Log?.Invoke($"[SIZE] 列举前校准占位大小失败 file={item.id}: {ex.Message}");
+            }
+        }
+    }
+
+    private static void ReconcileExistingPlaceholderTimes(string localDir,
+        List<(ulong id, string name, bool isFolder, long? size, DateTime? uploadTime)> items)
+    {
+        foreach (var item in items)
+        {
+            if (item.isFolder || item.uploadTime is not { } uploadTime) continue;
+            var path = Path.Combine(localDir, item.name);
+            try
+            {
+                if (!File.Exists(path) || !ProviderIdentity.OwnsPlaceholder(path)
+                    || !Callbacks.IsHydrationQuiet(item.id, quietMs: 200))
+                    continue;
+                if (!PlaceholderUpdater.TryGetPlaceholderDataState(path, out var state)
+                    || state.OnDiskDataSize != 0 || state.InSyncState != CF_IN_SYNC_STATE.CF_IN_SYNC_STATE_IN_SYNC)
+                    continue;
+
+                var fileTimeUtc = PlaceholderCreator.UploadTimeToFileTimeUtc(uploadTime);
+                if (File.GetLastWriteTimeUtc(path).ToFileTimeUtc() == fileTimeUtc) continue;
+                if (PlaceholderUpdater.TryUpdateFileLastWriteTime(path, fileTimeUtc, Log))
+                    Log?.Invoke($"[TIME] 未水化占位时间已按云端上传时间校准 file={item.id}");
+            }
+            catch (Exception ex)
+            {
+                Log?.Invoke($"[TIME] 列举前校准占位时间失败 file={item.id}: {ex.Message}");
             }
         }
     }

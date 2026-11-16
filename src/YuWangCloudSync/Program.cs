@@ -2006,7 +2006,7 @@ internal static class Program
                 }
                 if (derived is { } t)
                 {
-                    PlaceholderFixer.EnqueueDirTime(sub, t.ToFileTimeUtc(), force: true);
+                    PlaceholderFixer.EnqueueDirTime(sub, PlaceholderCreator.UploadTimeToFileTimeUtc(t), force: true);
                     count++;
                 }
                 else if (node == null)

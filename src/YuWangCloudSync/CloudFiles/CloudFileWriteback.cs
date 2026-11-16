@@ -18,13 +18,15 @@ namespace YuWangCloudSync.CloudFiles;
 internal sealed class CloudFileWriteback : IDisposable
 {
     private const long DebounceMilliseconds = 1_500;
-    private const long MaximumConfirmationWaitMilliseconds = 60_000;
+    private const long MaximumPendingAgeMilliseconds = 6 * 60_000;
+    private const int MaximumRetries = 3;
     private const int MaximumPendingEntries = 10_000;
+    private const int MaximumFailedEntries = 50_000;
     private const int ConfirmationConcurrency = 12;
     private const int MaximumScanQueueCapacity = 1_000;
     private const long MinimumFullScanIntervalMilliseconds = 30_000;
     private const long PeriodicFullScanIntervalMilliseconds = 5 * 60_000;
-    private static readonly int[] BusyRetryDelaysMilliseconds = [2_000, 4_000, 8_000, 16_000, 30_000];
+    private static readonly int[] RetryDelaysMilliseconds = [30_000, 60_000, 120_000];
 
     private readonly string _root, _prefix, _user;
     private readonly YuWangClient _client;
@@ -32,11 +34,14 @@ internal sealed class CloudFileWriteback : IDisposable
     private readonly Action<string>? _log;
     private readonly FileSystemWatcher _watcher;
     private readonly CancellationTokenSource _stop = new();
+    private readonly object _queueGate = new();
     private readonly ConcurrentDictionary<string, PendingChange> _pending = new(StringComparer.OrdinalIgnoreCase);
-    private readonly ConcurrentDictionary<string, string> _lastFailure = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, byte> _queuedPaths = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, FileFingerprint> _rerunPaths = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, byte> _confirming = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, byte> _readyPaths = new(StringComparer.OrdinalIgnoreCase);
-    private readonly ConcurrentDictionary<string, byte> _needsReconciliation = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, FileFingerprint> _activeFingerprints = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, FailureRecord> _failedPaths = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<long, Task> _confirmationTasks = new();
     private readonly SemaphoreSlim _confirmationSlots = new(ConfirmationConcurrency, ConfirmationConcurrency);
     private readonly Channel<ConfirmedPath> _readyQueue = Channel.CreateBounded<ConfirmedPath>(
@@ -52,6 +57,7 @@ internal sealed class CloudFileWriteback : IDisposable
     private readonly Task _uploadWorker;
     private int _scanRequested;
     private int _pendingLimitWarning;
+    private int _failureTrackingSaturated;
     private long _confirmationTaskId;
 
     public CloudFileWriteback(string root, string user, YuWangClient client, SqliteCache cache, Action<string>? log)
@@ -66,7 +72,7 @@ internal sealed class CloudFileWriteback : IDisposable
         {
             Filter = "*.*",
             IncludeSubdirectories = true,
-            NotifyFilter = NotifyFilters.FileName | NotifyFilters.DirectoryName | NotifyFilters.LastWrite,
+            NotifyFilter = NotifyFilters.FileName | NotifyFilters.DirectoryName | NotifyFilters.LastWrite | NotifyFilters.Size,
             InternalBufferSize = 65_536,
             EnableRaisingEvents = false
         };
@@ -105,32 +111,65 @@ internal sealed class CloudFileWriteback : IDisposable
         catch (Exception error) when (error is ArgumentException or NotSupportedException or PathTooLongException) { return; }
         if (!path.StartsWith(_prefix, StringComparison.OrdinalIgnoreCase) || IsTemporaryPath(path)) return;
 
-        SchedulePending(path, fromScan: false);
+        var fingerprint = GetCurrentFingerprint(path);
+        lock (_queueGate)
+        {
+            if (Volatile.Read(ref _failureTrackingSaturated) != 0
+                && !_failedPaths.ContainsKey(path)) return;
+            if (_failedPaths.TryGetValue(path, out var failed))
+            {
+                if (fingerprint == default || fingerprint == failed.Fingerprint) return;
+                if (_failedPaths.TryRemove(path, out _)
+                    && _failedPaths.Count < MaximumFailedEntries)
+                    Interlocked.Exchange(ref _failureTrackingSaturated, 0);
+            }
+            SchedulePendingLocked(path, fingerprint, 0);
+        }
     }
 
-    private void SchedulePending(string path, bool fromScan)
+    private void SchedulePendingLocked(string path, FileFingerprint fingerprint, int retries)
     {
-        if (fromScan)
-        {
-            var stopHandle = _stop.Token.WaitHandle;
-            while (!_pending.ContainsKey(path)
-                   && _pending.Count >= MaximumPendingEntries && !_stop.IsCancellationRequested)
-            {
-                if (stopHandle.WaitOne(100)) return;
-            }
-        }
         if (_stop.IsCancellationRequested) return;
-
-        var firstObserved = Environment.TickCount64;
-        _pending.AddOrUpdate(path,
-            _ => new PendingChange(firstObserved, firstObserved, firstObserved + DebounceMilliseconds, 0),
-            (_, current) =>
+        if (_queuedPaths.ContainsKey(path))
+        {
+            if (_pending.TryGetValue(path, out var current))
             {
-                var now = Environment.TickCount64;
-                var due = now + DebounceMilliseconds;
-                if (current.BusyRetries > 0) due = Math.Max(due, current.DueTick);
-                return current with { LastEventTick = now, DueTick = due };
-            });
+                var eventTick = Environment.TickCount64;
+                var changed = fingerprint != default && fingerprint != current.Fingerprint;
+                _pending[path] = current with
+                {
+                    FirstEventTick = changed ? eventTick : current.FirstEventTick,
+                    LastEventTick = eventTick,
+                    DueTick = eventTick + DebounceMilliseconds,
+                    Retries = changed ? 0 : current.Retries,
+                    Fingerprint = fingerprint == default ? current.Fingerprint : fingerprint
+                };
+                return;
+            }
+            if (_confirming.ContainsKey(path) || _readyPaths.ContainsKey(path))
+            {
+                if (_activeFingerprints.TryGetValue(path, out var active)
+                    && fingerprint != default && fingerprint != active)
+                    _rerunPaths[path] = fingerprint;
+                return;
+            }
+            _queuedPaths.TryRemove(path, out _);
+        }
+        if (_queuedPaths.Count >= MaximumPendingEntries)
+        {
+            RecordFailure(path, "写回队列已满，等待文件变化再重试。", fingerprint);
+            return;
+        }
+        var now = Environment.TickCount64;
+        _queuedPaths[path] = 0;
+        _pending[path] = new PendingChange(now, now, now + DebounceMilliseconds, retries, fingerprint);
+    }
+
+    private FileFingerprint GetCurrentFingerprint(string path)
+    {
+        try { return GetFingerprint(path, File.GetAttributes(path)); }
+        catch (IOException) { return default; }
+        catch (UnauthorizedAccessException) { return default; }
     }
 
     private void EnforcePendingLimit()
@@ -144,13 +183,22 @@ internal sealed class CloudFileWriteback : IDisposable
         }
 
         if (Interlocked.Exchange(ref _pendingLimitWarning, 1) == 0)
-            _log?.Invoke($"[WRITE] 待处理路径超过 {MaximumPendingEntries} 条，清理最久未更新项并请求全量扫描。");
-        RequestFullScan();
+            _log?.Invoke($"[WRITE] 待处理路径超过 {MaximumPendingEntries} 条，清理最久未更新项并记为失败。");
 
         var removeCount = count - MaximumPendingEntries;
         foreach (var entry in _pending.OrderBy(pair => pair.Value.LastEventTick).Take(removeCount))
         {
-            ((ICollection<KeyValuePair<string, PendingChange>>)_pending).Remove(entry);
+            var removed = false;
+            lock (_queueGate)
+            {
+                if (((ICollection<KeyValuePair<string, PendingChange>>)_pending).Remove(entry))
+                {
+                    _queuedPaths.TryRemove(entry.Key, out _);
+                    removed = true;
+                }
+            }
+            if (removed)
+                RecordFailure(entry.Key, "写回队列超过容量上限，等待文件后续变更再重试。");
         }
     }
 
@@ -193,12 +241,7 @@ internal sealed class CloudFileWriteback : IDisposable
             if (Interlocked.Exchange(ref _scanRequested, 0) == 0) continue;
             try
             {
-                Discover(_root, waitForCapacity: true);
-                foreach (var path in _needsReconciliation.Keys)
-                {
-                    if (File.Exists(path) || Directory.Exists(path)) SchedulePending(path, fromScan: true);
-                    _needsReconciliation.TryRemove(path, out _);
-                }
+                Discover(_root);
             }
             catch (Exception error) when (error is IOException or UnauthorizedAccessException)
             {
@@ -212,7 +255,7 @@ internal sealed class CloudFileWriteback : IDisposable
         }
     }
 
-    private void Discover(string path, bool waitForCapacity = false)
+    private void Discover(string path)
     {
         if (_stop.IsCancellationRequested) return;
         try
@@ -228,13 +271,69 @@ internal sealed class CloudFileWriteback : IDisposable
                 var owned = ProviderIdentity.TryReadPlaceholderIdentity(child, out _);
                 if ((attributes & FileAttributes.ReparsePoint) != 0 && !owned) continue;
                 if (IsTemporary(child, attributes)) continue;
-                SchedulePending(child, fromScan: waitForCapacity);
-                _needsReconciliation.TryRemove(child, out _);
-                if ((attributes & FileAttributes.Directory) != 0) Discover(child, waitForCapacity);
+
+                if (IsScanWritebackCandidate(child, attributes, owned))
+                {
+                    var fingerprint = GetCurrentFingerprint(child);
+                    var shouldQueue = true;
+                    if (_failedPaths.TryGetValue(child, out var failed))
+                    {
+                        if (fingerprint == default || fingerprint == failed.Fingerprint) shouldQueue = false;
+                        else
+                        {
+                            if (_failedPaths.TryRemove(child, out _)
+                                && _failedPaths.Count < MaximumFailedEntries)
+                                Interlocked.Exchange(ref _failureTrackingSaturated, 0);
+                        }
+                    }
+
+                    if (shouldQueue) TryQueueFromScan(child, fingerprint);
+                }
+
+                if ((attributes & FileAttributes.Directory) != 0) Discover(child);
             }
         }
         catch (IOException) { }
         catch (UnauthorizedAccessException) { }
+    }
+
+    private bool TryQueueFromScan(string path, FileFingerprint fingerprint)
+    {
+        lock (_queueGate)
+        {
+            if (Volatile.Read(ref _failureTrackingSaturated) != 0
+                || _queuedPaths.Count >= MaximumPendingEntries
+                || _queuedPaths.ContainsKey(path)
+                || _confirming.ContainsKey(path)
+                || _readyPaths.ContainsKey(path)
+                || (_failedPaths.TryGetValue(path, out var failed)
+                    && (fingerprint == default || fingerprint == failed.Fingerprint))) return false;
+
+            var now = Environment.TickCount64;
+            _queuedPaths[path] = 0;
+            if (_pending.TryAdd(path, new PendingChange(now, now, now + DebounceMilliseconds, 0, fingerprint))) return true;
+            _queuedPaths.TryRemove(path, out _);
+            return false;
+        }
+    }
+
+    private static bool IsScanWritebackCandidate(string path, FileAttributes attributes, bool owned)
+    {
+        var isDirectory = (attributes & FileAttributes.Directory) != 0;
+        if (!owned) return true;
+        if (isDirectory || !ProviderIdentity.TryReadPlaceholderIdentity(path, out var identity)
+            || identity.IsVirtual)
+            return false;
+
+        return PlaceholderUpdater.TryGetPlaceholderDataState(path, out var state)
+            && state.InSyncState != CF_IN_SYNC_STATE.CF_IN_SYNC_STATE_IN_SYNC;
+    }
+
+    private static FileFingerprint GetFingerprint(string path, FileAttributes attributes)
+    {
+        var isDirectory = (attributes & FileAttributes.Directory) != 0;
+        var length = isDirectory ? 0 : new FileInfo(path).Length;
+        return new FileFingerprint(length, File.GetLastWriteTimeUtc(path).Ticks);
     }
 
     private async Task RunSchedulerAsync()
@@ -249,31 +348,41 @@ internal sealed class CloudFileWriteback : IDisposable
                 foreach (var entry in _pending)
                 {
                     if (_stop.IsCancellationRequested) break;
-                    if (now - entry.Value.FirstEventTick >= MaximumConfirmationWaitMilliseconds)
+                    if (now - entry.Value.FirstEventTick >= MaximumPendingAgeMilliseconds)
                     {
-                        if (!((ICollection<KeyValuePair<string, PendingChange>>)_pending).Remove(entry)) continue;
-                        _needsReconciliation.TryAdd(entry.Key, 0);
-                        _log?.Invoke($"[WRITE] 独占确认等待超过 60 秒，移交全量扫描 path={entry.Key}");
-                        RequestFullScan();
+                        lock (_queueGate)
+                        {
+                            if (!((ICollection<KeyValuePair<string, PendingChange>>)_pending).Remove(entry)) continue;
+                        }
+                        ScheduleRetryOrFail(entry.Key, entry.Value, "单文件写回超过 6 分钟等待上限。", timeout: true);
                         continue;
                     }
 
-                    if (entry.Value.DueTick > now
-                        || _confirming.ContainsKey(entry.Key)
-                        || _readyPaths.ContainsKey(entry.Key)) continue;
-                    if (!_confirmationSlots.Wait(0)) break;
-                    if (!_confirming.TryAdd(entry.Key, 0))
+                    var started = false;
+                    lock (_queueGate)
                     {
-                        _confirmationSlots.Release();
-                        continue;
+                        if (!_pending.TryGetValue(entry.Key, out var current)
+                            || current != entry.Value
+                            || current.DueTick > now
+                            || _confirming.ContainsKey(entry.Key)
+                            || _readyPaths.ContainsKey(entry.Key)) continue;
+                        if (!_confirmationSlots.Wait(0)) break;
+                        if (!_confirming.TryAdd(entry.Key, 0))
+                        {
+                            _confirmationSlots.Release();
+                            continue;
+                        }
+                        _activeFingerprints[entry.Key] = current.Fingerprint;
+                        if (!((ICollection<KeyValuePair<string, PendingChange>>)_pending).Remove(entry))
+                        {
+                            _confirming.TryRemove(entry.Key, out _);
+                            _activeFingerprints.TryRemove(entry.Key, out _);
+                            _confirmationSlots.Release();
+                            continue;
+                        }
+                        started = true;
                     }
-                    if (!((ICollection<KeyValuePair<string, PendingChange>>)_pending).Remove(entry))
-                    {
-                        _confirming.TryRemove(entry.Key, out _);
-                        _confirmationSlots.Release();
-                        continue;
-                    }
-                    StartConfirmation(entry.Key, entry.Value);
+                    if (started) StartConfirmation(entry.Key, entry.Value);
                 }
             }
         }
@@ -297,18 +406,18 @@ internal sealed class CloudFileWriteback : IDisposable
         try
         {
             _stop.Token.ThrowIfCancellationRequested();
-            if (!CanConfirmWriteback(path))
-            {
-                _lastFailure.TryRemove(path, out _);
-                return;
-            }
+            if (!CanConfirmWriteback(path)) return;
 
             if (!Directory.Exists(path))
             {
                 using var exclusive = OpenExclusiveRead(path);
             }
 
-            if (!_readyPaths.TryAdd(path, 0)) return;
+            lock (_queueGate)
+            {
+                if (!_readyPaths.TryAdd(path, 0)) return;
+                _activeFingerprints[path] = pending.Fingerprint;
+            }
             try
             {
                 var now = Environment.TickCount64;
@@ -316,16 +425,19 @@ internal sealed class CloudFileWriteback : IDisposable
                 {
                     FirstEventTick = now,
                     LastEventTick = now,
-                    DueTick = now,
-                    BusyRetries = 0
+                    DueTick = now
                 };
                 await _readyQueue.Writer.WriteAsync(new ConfirmedPath(path, confirmed), _stop.Token)
                     .ConfigureAwait(false);
-                _needsReconciliation.TryRemove(path, out _);
             }
             catch
             {
-                _readyPaths.TryRemove(path, out _);
+                lock (_queueGate)
+                {
+                    if (_activeFingerprints.TryGetValue(path, out var active)
+                        && active == pending.Fingerprint)
+                        _readyPaths.TryRemove(path, out _);
+                }
                 throw;
             }
         }
@@ -333,17 +445,24 @@ internal sealed class CloudFileWriteback : IDisposable
         {
             ScheduleBusyRetry(path, pending, error.Message);
         }
-        catch (FileNotFoundException) { _lastFailure.TryRemove(path, out _); }
-        catch (DirectoryNotFoundException) { _lastFailure.TryRemove(path, out _); }
-        catch (OperationCanceledException) when (_stop.IsCancellationRequested) { }
+        catch (FileNotFoundException) { CompleteQueuePath(path, pending.Fingerprint); }
+        catch (DirectoryNotFoundException) { CompleteQueuePath(path, pending.Fingerprint); }
+        catch (OperationCanceledException) when (_stop.IsCancellationRequested) { CompleteQueuePath(path, pending.Fingerprint); }
         catch (Exception error)
         {
             LogWritebackFailure(path, error);
-            ScheduleGenericRetry(path, pending);
+            ScheduleGenericRetry(path, pending, error);
         }
         finally
         {
-            _confirming.TryRemove(path, out _);
+            lock (_queueGate)
+            {
+                var sameActive = _activeFingerprints.TryGetValue(path, out var active)
+                    && active == pending.Fingerprint;
+                if (sameActive) _confirming.TryRemove(path, out _);
+                if (sameActive && !_pending.ContainsKey(path) && !_readyPaths.ContainsKey(path))
+                    CompleteQueuePathLocked(path, pending.Fingerprint);
+            }
             _confirmationSlots.Release();
         }
     }
@@ -380,11 +499,11 @@ internal sealed class CloudFileWriteback : IDisposable
                 try
                 {
                     await ProcessAsync(ready.Path).ConfigureAwait(false);
-                    _lastFailure.TryRemove(ready.Path, out _);
+                    CompleteQueuePath(ready.Path, ready.Pending.Fingerprint);
                 }
                 catch (OperationCanceledException) when (_stop.IsCancellationRequested) { throw; }
-                catch (FileNotFoundException) { _lastFailure.TryRemove(ready.Path, out _); }
-                catch (DirectoryNotFoundException) { _lastFailure.TryRemove(ready.Path, out _); }
+                catch (FileNotFoundException) { CompleteQueuePath(ready.Path, ready.Pending.Fingerprint); }
+                catch (DirectoryNotFoundException) { CompleteQueuePath(ready.Path, ready.Pending.Fingerprint); }
                 catch (FileBusyException error)
                 {
                     ScheduleBusyRetry(ready.Path, ready.Pending, error.Message);
@@ -392,11 +511,16 @@ internal sealed class CloudFileWriteback : IDisposable
                 catch (Exception error)
                 {
                     LogWritebackFailure(ready.Path, error);
-                    ScheduleGenericRetry(ready.Path, ready.Pending);
+                    ScheduleGenericRetry(ready.Path, ready.Pending, error);
                 }
                 finally
                 {
-                    _readyPaths.TryRemove(ready.Path, out _);
+                    lock (_queueGate)
+                    {
+                        if (_activeFingerprints.TryGetValue(ready.Path, out var active)
+                            && active == ready.Pending.Fingerprint)
+                            _readyPaths.TryRemove(ready.Path, out _);
+                    }
                 }
             }
         }
@@ -405,48 +529,104 @@ internal sealed class CloudFileWriteback : IDisposable
 
     private void ScheduleBusyRetry(string path, PendingChange failed, string reason)
     {
-        var now = Environment.TickCount64;
-        var firstEvent = failed.FirstEventTick;
-        var nextRetry = Math.Min(failed.BusyRetries, BusyRetryDelaysMilliseconds.Length - 1);
-        var due = now + BusyRetryDelaysMilliseconds[nextRetry];
-        var retry = failed with
-        {
-            FirstEventTick = firstEvent,
-            LastEventTick = now,
-            DueTick = due,
-            BusyRetries = Math.Min(failed.BusyRetries + 1, BusyRetryDelaysMilliseconds.Length)
-        };
-
-        if (now - firstEvent >= MaximumConfirmationWaitMilliseconds)
-        {
-            _needsReconciliation.TryAdd(path, 0);
-            _log?.Invoke($"[WRITE] 独占确认等待超过 60 秒，移交全量扫描 path={path}");
-            RequestFullScan();
-            return;
-        }
-
-        _pending.AddOrUpdate(path, retry, (_, current) =>
-        {
-            if (current.LastEventTick <= failed.LastEventTick) return retry;
-            return current with
-            {
-                FirstEventTick = Math.Min(current.FirstEventTick, failed.FirstEventTick),
-                DueTick = Math.Max(current.DueTick, due),
-                BusyRetries = Math.Max(current.BusyRetries, retry.BusyRetries)
-            };
-        });
-
-        if (!_lastFailure.TryGetValue(path, out var previous) || previous != reason)
-            _log?.Invoke($"[WRITE] 文件仍被占用，按退避间隔重新确认 path={path} retry={retry.BusyRetries}");
-        _lastFailure[path] = reason;
+        ScheduleRetryOrFail(path, failed, reason);
     }
 
-    private void ScheduleGenericRetry(string path, PendingChange failed)
+    private void ScheduleGenericRetry(string path, PendingChange failed, Exception error)
     {
-        var now = Environment.TickCount64;
-        var retry = new PendingChange(now, now, now + 30_000, 0);
-        _pending.AddOrUpdate(path, retry,
-            (_, current) => current.LastEventTick <= failed.LastEventTick ? retry : current);
+        var reason = error is HttpRequestException ? "HTTP 请求失败"
+            : error is IOException or UnauthorizedAccessException ? error.Message
+            : error.GetType().Name;
+        ScheduleRetryOrFail(path, failed, reason);
+    }
+
+    private void ScheduleRetryOrFail(string path, PendingChange failed, string reason, bool timeout = false)
+    {
+        var currentFingerprint = timeout ? GetCurrentFingerprint(path) : default;
+        lock (_queueGate)
+        {
+            if (_pending.TryGetValue(path, out var newer)
+                && newer.LastEventTick > failed.LastEventTick)
+                return;
+
+            if (timeout && currentFingerprint == failed.Fingerprint)
+            {
+                _rerunPaths.TryRemove(path, out _);
+                CompleteQueuePathLocked(path, failed.Fingerprint);
+                RecordFailure(path, reason, currentFingerprint, failed.Retries);
+                return;
+            }
+
+            if (failed.Retries >= MaximumRetries)
+            {
+                if (_rerunPaths.TryGetValue(path, out var rerun)
+                    && rerun != default && rerun != failed.Fingerprint)
+                {
+                    CompleteQueuePathLocked(path, failed.Fingerprint);
+                    return;
+                }
+
+                _rerunPaths.TryRemove(path, out _);
+                CompleteQueuePathLocked(path, failed.Fingerprint);
+                RecordFailure(path, reason, currentFingerprint, failed.Retries);
+                return;
+            }
+
+            var now = Environment.TickCount64;
+            var retryCount = failed.Retries + 1;
+            var delay = RetryDelaysMilliseconds[retryCount - 1];
+            var retryFingerprint = timeout && currentFingerprint != default
+                ? currentFingerprint
+                : failed.Fingerprint;
+            var retry = failed with
+            {
+                FirstEventTick = now,
+                LastEventTick = now,
+                DueTick = now + delay,
+                Retries = retryCount,
+                Fingerprint = retryFingerprint
+            };
+            _queuedPaths[path] = 0;
+            _pending[path] = retry;
+            _log?.Invoke($"[WRITE] 写回失败，按指数退避重试 path={path} retry={retryCount}/{MaximumRetries}");
+        }
+    }
+
+    private void RecordFailure(string path, string reason, FileFingerprint fingerprint = default, int attempts = MaximumRetries)
+    {
+        if (fingerprint == default) fingerprint = GetCurrentFingerprint(path);
+        lock (_queueGate)
+        {
+            if (_failedPaths.Count < MaximumFailedEntries || _failedPaths.ContainsKey(path))
+                _failedPaths[path] = new FailureRecord(fingerprint, attempts, reason);
+            else
+                Interlocked.Exchange(ref _failureTrackingSaturated, 1);
+        }
+        _log?.Invoke($"[WRITE] 写回重试已终止，记录失败并等待文件变化 path={path} reason={reason}");
+    }
+
+    private readonly record struct FailureRecord(FileFingerprint Fingerprint, int Attempts, string Reason);
+
+    private void CompleteQueuePath(string path, FileFingerprint? expected = null)
+    {
+        lock (_queueGate) CompleteQueuePathLocked(path, expected);
+    }
+
+    private void CompleteQueuePathLocked(string path, FileFingerprint? expected = null)
+    {
+        if (expected is { } expectedFingerprint
+            && ((_pending.TryGetValue(path, out var pending) && pending.Fingerprint != expectedFingerprint)
+                || (_activeFingerprints.TryGetValue(path, out var activeCurrent)
+                    && activeCurrent != expectedFingerprint))) return;
+        var active = _activeFingerprints.TryGetValue(path, out var fingerprint) ? fingerprint : default;
+        _pending.TryRemove(path, out _);
+        _confirming.TryRemove(path, out _);
+        _readyPaths.TryRemove(path, out _);
+        _activeFingerprints.TryRemove(path, out _);
+        _queuedPaths.TryRemove(path, out _);
+        if (_rerunPaths.TryRemove(path, out var rerun) && !_stop.IsCancellationRequested
+            && (rerun == default || active == default || rerun != active))
+            SchedulePendingLocked(path, rerun, 0);
     }
 
     private void LogWritebackFailure(string path, Exception error)
@@ -455,9 +635,7 @@ internal sealed class CloudFileWriteback : IDisposable
         var reason = error is HttpRequestException ? "HTTP 请求失败"
             : error is IOException or UnauthorizedAccessException ? error.Message
             : error.GetType().Name;
-        if (!_lastFailure.TryGetValue(path, out var previous) || previous != reason)
-            _log?.Invoke($"[WRITE] 保留本地内容，写回未完成 path={path} reason={reason}");
-        _lastFailure[path] = reason;
+        _log?.Invoke($"[WRITE] 保留本地内容，写回未完成 path={path} reason={reason}");
     }
 
     private static FileStream OpenExclusiveRead(string path)
@@ -698,7 +876,9 @@ internal sealed class CloudFileWriteback : IDisposable
     }
 
     private readonly record struct PendingChange(
-        long FirstEventTick, long LastEventTick, long DueTick, int BusyRetries);
+        long FirstEventTick, long LastEventTick, long DueTick, int Retries, FileFingerprint Fingerprint);
+
+    private readonly record struct FileFingerprint(long Length, long LastWriteTicks);
 
     private readonly record struct ConfirmedPath(string Path, PendingChange Pending);
 
