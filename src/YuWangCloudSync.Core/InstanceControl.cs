@@ -10,6 +10,11 @@ public static class InstanceControl
         + "." + Process.GetCurrentProcess().SessionId;
 
     public static async Task ListenAsync(Action stop, CancellationToken cancellationToken)
+        => await ListenAsync(command => string.Equals(command, "stop", StringComparison.Ordinal)
+            ? Environment.ProcessId.ToString() : null, stop, cancellationToken);
+
+    public static async Task ListenAsync(Func<string, string?> command,
+        Action stop, CancellationToken cancellationToken)
     {
         while (!cancellationToken.IsCancellationRequested)
         {
@@ -22,10 +27,18 @@ public static class InstanceControl
                 using var writer = new StreamWriter(server, leaveOpen: true) { AutoFlush = true };
                 using var requestTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
                 requestTimeout.CancelAfter(TimeSpan.FromSeconds(5));
-                if (await reader.ReadLineAsync(requestTimeout.Token) != "stop") continue;
-                await writer.WriteLineAsync(Environment.ProcessId.ToString());
-                stop();
-                return;
+                var line = await reader.ReadLineAsync(requestTimeout.Token);
+                if (line is null) continue;
+                var response = command(line);
+                if (response is not null)
+                {
+                    await writer.WriteLineAsync(response);
+                    if (string.Equals(line, "stop", StringComparison.Ordinal))
+                    {
+                        stop();
+                        return;
+                    }
+                }
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { return; }
             catch (IOException) { }

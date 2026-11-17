@@ -245,11 +245,18 @@ public sealed partial class YuWangClient : IDisposable
 
     public async Task<List<YuWangItem>> ListFolderAsync(ulong diskId, ulong folderId)
     {
-        var result = await ListFolderWithPermissionsAsync(diskId, folderId).ConfigureAwait(false);
+        var result = await ListFolderWithoutPermissionProbeAsync(diskId, folderId).ConfigureAwait(false);
         return result.Items.ToList();
     }
 
-    public async Task<FolderListingResult> ListFolderWithPermissionsAsync(ulong diskId, ulong folderId)
+    public Task<FolderListingResult> ListFolderWithPermissionsAsync(ulong diskId, ulong folderId)
+        => ListFolderCoreAsync(diskId, folderId, probePermission: true);
+
+    /// <summary>Fetch and validate a directory page without probing write permission.</summary>
+    public Task<FolderListingResult> ListFolderWithoutPermissionProbeAsync(ulong diskId, ulong folderId)
+        => ListFolderCoreAsync(diskId, folderId, probePermission: false);
+
+    private async Task<FolderListingResult> ListFolderCoreAsync(ulong diskId, ulong folderId, bool probePermission)
     {
         await _folderContextGate.WaitAsync(_lifetimeToken).ConfigureAwait(false);
         try
@@ -271,7 +278,7 @@ public sealed partial class YuWangClient : IDisposable
                 .Select(match => match.Groups[1].Value).Distinct(StringComparer.Ordinal).Count();
             var validPage = IsExpectedFolderPage(html, diskId, folderId) && declaredItems == items.Count;
             var permission = DirectoryPermission.Unknown;
-            if (validPage)
+            if (validPage && probePermission)
             {
                 try
                 {
@@ -283,7 +290,8 @@ public sealed partial class YuWangClient : IDisposable
                     _log($"[PERMISSION] disk={diskId} folder={folderId} beforePaste 探测失败，权限未知: {error.Message}");
                 }
             }
-            _log($"[PERMISSION] disk={diskId} folder={folderId} result={permission}");
+            if (probePermission)
+                _log($"[PERMISSION] disk={diskId} folder={folderId} result={permission}");
             return new FolderListingResult(items, permission, validPage);
         }
         finally { _folderContextGate.Release(); }

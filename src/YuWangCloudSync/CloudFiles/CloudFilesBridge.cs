@@ -451,11 +451,168 @@ public static class Callbacks
     {
         StopDirectoryRefresh();
         if (Cache is { } cache)
-            _directoryRefresh = new DirectoryPopulationRefresh(cache, SyncRootPath, () => FolderCache, Log);
+            _directoryRefresh = new DirectoryPopulationRefresh(cache, SyncRootPath, UserKey,
+                () => DirectoryRefreshInterval,
+                (identity, path) => RefreshDirectoryNow(identity, path, probePermission: false), Log);
     }
 
     public static void StopDirectoryRefresh()
         => Interlocked.Exchange(ref _directoryRefresh, null)?.Dispose();
+
+    public static int LoadPersistedDirectoryListings(CancellationToken cancellationToken)
+    {
+        var cache = Cache;
+        if (cache is null) return 0;
+        var root = Path.GetFullPath(SyncRootPath).TrimEnd(Path.DirectorySeparatorChar)
+            + Path.DirectorySeparatorChar;
+        var loaded = 0;
+        foreach (var (identity, path) in cache.ListKnownFolderPaths(UserKey))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!Path.GetFullPath(path).StartsWith(root, StringComparison.OrdinalIgnoreCase)) continue;
+            var items = cache.ListCachedItems(identity.DiskId, identity.FileId);
+            SetMem(new NodeKey(identity), items);
+            loaded++;
+        }
+        return loaded;
+    }
+
+    internal static object GetDirectoryListingGate(FileIdentity identity)
+        => ListingGates.GetOrAdd(new NodeKey(identity), _ => new object());
+
+    /// <summary>Fetch one folder for full prefetch without probing permissions or touching placeholders.</summary>
+    public static (Net.FolderListingResult Listing, long PreviousFileCount,
+        HashSet<ulong> PreviousFolderIds) FetchAndStoreDirectoryListingForPrefetch(
+        FileIdentity identity, string localDir, Action<IReadOnlyList<Net.YuWangItem>> validateListing)
+    {
+        if (!identity.IsValid || identity.IsVirtual || identity.Type != 0 || string.IsNullOrWhiteSpace(localDir))
+            throw new ArgumentException("预拉取目录身份或路径无效。", nameof(identity));
+        var cache = Cache ?? throw new InvalidOperationException("元数据缓存尚未初始化");
+        var client = Client ?? throw new InvalidOperationException("Cloud client 尚未初始化");
+        lock (GetDirectoryListingGate(identity))
+        {
+            var previousItems = cache.ListCachedItems(identity.DiskId, identity.FileId);
+            var previousFiles = previousItems.LongCount(item => !item.isFolder);
+            var previousFolderIds = previousItems.Where(item => item.isFolder)
+                .Select(item => item.id).ToHashSet();
+            ListThrottle.Wait();
+            Net.FolderListingResult listing;
+            try
+            {
+                listing = client.ListFolderWithoutPermissionProbeAsync(identity.DiskId, identity.FileId)
+                    .GetAwaiter().GetResult();
+            }
+            finally
+            {
+                ListThrottle.Release();
+            }
+            if (!listing.IsValidPage)
+                throw new InvalidDataException("服务器没有返回请求的目录页面。");
+            validateListing(listing.Items);
+            cache.SaveFolder(identity.DiskId, identity.FileId, identity.FolderId,
+                Path.GetFileName(localDir.TrimEnd(Path.DirectorySeparatorChar)), localDir, listing.Items);
+            RefreshKeptDirectoryPaths(cache, identity.DiskId, identity.FileId, localDir, listing.Items);
+            InvalidateFolderListing(identity.DiskId, identity.FileId);
+            return (listing, previousFiles, previousFolderIds);
+        }
+    }
+
+    public static bool RefreshDirectoryNow(FileIdentity identity, string localDir, bool probePermission = true)
+    {
+        if (!identity.IsValid || identity.IsVirtual || identity.Type != 0 || string.IsNullOrWhiteSpace(localDir))
+            return false;
+        var cache = Cache;
+        var client = Client;
+        if (cache is null || client is null) return false;
+        var nodeKey = new NodeKey(identity);
+        lock (GetDirectoryListingGate(identity))
+        {
+            try
+            {
+                ListThrottle.Wait();
+                try
+                {
+                    var listing = (probePermission
+                            ? client.ListFolderWithPermissionsAsync(identity.DiskId, identity.FileId)
+                            : client.ListFolderWithoutPermissionProbeAsync(identity.DiskId, identity.FileId))
+                        .GetAwaiter().GetResult();
+                    if (!listing.IsValidPage)
+                        throw new InvalidDataException("目录响应不是目标目录页面，拒绝缓存或变更占位。");
+                    var remoteItems = listing.Items.ToList();
+                    if (probePermission)
+                        cache.SaveDirectoryPermission(UserKey, identity.DiskId, identity.FileId, listing.Permission);
+                    cache.SaveFolder(identity.DiskId, identity.FileId, identity.FolderId,
+                        Path.GetFileName(localDir.TrimEnd(Path.DirectorySeparatorChar)), localDir, remoteItems);
+                    RefreshKeptDirectoryPaths(cache, identity.DiskId, identity.FileId, localDir, remoteItems);
+                    ReconcileRemovedPlaceholders(identity, localDir, remoteItems);
+                    ProbeRealSizes(identity.FileId, remoteItems);
+                    var items = EnrichFolderTimes(cache, identity.DiskId,
+                        cache.ListCachedItems(identity.DiskId, identity.FileId));
+                    InvalidateFolderListing(identity.DiskId, identity.FileId);
+                    SetMem(nodeKey, items);
+                    ReconcileExistingPlaceholderSizes(localDir, items);
+                    _ = EnsurePlaceholders(nodeKey, localDir, false, out _, () =>
+                    {
+                        var permission = cache.GetDirectoryPermission(UserKey, identity.DiskId, identity.FileId);
+                        var placeholders = PlaceholderCreator.Build(identity.DiskId, identity.FileId, items,
+                            out var ids, readOnly: permission != DirectoryPermission.FullAccess);
+                        return (placeholders, ids);
+                    });
+                    ReconcileExistingPlaceholderTimes(localDir, items);
+                    RefreshKeptDirectoryPaths(cache, identity.DiskId, identity.FileId, localDir, remoteItems);
+                    if (cache.IsDirectoryRefreshKept(UserKey, identity.DiskId, identity.FileId))
+                        _directoryRefresh?.Schedule(identity, localDir);
+                    ExplorerStateNotifier.NotifyDirectory(localDir);
+                    Log?.Invoke($"[REFRESH] 已刷新目录 folder={nodeKey} items={items.Count} dir='{localDir}'");
+                    return true;
+                }
+                finally
+                {
+                    ListThrottle.Release();
+                }
+            }
+            catch (Exception error)
+            {
+                Log?.Invoke($"[REFRESH] 刷新目录失败 folder={nodeKey}: {error.Message}");
+                return false;
+            }
+        }
+    }
+
+    public static bool SetDirectoryRefreshKept(FileIdentity identity, string localDir, bool kept)
+    {
+        var cache = Cache;
+        if (cache is null || identity.IsVirtual || identity.Type != 0 || string.IsNullOrWhiteSpace(localDir))
+            return false;
+        var name = Path.GetFileName(localDir.TrimEnd(Path.DirectorySeparatorChar));
+        cache.SetDirectoryRefreshKept(UserKey, identity.DiskId, identity.FileId, localDir, name, kept);
+        if (kept) _directoryRefresh?.Schedule(identity, localDir);
+        else _directoryRefresh?.Unschedule(identity);
+        Log?.Invoke(kept
+            ? $"[REFRESH] 已保持目录刷新 folder={identity.FileId} dir='{localDir}'"
+            : $"[REFRESH] 已取消目录自动刷新 folder={identity.FileId} dir='{localDir}'");
+        return true;
+    }
+
+    private static void RefreshKeptDirectoryPaths(SqliteCache cache, ulong diskId, ulong parentFolderId,
+        string localDir, IReadOnlyList<Net.YuWangItem> items)
+    {
+        cache.RebindKeptDirectoryRefreshPaths(UserKey);
+        foreach (var item in items)
+        {
+            if (!item.IsFolder || !cache.IsDirectoryRefreshKept(UserKey, diskId, item.Id)) continue;
+            try
+            {
+                var path = Path.GetFullPath(Path.Combine(localDir, item.Name));
+                if (!Directory.Exists(path)) continue;
+                _directoryRefresh?.Schedule(new FileIdentity(diskId, parentFolderId, item.Id, 0), path);
+            }
+            catch (Exception error)
+            {
+                Log?.Invoke($"[REFRESH] 更新保持目录路径失败 folder={item.Id}: {error.Message}");
+            }
+        }
+    }
 
     public static void StartWriteback()
     {
@@ -1271,95 +1428,40 @@ public static class Callbacks
             }
             else
             {
-                lock (ListingGates.GetOrAdd(nodeKey, _ => new object()))
+                lock (GetDirectoryListingGate(identity))
                 {
-                    var forceRefresh = _directoryRefresh?.BeginEnumeration(identity, localDir) == true;
-                    if (forceRefresh)
+                    var cacheHit = false;
+                    Log?.Invoke($"[DEBUG] 列举 folder={nodeKey} 强制查询云端（dir='{localDir}'）");
+                    ListThrottle.Wait();
+                    try
                     {
-                        Log?.Invoke($"[REFRESH] 目录重新枚举，立即查询云端 folder={nodeKey} dir='{localDir}'");
+                        var listing = (Client ?? throw new InvalidOperationException("Cloud client 尚未初始化"))
+                            .ListFolderWithPermissionsAsync(identity.DiskId, identity.FileId)
+                            .GetAwaiter().GetResult();
+                        if (!listing.IsValidPage)
+                            throw new InvalidDataException("目录响应不是目标目录页面，拒绝缓存或变更占位。");
+                        var remoteItems = listing.Items.ToList();
+                        cache.SaveDirectoryPermission(UserKey, identity.DiskId, identity.FileId,
+                            listing.Permission);
+                        cache.SaveFolder(identity.DiskId, identity.FileId, identity.FolderId,
+                            Path.GetFileName(localDir), localDir, remoteItems);
+                        cache.RebindKeptDirectoryRefreshPaths(UserKey);
+                        ReconcileRemovedPlaceholders(identity, localDir, remoteItems);
+                        ProbeRealSizes(identity.FileId, remoteItems);
+                        items = EnrichFolderTimes(cache, identity.DiskId,
+                            cache.ListCachedItems(identity.DiskId, identity.FileId));
+                        SetMem(nodeKey, items);
                     }
-                    // ===== 真实磁盘节点：SQLite 时间戳判定后复用进程内存 → SQLite → HTTP =====
-                    // cacheHit=true 表示之前已列举过该目录、占位文件已存在 → 后面跳过创建
-                    bool cacheHit;
-                    if (!forceRefresh && cache.IsFolderCached(identity.DiskId, identity.FileId, FolderCache))
+                    catch (Exception error) when (cache.IsFolderCached(identity.DiskId, identity.FileId, TimeSpan.MaxValue))
                     {
-                        cacheHit = true;
-                        if (!TryMem(nodeKey, out items))
-                        {
-                            items = EnrichFolderTimes(cache, identity.DiskId,
-                                cache.ListCachedItems(identity.DiskId, identity.FileId));
-                            ProbeCachedRealSizes(identity.FileId, items);
-                            items = EnrichFolderTimes(cache, identity.DiskId,
-                                cache.ListCachedItems(identity.DiskId, identity.FileId));
-                            SetMem(nodeKey, items);
-                            if (DiagAllowed(nodeKey))
-                                Log?.Invoke($"[DEBUG] 列举 folder={nodeKey} SQLITE_HIT items={items.Count} dir='{localDir}'");
-                        }
+                        Log?.Invoke($"[REFRESH] 云端查询未成功，保留已有列表 folder={nodeKey}: {error.Message}");
+                        items = EnrichFolderTimes(cache, identity.DiskId,
+                            cache.ListCachedItems(identity.DiskId, identity.FileId));
+                        SetMem(nodeKey, items);
                     }
-                    else
+                    finally
                     {
-                        cacheHit = false;
-                        Log?.Invoke($"[DEBUG] 列举 folder={nodeKey} MISS → HTTP（dir='{localDir}' " +
-                                    $"identity(disk={identity.DiskId},folder={identity.FolderId},file={identity.FileId})）");
-                        // 并发节流：限制同时打出的育网云列举请求数（Explorer 连锁触发时避免 HTTP 风暴）
-                        ListThrottle.Wait();
-                        try
-                        {
-                            // 再查一次：排队期间可能已被其他线程填充（避免重复 HTTP）
-                            if (!forceRefresh && cache.IsFolderCached(identity.DiskId, identity.FileId, FolderCache))
-                            {
-                                cacheHit = true;
-                                if (!TryMem(nodeKey, out items))
-                                {
-                                    items = EnrichFolderTimes(cache, identity.DiskId,
-                                        cache.ListCachedItems(identity.DiskId, identity.FileId));
-                                    ProbeCachedRealSizes(identity.FileId, items);
-                                    items = EnrichFolderTimes(cache, identity.DiskId,
-                                        cache.ListCachedItems(identity.DiskId, identity.FileId));
-                                    SetMem(nodeKey, items);
-                                }
-                            }
-                            else
-                            {
-                                var listing = (Client ?? throw new InvalidOperationException("Cloud client 尚未初始化"))
-                                    .ListFolderWithPermissionsAsync(identity.DiskId, identity.FileId)
-                                    .GetAwaiter().GetResult();
-                                if (!listing.IsValidPage)
-                                    throw new InvalidDataException("目录响应不是目标目录页面，拒绝缓存或变更占位。");
-                                var remoteItems = listing.Items.ToList();
-                                cache.SaveDirectoryPermission(UserKey, identity.DiskId, identity.FileId,
-                                    listing.Permission);
-                                cache.SaveFolder(identity.DiskId, identity.FileId, identity.FolderId,
-                                    Path.GetFileName(localDir), localDir, remoteItems);
-                                ReconcileRemovedPlaceholders(identity, localDir, remoteItems);
-                                // 列表页大小向下取整到整 MB；创建占位前通过直链 HEAD 取得精确字节数，
-                                // 避免在 FETCH_DATA 期间修改正在水化的文件。
-                                //   PicPlayer 页 → sketch hash → upload_dir/file/<yyyyMM>/<hash>.<ext>
-                                //   直链 → HEAD Content-Length
-                                // 探测结果写 real_size + direct_url + probed_upload_time；
-                                // 之后列举时 upload_time 不变 → 不再重复探测。
-                                // 探测失败仍降级用声明值+余量，不阻塞列举。
-                                ProbeRealSizes(identity.FileId, remoteItems);
-
-                                items = EnrichFolderTimes(cache, identity.DiskId, cache.ListCachedItems(identity.DiskId, identity.FileId));
-                                SetMem(nodeKey, items);
-                            }
-                        }
-                        catch (Exception error) when (forceRefresh
-                            && cache.IsFolderCached(identity.DiskId, identity.FileId, TimeSpan.MaxValue))
-                        {
-                            // A failed refresh must not turn an existing local directory into
-                            // an error or interpret a login/error page as an empty snapshot.
-                            Log?.Invoke($"[REFRESH] 云端查询未成功，保留已有列表 folder={nodeKey}: {error.Message}");
-                            cacheHit = false;
-                            items = EnrichFolderTimes(cache, identity.DiskId,
-                                cache.ListCachedItems(identity.DiskId, identity.FileId));
-                            SetMem(nodeKey, items);
-                        }
-                        finally
-                        {
-                            ListThrottle.Release();
-                        }
+                        ListThrottle.Release();
                     }
 
                     // Memory cache can predate enumeration of a child folder. Refresh folder
@@ -1375,6 +1477,16 @@ public static class Callbacks
                         return (phs, ids);
                     });
                     ReconcileExistingPlaceholderTimes(localDir, items);
+                    RefreshKeptDirectoryPaths(cache, identity.DiskId, identity.FileId, localDir,
+                        cache.ListCachedItems(identity.DiskId, identity.FileId)
+                            .Select(item => new Net.YuWangItem
+                            {
+                                Type = item.isFolder ? 'D' : 'F',
+                                Id = item.id,
+                                Name = item.name,
+                                Size = item.size,
+                                UploadTime = item.uploadTime,
+                            }).ToList());
                     if (built && DiagAllowed(nodeKey))
                         Log?.Invoke($"[DEBUG] 占位已准备 folder={nodeKey} count={count}");
                 }
@@ -1453,7 +1565,8 @@ public static class Callbacks
             // Re-enabling population immediately after each enumeration makes an open
             // Explorer folder enumerate again, creating a one-second refresh loop.
             // Keep the initial startup arm short, then honor the configured refresh cadence.
-            _directoryRefresh?.Schedule(identity, populatedDir);
+            if (Cache?.IsDirectoryRefreshKept(UserKey, identity.DiskId, identity.FileId) == true)
+                _directoryRefresh?.Schedule(identity, populatedDir);
             var nodeKey = new NodeKey(identity);
             var firstTime = PopulatedFolders.TryAdd(nodeKey, (int)totalCount);
             PopulatedFolders[nodeKey] = (int)totalCount;
@@ -1946,12 +2059,8 @@ public static class Callbacks
     /// </summary>
     public static bool DisablePopulationAfterPopulate { get; set; } = true;
 
-    /// <summary>
-    /// 目录缓存与自动刷新共用的周期（来自 appsettings 的 FolderCacheMinutes）。
-    /// 首次填充与后台预拉取基于 SQLite last_listed 复用缓存；重新开启后的目录枚举会绕过缓存查询云端。
-    /// 取值由 Program 归一化到 **1~120 分钟**（无效值 ≤0 或 &gt;120 重置为 30）。
-    /// </summary>
-    public static TimeSpan FolderCache { get; set; } = TimeSpan.FromMinutes(30);
+    /// <summary>按当前账户设置的保持目录刷新频率。</summary>
+    public static TimeSpan DirectoryRefreshInterval { get; set; } = TimeSpan.FromMinutes(5);
 
     /// <summary>已从 Range 响应记录真实大小的文件（避免每个 FETCH_DATA 分片重复写 SQLite）。</summary>
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<ulong, long> RealSizeRecorded = new();

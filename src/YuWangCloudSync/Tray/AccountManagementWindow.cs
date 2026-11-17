@@ -287,7 +287,8 @@ internal sealed class AccountManagementWindow : Window
                 var existing = _accounts.FirstOrDefault(account =>
                     account.Username.Equals(name, StringComparison.OrdinalIgnoreCase));
                 if (existing is null)
-                    _accounts.Add(new AccountCredential { Username = name, ProtectedPassword = protectedPassword });
+                    _accounts.Add(new AccountCredential { Username = name, ProtectedPassword = protectedPassword,
+                        DirectoryRefreshIntervalMinutes = 5 });
                 else
                     existing.ProtectedPassword = protectedPassword;
                 _selectedAccount = name;
@@ -395,6 +396,7 @@ internal sealed class AccountManagementWindow : Window
     {
         Username = account.Username,
         ProtectedPassword = account.ProtectedPassword,
+        DirectoryRefreshIntervalMinutes = account.DirectoryRefreshIntervalMinutes,
     };
 
     private static async Task<BitmapImage> CreateCaptchaImageAsync(byte[] imageBytes)

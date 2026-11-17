@@ -110,6 +110,22 @@ public sealed class SqliteCache : IDisposable
                 probed_at INTEGER NOT NULL,
                 PRIMARY KEY (user_key, disk_id, folder_id)
             );
+            CREATE TABLE IF NOT EXISTS full_prefetch_state (
+                user_key TEXT PRIMARY KEY,
+                completed_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS kept_directory_refreshes (
+                user_key TEXT NOT NULL,
+                disk_id INTEGER NOT NULL,
+                folder_id INTEGER NOT NULL,
+                local_path TEXT NOT NULL,
+                name TEXT NOT NULL,
+                PRIMARY KEY(user_key, disk_id, folder_id)
+            );
+            CREATE TABLE IF NOT EXISTS directory_refresh_settings (
+                user_key TEXT PRIMARY KEY,
+                interval_minutes INTEGER NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS writeback_receipts (
                 user_key TEXT NOT NULL, local_path TEXT NOT NULL COLLATE NOCASE,
                 content_hash TEXT NOT NULL, disk_id INTEGER NOT NULL, folder_id INTEGER NOT NULL,
@@ -651,6 +667,19 @@ public sealed class SqliteCache : IDisposable
         }
     }
 
+    public ulong GetFolderParentId(ulong diskId, ulong folderId)
+    {
+        lock (_sync)
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = "SELECT parent_folder_id FROM folders WHERE disk_id=@disk AND folder_id=@folder";
+            cmd.Parameters.AddWithValue("@disk", (long)diskId);
+            cmd.Parameters.AddWithValue("@folder", (long)folderId);
+            var value = cmd.ExecuteScalar();
+            return value is long parent && parent >= 0 ? (ulong)parent : 0;
+        }
+    }
+
     public void SetFolderLocalPath(ulong diskId, ulong folderId, string localPath)
     {
         lock (_sync)
@@ -686,6 +715,180 @@ public sealed class SqliteCache : IDisposable
             return DateTimeOffset.UtcNow - lastListed < maxAge;
         }
         return false;
+        }
+    }
+
+    public (long folders, long files) GetPersistedListingCounts(string userKey)
+    {
+        lock (_sync)
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = """
+                SELECT
+                    (SELECT COUNT(*) FROM folders WHERE disk_id IN
+                        (SELECT node_id FROM disk_tree WHERE user_key=@uk AND node_type='disk')),
+                    (SELECT COUNT(*) FROM files WHERE disk_id IN
+                        (SELECT node_id FROM disk_tree WHERE user_key=@uk AND node_type='disk'))
+                """;
+            cmd.Parameters.AddWithValue("@uk", userKey ?? "");
+            using var reader = cmd.ExecuteReader();
+            return reader.Read() ? (reader.GetInt64(0), reader.GetInt64(1)) : (0, 0);
+        }
+    }
+
+    public bool HasFolder(ulong diskId, ulong folderId)
+    {
+        lock (_sync)
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = "SELECT 1 FROM folders WHERE disk_id=@disk AND folder_id=@folder LIMIT 1";
+            cmd.Parameters.AddWithValue("@disk", (long)diskId);
+            cmd.Parameters.AddWithValue("@folder", (long)folderId);
+            return cmd.ExecuteScalar() is long;
+        }
+    }
+
+    public bool HasCompletedFullPrefetch(string userKey)
+    {
+        lock (_sync)
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = "SELECT 1 FROM full_prefetch_state WHERE user_key=@uk LIMIT 1";
+            cmd.Parameters.AddWithValue("@uk", userKey ?? "");
+            return cmd.ExecuteScalar() is long;
+        }
+    }
+
+    public void MarkFullPrefetchCompleted(string userKey)
+    {
+        lock (_sync)
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = """
+                INSERT INTO full_prefetch_state(user_key, completed_at) VALUES(@uk, @at)
+                ON CONFLICT(user_key) DO UPDATE SET completed_at=excluded.completed_at;
+                """;
+            cmd.Parameters.AddWithValue("@uk", userKey ?? "");
+            cmd.Parameters.AddWithValue("@at", DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+            cmd.ExecuteNonQuery();
+        }
+    }
+
+    public int GetDirectoryRefreshIntervalMinutes(string userKey, int fallback = 5)
+    {
+        lock (_sync)
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = "SELECT interval_minutes FROM directory_refresh_settings WHERE user_key=@uk";
+            cmd.Parameters.AddWithValue("@uk", userKey ?? "");
+            var value = cmd.ExecuteScalar();
+            return value is long minutes && minutes is >= 1 and <= 60 ? (int)minutes : Math.Clamp(fallback, 1, 60);
+        }
+    }
+
+    public void SetDirectoryRefreshIntervalMinutes(string userKey, int minutes)
+    {
+        minutes = Math.Clamp(minutes, 1, 60);
+        lock (_sync)
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = """
+                INSERT INTO directory_refresh_settings(user_key, interval_minutes) VALUES(@uk, @minutes)
+                ON CONFLICT(user_key) DO UPDATE SET interval_minutes=excluded.interval_minutes;
+                """;
+            cmd.Parameters.AddWithValue("@uk", userKey ?? "");
+            cmd.Parameters.AddWithValue("@minutes", minutes);
+            cmd.ExecuteNonQuery();
+        }
+    }
+
+    public List<(ulong diskId, ulong folderId, string path, string name)> ListKeptDirectoryRefreshes(string userKey)
+    {
+        lock (_sync)
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = "SELECT disk_id, folder_id, local_path, name FROM kept_directory_refreshes WHERE user_key=@uk ORDER BY local_path";
+            cmd.Parameters.AddWithValue("@uk", userKey ?? "");
+            using var reader = cmd.ExecuteReader();
+            var result = new List<(ulong, ulong, string, string)>();
+            while (reader.Read())
+                result.Add(((ulong)reader.GetInt64(0), (ulong)reader.GetInt64(1), reader.GetString(2), reader.GetString(3)));
+            return result;
+        }
+    }
+
+    public bool IsDirectoryRefreshKept(string userKey, ulong diskId, ulong folderId)
+    {
+        lock (_sync)
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = "SELECT 1 FROM kept_directory_refreshes WHERE user_key=@uk AND disk_id=@disk AND folder_id=@folder LIMIT 1";
+            cmd.Parameters.AddWithValue("@uk", userKey ?? "");
+            cmd.Parameters.AddWithValue("@disk", (long)diskId);
+            cmd.Parameters.AddWithValue("@folder", (long)folderId);
+            return cmd.ExecuteScalar() is long;
+        }
+    }
+
+    public void SetDirectoryRefreshKept(string userKey, ulong diskId, ulong folderId,
+        string path, string name, bool kept)
+    {
+        lock (_sync)
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.Parameters.AddWithValue("@uk", userKey ?? "");
+            cmd.Parameters.AddWithValue("@disk", (long)diskId);
+            cmd.Parameters.AddWithValue("@folder", (long)folderId);
+            if (kept)
+            {
+                cmd.CommandText = """
+                    INSERT INTO kept_directory_refreshes(user_key, disk_id, folder_id, local_path, name)
+                    VALUES(@uk, @disk, @folder, @path, @name)
+                    ON CONFLICT(user_key, disk_id, folder_id) DO UPDATE SET
+                        local_path=excluded.local_path, name=excluded.name;
+                    """;
+                cmd.Parameters.AddWithValue("@path", path);
+                cmd.Parameters.AddWithValue("@name", name);
+            }
+            else
+            {
+                cmd.CommandText = "DELETE FROM kept_directory_refreshes WHERE user_key=@uk AND disk_id=@disk AND folder_id=@folder";
+            }
+            cmd.ExecuteNonQuery();
+        }
+    }
+
+    public void RebindKeptDirectoryRefreshPaths(string userKey)
+    {
+        lock (_sync)
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = """
+                UPDATE kept_directory_refreshes
+                SET local_path=(SELECT folders.local_path FROM folders
+                    WHERE folders.disk_id=kept_directory_refreshes.disk_id
+                      AND folders.folder_id=kept_directory_refreshes.folder_id),
+                    name=(SELECT folders.name FROM folders
+                    WHERE folders.disk_id=kept_directory_refreshes.disk_id
+                      AND folders.folder_id=kept_directory_refreshes.folder_id)
+                WHERE user_key=@uk AND EXISTS(SELECT 1 FROM folders
+                    WHERE folders.disk_id=kept_directory_refreshes.disk_id
+                      AND folders.folder_id=kept_directory_refreshes.folder_id
+                      AND folders.local_path IS NOT NULL AND folders.local_path <> '');
+                """;
+            cmd.Parameters.AddWithValue("@uk", userKey ?? "");
+            cmd.ExecuteNonQuery();
+        }
+    }
+
+    public void ClearFullPrefetchCompleted(string userKey)
+    {
+        lock (_sync)
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = "DELETE FROM full_prefetch_state WHERE user_key=@uk";
+            cmd.Parameters.AddWithValue("@uk", userKey ?? "");
+            cmd.ExecuteNonQuery();
         }
     }
 
@@ -1003,12 +1206,19 @@ public sealed class SqliteCache : IDisposable
         }
     }
 
-    public List<(FileIdentity identity, string path)> ListKnownFolderPaths()
+    public List<(FileIdentity identity, string path)> ListKnownFolderPaths(string userKey)
     {
         lock (_sync)
         {
             using var cmd = _conn.CreateCommand();
-            cmd.CommandText = "SELECT disk_id, parent_folder_id, folder_id, local_path FROM folders WHERE local_path IS NOT NULL AND local_path <> ''";
+            cmd.CommandText = """
+                SELECT disk_id, parent_folder_id, folder_id, local_path
+                FROM folders
+                WHERE local_path IS NOT NULL AND local_path <> ''
+                  AND disk_id IN (SELECT node_id FROM disk_tree
+                                  WHERE user_key=@uk AND node_type='disk')
+                """;
+            cmd.Parameters.AddWithValue("@uk", userKey ?? "");
             using var reader = cmd.ExecuteReader();
             var result = new List<(FileIdentity, string)>();
             while (reader.Read())
@@ -1081,7 +1291,7 @@ public sealed class SqliteCache : IDisposable
             {
                 using var cmd = _conn.CreateCommand();
                 cmd.Transaction = tx;
-                cmd.CommandText = "DELETE FROM files; DELETE FROM folders;";
+                cmd.CommandText = "DELETE FROM files; DELETE FROM folders; DELETE FROM full_prefetch_state;";
                 cmd.ExecuteNonQuery();
                 tx.Commit();
             }

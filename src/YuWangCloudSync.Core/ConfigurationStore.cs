@@ -33,22 +33,10 @@ public static class ConfigurationStore
         if (hasLegacyProviderName) config.ProviderName = ProductIdentity.SyncRootDefaultName;
         var hasProviderVersionSetting = ContainsProperty(document, "ProviderVersion");
         var hasProtectedAccountNames = ReadBooleanProperty(document, "AccountNamesProtected");
-        var hasUnifiedCache = ContainsProperty(document, "FolderCacheMinutes");
         var hasAccounts = ContainsProperty(document, "Accounts");
-        var hasLegacyCache = ContainsProperty(document, "FolderListCacheMinutes")
+        var hasRemovedFolderRefreshSettings = ContainsProperty(document, "FolderCacheMinutes")
+            || ContainsProperty(document, "FolderListCacheMinutes")
             || ContainsProperty(document, "FolderRefreshCacheMinutes");
-        if (!hasUnifiedCache && hasLegacyCache)
-        {
-            // Preserve the former effective freshness window (both gates had to expire).
-            // If a legacy file omitted one field, use the old model default for that field.
-            var hasLegacyList = ContainsProperty(document, "FolderListCacheMinutes");
-            var hasLegacyRefresh = ContainsProperty(document, "FolderRefreshCacheMinutes");
-            var listMinutes = ReadIntProperty(document, "FolderListCacheMinutes") ?? (hasLegacyList ? 0 : 10);
-            var refreshMinutes = ReadIntProperty(document, "FolderRefreshCacheMinutes") ?? (hasLegacyRefresh ? 0 : 60);
-            config.FolderCacheMinutes = Math.Max(
-                NormalizeLegacyCacheMinutes(listMinutes),
-                NormalizeLegacyCacheMinutes(refreshMinutes));
-        }
         var passwordKey = document.Select(entry => entry.Key)
             .FirstOrDefault(key => key.Equals("Password", StringComparison.OrdinalIgnoreCase));
         var plaintext = passwordKey == null ? "" : document[passwordKey]?.GetValue<string>() ?? "";
@@ -104,7 +92,7 @@ public static class ConfigurationStore
         }
 
         if (migrate && (!string.Equals(source, targetPath, StringComparison.OrdinalIgnoreCase)
-                        || passwordKey != null || hasLegacyCache || !hasAccounts
+                        || passwordKey != null || hasRemovedFolderRefreshSettings || !hasAccounts
                         || hasProviderVersionSetting || hasLegacyProviderName || !hasProtectedAccountNames))
         {
             if (activeCredential is not null && string.IsNullOrWhiteSpace(activeCredential.ProtectedPassword))
@@ -169,19 +157,6 @@ public static class ConfigurationStore
 
         document[key] = DpapiSecret.Protect(username);
     }
-
-    private static int? ReadIntProperty(JsonObject document, string name)
-    {
-        foreach (var entry in document)
-            if (entry.Key.Equals(name, StringComparison.OrdinalIgnoreCase)
-                && entry.Value is JsonValue value
-                && value.TryGetValue<int>(out var result))
-                return result;
-        return null;
-    }
-
-    private static int NormalizeLegacyCacheMinutes(int minutes) =>
-        minutes is >= 1 and <= 120 ? minutes : 30;
 
     public static void Save(SyncRootContext config, string? configurationPath = null)
     {

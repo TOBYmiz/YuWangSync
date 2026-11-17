@@ -34,7 +34,7 @@ internal sealed class SettingsWindow : Window
         MinWidth = 0,
     };
     private readonly TextBox _path = new() { Name = "SyncRootPathTextBox", Height = SettingsTextBoxHeight };
-    private readonly TextBox _folderCache = NewMinutesInput(30, "FolderCacheTextBox");
+    private readonly TextBox _directoryRefreshInterval = NewMinutesInput(5, "DirectoryRefreshIntervalTextBox");
     private readonly CheckBox _automaticFileCacheCleanup = new()
     {
         Name = "AutomaticFileCacheCleanupCheckBox",
@@ -109,6 +109,7 @@ internal sealed class SettingsWindow : Window
     internal event Action<SyncRootContext, bool>? ApplyRequested;
     internal event Action<SyncRootContext>? AccountSwitchRequested;
     internal event Action<SettingsWindow>? AccountManagementRequested;
+    internal event Action<SettingsWindow>? DirectoryRefreshManagementRequested;
     internal SyncRootContext AccountSource => _source;
     internal bool IsClosed => _isClosed;
     internal string? SelectedAccountName => (_accountSelector.SelectedItem as ComboBoxItem)?.Tag as string;
@@ -118,6 +119,7 @@ internal sealed class SettingsWindow : Window
         {
             Username = account.Username,
             ProtectedPassword = account.ProtectedPassword,
+            DirectoryRefreshIntervalMinutes = account.DirectoryRefreshIntervalMinutes,
         }).ToList();
 
     internal void UpdateAccountsFromManager(IReadOnlyList<AccountCredential> accounts, string? selectedAccount)
@@ -130,6 +132,7 @@ internal sealed class SettingsWindow : Window
             {
                 Username = account.Username,
                 ProtectedPassword = account.ProtectedPassword,
+                DirectoryRefreshIntervalMinutes = account.DirectoryRefreshIntervalMinutes,
             }));
         _accountSelector.Items.Clear();
         foreach (var account in _accounts)
@@ -148,14 +151,16 @@ internal sealed class SettingsWindow : Window
             .Select(account => new AccountCredential
             {
                 Username = account.Username,
-                ProtectedPassword = account.ProtectedPassword
+                ProtectedPassword = account.ProtectedPassword,
+                DirectoryRefreshIntervalMinutes = account.DirectoryRefreshIntervalMinutes
             }));
         if (_accounts.Count == 0 && !string.IsNullOrWhiteSpace(snapshot.Username))
             _accounts.Add(new AccountCredential
             {
                 Username = snapshot.Username,
                 ProtectedPassword = string.IsNullOrWhiteSpace(snapshot.ProtectedPassword)
-                    ? DpapiSecret.Protect(snapshot.Password) : snapshot.ProtectedPassword
+                    ? DpapiSecret.Protect(snapshot.Password) : snapshot.ProtectedPassword,
+                DirectoryRefreshIntervalMinutes = 5
             });
         Title = $"{ProductIdentity.DisplayNameZh} - 设置";
 
@@ -186,17 +191,20 @@ internal sealed class SettingsWindow : Window
         Add(pathGrid, NewNote("请选择空目录，更换后旧目录会被清理。"), 1, 0, 2);
         AddCard(content, "挂载位置", pathGrid);
 
-        var cacheGrid = NewGrid(RowHeight, 0, 0, RowHeight);
+        var cacheGrid = NewGrid(RowHeight, 0, RowHeight, 0, RowHeight);
         cacheGrid.ColumnDefinitions[0].Width = new GridLength(LabelColumnWidth * 1.1);
-        Add(cacheGrid, NewLabel("目录缓存与自动刷新周期（分钟）"), 0, 0);
-        Add(cacheGrid, MinutesInputRow(_folderCache), 0, 1);
-        Add(cacheGrid, NewNote("到期后后台更新，重进目录联网刷新，不影响手动刷新。"), 1, 0, 2);
-        Add(cacheGrid, NewNote("有效值 1—120 分钟。"), 2, 0, 2);
+        Add(cacheGrid, NewLabel("保持目录刷新频率（分钟）"), 0, 0);
+        Add(cacheGrid, MinutesInputRow(_directoryRefreshInterval, 1, 60), 0, 1);
+        Add(cacheGrid, NewNote("仅对标记为保持刷新的目录生效；普通目录进入时直接拉取云端。"), 1, 0, 2);
+        var manageKeptDirectories = new Button { Name = "ManageKeptDirectoriesButton", Content = "管理保持更新的目录", MinWidth = 150 };
+        manageKeptDirectories.Click += (_, _) => DirectoryRefreshManagementRequested?.Invoke(this);
+        Add(cacheGrid, manageKeptDirectories, 2, 1);
+        Add(cacheGrid, NewNote("有效值 1—60 分钟，默认 5 分钟。"), 3, 0, 2);
         _automaticFileCacheCleanup.Content = "自动清理文件缓存";
         foreach (var (text, hours) in new[] { ("每 8 小时", 8), ("每 12 小时", 12), ("每天", 24), ("每 7 天", 168) })
             _fileCacheCleanupInterval.Items.Add(new ComboBoxItem { Content = text, Tag = hours });
-        Add(cacheGrid, _automaticFileCacheCleanup, 3, 0);
-        Add(cacheGrid, _fileCacheCleanupInterval, 3, 1);
+        Add(cacheGrid, _automaticFileCacheCleanup, 4, 0);
+        Add(cacheGrid, _fileCacheCleanupInterval, 4, 1);
         AddCard(content, "缓存与刷新", cacheGrid);
 
         _persist.Content = "退出后保留同步目录";
@@ -268,7 +276,7 @@ internal sealed class SettingsWindow : Window
             .FirstOrDefault(item => string.Equals(item.Tag as string, activeAccount,
                 StringComparison.OrdinalIgnoreCase))
             ?? _accountSelector.Items.FirstOrDefault();
-        _folderCache.Text = ClampMinutes(snapshot.FolderCacheMinutes).ToString();
+        UpdateDirectoryRefreshIntervalText();
         _automaticFileCacheCleanup.IsChecked = snapshot.AutomaticFileCacheCleanup;
         _fileCacheCleanupInterval.SelectedItem = _fileCacheCleanupInterval.Items.OfType<ComboBoxItem>()
             .First(item => (int)item.Tag == SyncRootContext.NormalizeFileCacheCleanupHours(snapshot.FileCacheCleanupHours));
@@ -301,7 +309,7 @@ internal sealed class SettingsWindow : Window
         TextAlignment = TextAlignment.Center,
     };
 
-    private static StackPanel MinutesInputRow(TextBox input)
+    private static StackPanel MinutesInputRow(TextBox input, int minimum = 1, int maximum = 120)
     {
         var row = new StackPanel
         {
@@ -312,18 +320,18 @@ internal sealed class SettingsWindow : Window
         };
         var decrement = new Button { Content = "−", MinWidth = 32 };
         var increment = new Button { Content = "+", MinWidth = 32 };
-        decrement.Click += (_, _) => ChangeMinutes(input, -1);
-        increment.Click += (_, _) => ChangeMinutes(input, 1);
+        decrement.Click += (_, _) => ChangeMinutes(input, -1, minimum, maximum);
+        increment.Click += (_, _) => ChangeMinutes(input, 1, minimum, maximum);
         row.Children.Add(decrement);
         row.Children.Add(input);
         row.Children.Add(increment);
         return row;
     }
 
-    private static void ChangeMinutes(TextBox input, int delta)
+    private static void ChangeMinutes(TextBox input, int delta, int minimum = 1, int maximum = 120)
     {
         var current = int.TryParse(input.Text, out var value) ? value : 1;
-        input.Text = Math.Clamp(current + delta, 1, 120).ToString();
+        input.Text = Math.Clamp(current + delta, minimum, maximum).ToString();
     }
 
     private static Grid NewGrid(params double[] rowHeights)
@@ -667,7 +675,7 @@ internal sealed class SettingsWindow : Window
         if (pathError is not null) return pathError;
         if (path is null) return null;
 
-        var validationError = ValidateEditableValues(out var cacheMinutes, out var containerTypeId);
+        var validationError = ValidateEditableValues(out var refreshMinutes, out var containerTypeId);
         if (validationError is not null) return validationError;
 
         var providerName = _providerName.Text.Trim();
@@ -677,6 +685,7 @@ internal sealed class SettingsWindow : Window
         var selectedCredential = _accounts.FirstOrDefault(account =>
             account.Username.Equals(selectedAccount, StringComparison.OrdinalIgnoreCase));
         if (selectedCredential is null) return "账户凭据不存在。";
+        selectedCredential.DirectoryRefreshIntervalMinutes = refreshMinutes;
         string password;
         try
         {
@@ -696,6 +705,7 @@ internal sealed class SettingsWindow : Window
             {
                 Username = account.Username,
                 ProtectedPassword = account.ProtectedPassword,
+                DirectoryRefreshIntervalMinutes = account.DirectoryRefreshIntervalMinutes,
             }).ToList(),
             Password = password,
             RootDiskId = _source.RootDiskId,
@@ -710,7 +720,6 @@ internal sealed class SettingsWindow : Window
             HttpRequestTimeoutSeconds = _source.HttpRequestTimeoutSeconds,
             DownloadTimeoutMinutes = _source.DownloadTimeoutMinutes,
             LegacySyncRootPaths = _source.LegacySyncRootPaths,
-            FolderCacheMinutes = cacheMinutes,
             AutomaticFileCacheCleanup = _automaticFileCacheCleanup.IsChecked == true,
             FileCacheCleanupHours = (_fileCacheCleanupInterval.SelectedItem as ComboBoxItem)?.Tag as int? ?? 24,
             PersistSyncRoot = _persist.IsChecked == true,
@@ -721,12 +730,12 @@ internal sealed class SettingsWindow : Window
         return null;
     }
 
-    private string? ValidateEditableValues(out int cacheMinutes, out ulong containerTypeId)
+    private string? ValidateEditableValues(out int refreshMinutes, out ulong containerTypeId)
     {
-        cacheMinutes = int.TryParse(_folderCache.Text, out var cacheValue) ? cacheValue : 0;
+        refreshMinutes = int.TryParse(_directoryRefreshInterval.Text, out var refreshValue) ? refreshValue : 0;
         containerTypeId = 0;
-        if (cacheMinutes is < 1 or > 120)
-            return "缓存有效期必须在 1—120 分钟之间。";
+        if (refreshMinutes is < 1 or > 60)
+            return "保持目录刷新频率必须在 1—60 分钟之间。";
         if (!ulong.TryParse(_containerTypeId.Text.Trim(), out containerTypeId))
             return "磁盘树入口容器 TypeId 必须是整数。";
         return null;
@@ -735,7 +744,7 @@ internal sealed class SettingsWindow : Window
     internal bool ValidateForSelfTest()
     {
         var originalTypeId = _containerTypeId.Text;
-        var originalFolderCache = _folderCache.Text;
+        var originalRefreshInterval = _directoryRefreshInterval.Text;
         try
         {
             _containerTypeId.Text = "not-an-id";
@@ -743,13 +752,13 @@ internal sealed class SettingsWindow : Window
             _containerTypeId.Text = "0";
             if (ValidateEditableValues(out _, out var zeroTypeId) is not null || zeroTypeId != 0) return false;
             _containerTypeId.Text = originalTypeId;
-            _folderCache.Text = "0";
-            return ValidateEditableValues(out _, out _) == "缓存有效期必须在 1—120 分钟之间。";
+            _directoryRefreshInterval.Text = "0";
+            return ValidateEditableValues(out _, out _) == "保持目录刷新频率必须在 1—60 分钟之间。";
         }
         finally
         {
             _containerTypeId.Text = originalTypeId;
-            _folderCache.Text = originalFolderCache;
+            _directoryRefreshInterval.Text = originalRefreshInterval;
         }
     }
 
@@ -1030,9 +1039,13 @@ internal sealed class SettingsWindow : Window
 
     private void WireDirty()
     {
-        _accountSelector.SelectionChanged += (_, _) => MarkDirty();
+        _accountSelector.SelectionChanged += (_, _) =>
+        {
+            UpdateDirectoryRefreshIntervalText();
+            MarkDirty();
+        };
         _path.TextChanged += (_, _) => MarkDirty();
-        _folderCache.TextChanged += (_, _) => MarkDirty();
+        _directoryRefreshInterval.TextChanged += (_, _) => MarkDirty();
         _automaticFileCacheCleanup.Checked += (_, _) => UpdateFileCacheCleanupEnabled();
         _automaticFileCacheCleanup.Unchecked += (_, _) => UpdateFileCacheCleanupEnabled();
         _fileCacheCleanupInterval.SelectionChanged += (_, _) => MarkDirty();
@@ -1061,5 +1074,11 @@ internal sealed class SettingsWindow : Window
             SetApplyVisualState(ApplyVisualState.Normal);
     }
 
-    private static int ClampMinutes(int value) => Math.Clamp(value, 1, 120);
+    private void UpdateDirectoryRefreshIntervalText()
+    {
+        var selected = (_accountSelector.SelectedItem as ComboBoxItem)?.Tag as string;
+        var account = _accounts.FirstOrDefault(item =>
+            item.Username.Equals(selected, StringComparison.OrdinalIgnoreCase));
+        _directoryRefreshInterval.Text = Math.Clamp(account?.DirectoryRefreshIntervalMinutes ?? 5, 1, 60).ToString();
+    }
 }

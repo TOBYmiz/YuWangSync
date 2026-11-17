@@ -56,6 +56,7 @@ internal static class WinUiUiHost
     private static AboutWindow? _about;
     private static CaptchaWindow? _captcha;
     private static CacheCleanupConfirmationWindow? _cacheCleanupConfirmation;
+    private static KeptDirectoriesWindow? _keptDirectories;
     private static int _uiThreadId;
 
     internal static bool IsReady => Ready.IsSet && _dispatcher is not null;
@@ -239,12 +240,31 @@ internal static class WinUiUiHost
             ApplySettingsInBackground(window, edit, closeOnSuccess);
         window.AccountSwitchRequested += Program.RequestAccountSwitch;
         window.AccountManagementRequested += ShowAccountManagementOnUi;
+        window.DirectoryRefreshManagementRequested += ShowKeptDirectoriesOnUi;
         window.Closed += (_, _) =>
         {
             if (ReferenceEquals(_settings, window)) _settings = null;
         };
         if (activate) window.Activate();
         return window;
+    }
+
+    private static void ShowKeptDirectoriesOnUi(SettingsWindow owner)
+    {
+        if (!ReferenceEquals(_settings, owner) || owner.IsClosed) return;
+        if (_keptDirectories is not null)
+        {
+            ActivateWindow(_keptDirectories);
+            return;
+        }
+        var window = new KeptDirectoriesWindow(Program.GetKeptDirectoryRefreshes(), Program.RemoveKeptDirectoryRefresh);
+        _keptDirectories = window;
+        window.Closed += (_, _) =>
+        {
+            if (ReferenceEquals(_keptDirectories, window)) _keptDirectories = null;
+            if (!owner.IsClosed) ActivateWindow(owner);
+        };
+        window.Activate();
     }
 
     private static void ShowAccountManagementOnUi(SettingsWindow owner)
@@ -340,12 +360,14 @@ internal static class WinUiUiHost
     internal static void CloseAllOnUiThread()
     {
         try { _accountManager?.Close(); } catch { }
+        try { _keptDirectories?.Close(); } catch { }
         try { _settings?.Close(); } catch { }
         try { _about?.Close(); } catch { }
         try { _captcha?.Close(); } catch { }
         try { _cacheCleanupConfirmation?.Close(); } catch { }
         _settings = null;
         _accountManager = null;
+        _keptDirectories = null;
         _about = null;
         _captcha = null;
         _cacheCleanupConfirmation = null;

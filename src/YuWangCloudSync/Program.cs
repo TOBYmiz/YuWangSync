@@ -22,6 +22,7 @@ namespace YuWangCloudSync;
 [SupportedOSPlatform("windows")]
 internal static class Program
 {
+    internal sealed record KeptDirectoryRefreshInfo(ulong DiskId, ulong FolderId, string Path, string Name);
     private static SyncRootContext _ctx = new();
     private static YuWangClient? _client;
     private static SqliteCache? _cache;
@@ -33,8 +34,48 @@ internal static class Program
     private static FileCacheCleanupService? _fileCacheCleanup;
     private static readonly SemaphoreSlim _preFetchGate = new(1, 1);
     private static readonly CancellationTokenSource _cts = new();
+    private static readonly object _prefetchRunLock = new();
+    private static PrefetchRun? _activePrefetchRun;
     private static int _manualRefreshQueued;
     internal static CancellationToken ApplicationCancellationToken => _cts.Token;
+
+    private sealed class PrefetchRun(string userKey, bool manual)
+    {
+        private int _manual = manual ? 1 : 0;
+        private Action<int?>? _progressReporter;
+        private int _progress;
+        private long _completedItems;
+        private long _estimatedItems;
+
+        public string UserKey { get; } = userKey;
+        public bool IsManual => Volatile.Read(ref _manual) != 0;
+
+        public void AttachManualProgressReporter(Action<int?> reporter)
+        {
+            Volatile.Write(ref _manual, 1);
+            Volatile.Write(ref _progressReporter, reporter);
+            reporter(Volatile.Read(ref _progress));
+        }
+
+        public void UpdateProgress(long completedItems, long estimatedItems, bool completed = false)
+        {
+            Volatile.Write(ref _completedItems, completedItems);
+            Volatile.Write(ref _estimatedItems, estimatedItems);
+            var percentage = completed ? 100 : completedItems <= 0
+                ? 0
+                : (int)Math.Clamp(Math.Max(1, completedItems * 100 / Math.Max(1, estimatedItems)), 1, 99);
+            percentage = Math.Max(percentage, Volatile.Read(ref _progress));
+            Volatile.Write(ref _progress, percentage);
+            if (Volatile.Read(ref _progressReporter) is { } reporter)
+                reporter(percentage);
+        }
+
+        public void PublishCurrentProgress()
+            => UpdateProgress(Volatile.Read(ref _completedItems), Volatile.Read(ref _estimatedItems));
+
+        public void ClearManualProgressReporter()
+            => Interlocked.Exchange(ref _progressReporter, null)?.Invoke(null);
+    }
 
     // ============== 控制台控制事件（关闭窗口 / 停止进程 / 注销 / 关机）==============
     // 仅 Console.CancelKeyPress 只能捕获 Ctrl+C / Ctrl+Break；点击控制台窗口右上角 X、
@@ -776,7 +817,7 @@ internal static class Program
         if (!EnsureSingleInstance(_openFolder, _accountSwitchRestart))
             return;
 
-        _ = InstanceControl.ListenAsync(RequestShutdownFromUi, _cts.Token);
+        _ = InstanceControl.ListenAsync(HandleInstanceControlCommand, RequestShutdownFromUi, _cts.Token);
 
         Log.Information("{ProductName} 启动 - SyncRoot={Path} 模式={Mode}",
             ProductIdentity.DisplayNameZh,
@@ -886,6 +927,14 @@ internal static class Program
         _ctx.FileCacheCleanupHours = SyncRootContext.NormalizeFileCacheCleanupHours(_ctx.FileCacheCleanupHours);
         _fileCacheCleanup?.Configure(_ctx.AutomaticFileCacheCleanup, _ctx.FileCacheCleanupHours);
         Callbacks.UserKey = CurrentUserKey();
+        foreach (var account in _ctx.Accounts ?? [])
+        {
+            var accountKey = AccountUserKey(account.Username);
+            account.DirectoryRefreshIntervalMinutes = _cache.GetDirectoryRefreshIntervalMinutes(
+                accountKey, account.DirectoryRefreshIntervalMinutes);
+            _cache.SetDirectoryRefreshIntervalMinutes(accountKey, account.DirectoryRefreshIntervalMinutes);
+        }
+        _cache.RebindKeptDirectoryRefreshPaths(CurrentUserKey());
         // 统一设置 SyncRootPath（关键修复）：
         // SyncRootPath 仅在 SyncRootRegistrar.Register 内设置（CloudFilesBridge.cs line 67），
         // 但常驻复用路径（reused=true）跳过 Register → SyncRootPath 仍是默认 Environment.CurrentDirectory
@@ -899,15 +948,13 @@ internal static class Program
         Callbacks.DisablePopulationAfterPopulate = true;
         Log.Information("填充后关闭按需填充: true（固定开启）");
 
-        // 3c. 应用统一目录缓存 / 自动刷新周期（IsFolderCached 的过期时间）。
-        //     **无效值重置**：≤0（含 0 / 负数 / 缺失导致的 0）或 >120 分钟 → 重置为 30 分钟并告警。
-        //     保证既不出现"永久不过期"看不到云端变更，也不出现"超长有效期"长期停留在旧内容。
-        _ctx.FolderCacheMinutes = NormalizeCacheMinutes(_ctx.FolderCacheMinutes,
-            nameof(SyncRootContext.FolderCacheMinutes));
-        Callbacks.FolderCache = TimeSpan.FromMinutes(_ctx.FolderCacheMinutes);
-        Log.Information("目录缓存与自动刷新周期: {Minutes}分钟（合法区间 {Min}~{Max}，无效值已重置为 {Default}）",
-            _ctx.FolderCacheMinutes,
-            MinCacheMinutes, MaxCacheMinutes, DefaultCacheMinutes);
+        // 3c. 应用当前账户的保持目录刷新频率。普通目录访问始终查询云端，
+        // 该频率只用于用户明确标记为“保持目录刷新”的目录。
+        var directoryRefreshMinutes = CurrentDirectoryRefreshIntervalMinutes();
+        Callbacks.DirectoryRefreshInterval = TimeSpan.FromMinutes(directoryRefreshMinutes);
+        Log.Information("保持目录刷新频率: {Minutes}分钟（合法区间 {Min}~{Max}，默认 {Default}）",
+            directoryRefreshMinutes, MinDirectoryRefreshMinutes, MaxDirectoryRefreshMinutes,
+            DefaultDirectoryRefreshMinutes);
 
         // 4. 启动期：登录育网云
         //    优先复用上次会话（cookies.json 里的 JSESSIONID），失效才走人工验证码。
@@ -1132,7 +1179,7 @@ internal static class Program
                 // 常驻复用也要刷新磁盘树并对账顶层占位：
                 // 服务器端磁盘树可能变化（改名/增删容器），旧顶层目录（含旧版数字 id 命名残留）
                 // 需清理、缺失的需补建。此刻 Provider 已连接，占位删除可被 cldflt 放行。
-                try { await RefreshDiskTreeAndReconcileAsync(); }
+                try { await ReconcileStartupDiskTreeAsync(); }
                 catch (Exception ex)
                 {
                     Log.Warning(ex, "常驻模式磁盘树刷新/顶层对账失败（忽略，回调枚举时沿用 DB 缓存的磁盘树）");
@@ -1201,7 +1248,7 @@ internal static class Program
             //    此路径目录刚被清空重注册，对账的删除段无事可做，仅建顶层占位。
             try
             {
-                await RefreshDiskTreeAndReconcileAsync();
+                await ReconcileStartupDiskTreeAsync();
             }
             catch (Exception ex)
             {
@@ -1253,7 +1300,7 @@ internal static class Program
         //       现在后台预拉取全部磁盘的目录结构入库（folders.local_path + files），
         //       完成后 ReconcileDirectoryTimes 才有效（对账时 DB 有数据）。
         //       不阻塞主循环：用户可立即用 Explorer 浏览（回调照常，浏览期 self Force 仍工作）。
-        _ = Task.Run(() => PreFetchAllDisksAsync(_cts.Token));
+        _ = Task.Run(RunStartupFolderInitializationAsync);
 
         // 9. 后台线程：session 续期检测
         _ = Task.Run(() => SessionWatcherAsync(_cts.Token));
@@ -1653,29 +1700,25 @@ internal static class Program
     }
 
     /// <summary>账号隔离键。旧版自定义 UserKey 仍作为命名空间前缀。</summary>
-    private static string CurrentUserKey() =>
-        string.IsNullOrWhiteSpace(_ctx.UserKey) ? _ctx.Username : $"{_ctx.UserKey}:{_ctx.Username}";
+    private static string CurrentUserKey() => AccountUserKey(_ctx.Username);
 
-    // === 目录缓存有效期（分钟）取值约束 ===
-    // 合法区间：1 ~ 120 分钟。
-    // 0 / 负数 / 异常值（如超大值、缺失导致的 0）以及 **> 120** 均视为无效配置，
-    // 启动时统一重置为 30 分钟并告警——避免"永久不过期"（0）看不到云端变更，
-    // 也避免"超长有效期"（几百/几千分钟）长时间停留在过期目录内容上。
-    private const int MinCacheMinutes = 1;
-    private const int MaxCacheMinutes = 120;
-    private const int DefaultCacheMinutes = 30;
+    private static string AccountUserKey(string username) =>
+        string.IsNullOrWhiteSpace(_ctx.UserKey) ? username : $"{_ctx.UserKey}:{username}";
 
-    /// <summary>
-    /// 校验并归一化目录缓存有效期配置（分钟）。
-    /// **无效值（≤0 或 &gt;120）在启动时重置为 30 分钟**（同时写 Warning 日志），
-    /// 保证 IsFolderCached 的过期时间永远落在可控区间内。
-    /// </summary>
-    private static int NormalizeCacheMinutes(int minutes, string configName)
+    private const int MinDirectoryRefreshMinutes = 1;
+    private const int MaxDirectoryRefreshMinutes = 60;
+    private const int DefaultDirectoryRefreshMinutes = 5;
+
+    private static int CurrentDirectoryRefreshIntervalMinutes()
     {
-        if (minutes >= MinCacheMinutes && minutes <= MaxCacheMinutes) return minutes;
-        Log.Warning("配置项 {Name}={Value} 无效（合法区间 {Min}~{Max} 分钟），已重置为 {Default} 分钟",
-            configName, minutes, MinCacheMinutes, MaxCacheMinutes, DefaultCacheMinutes);
-        return DefaultCacheMinutes;
+        var account = (_ctx.Accounts ?? []).FirstOrDefault(a =>
+            a.Username.Equals(_ctx.Username, StringComparison.OrdinalIgnoreCase));
+        var minutes = account?.DirectoryRefreshIntervalMinutes ?? DefaultDirectoryRefreshMinutes;
+        if (minutes is >= MinDirectoryRefreshMinutes and <= MaxDirectoryRefreshMinutes)
+            return minutes;
+        Log.Warning("账户 {Account} 的保持目录刷新频率 {Value} 无效，已使用默认值 {Default} 分钟",
+            _ctx.Username, minutes, DefaultDirectoryRefreshMinutes);
+        return DefaultDirectoryRefreshMinutes;
     }
 
     /// <summary>
@@ -1765,6 +1808,23 @@ internal static class Program
         Log.Information("根目录（磁盘树）占位对账完成：{Count} 个顶层容器", topNodes.Count);
     }
 
+    private static async Task ReconcileStartupDiskTreeAsync()
+    {
+        var cache = _cache ?? throw new InvalidOperationException("同步缓存尚未初始化。");
+        if (!cache.HasCompletedFullPrefetch(CurrentUserKey()))
+        {
+            await RefreshDiskTreeAndReconcileAsync().ConfigureAwait(false);
+            return;
+        }
+
+        var topNodes = cache.ListChildNodes(CurrentUserKey(), _ctx.RootContainerTypeId);
+        Callbacks.InvalidateFolderListing(0, 0);
+        Callbacks.ReleasePlaceholderArrays();
+        PlaceholderCreator.CreateVirtualBatch(_ctx.SyncRootPath, topNodes);
+        ExplorerStateNotifier.NotifyDirectory(_ctx.SyncRootPath);
+        Log.Information("[TREE] 全量拉取已完成，启动时仅恢复持久化磁盘树和 {Count} 个顶层占位", topNodes.Count);
+    }
+
     /// <summary>从托盘排队一次强制全盘目录刷新；重复点击会合并。</summary>
     internal static bool QueueManualFileRefreshFromUi()
     {
@@ -1775,25 +1835,20 @@ internal static class Program
 
         try
         {
-            TrayHost.SetManualFileRefreshProgress(0);
-            _ = Task.Run(async () =>
+            lock (_prefetchRunLock)
             {
-                try
+                if (_activePrefetchRun is { } running)
                 {
-                    Log.Information("[PREFETCH] 收到托盘请求：立即刷新全部文件列表");
-                    await PreFetchAllDisksAsync(_cts.Token, forceRefresh: true,
-                        TrayHost.SetManualFileRefreshProgress).ConfigureAwait(false);
+                    Log.Information("[PREFETCH] 手动刷新接管正在运行的全量预拉取，沿当前进度继续");
+                    running.AttachManualProgressReporter(TrayHost.SetManualFileRefreshProgress);
+                    return true;
                 }
-                catch (Exception error)
-                {
-                    Log.Error(error, "[PREFETCH] 托盘立即刷新失败");
-                }
-                finally
-                {
-                    Volatile.Write(ref _manualRefreshQueued, 0);
-                    TrayHost.SetManualFileRefreshProgress(null);
-                }
-            });
+
+                var run = new PrefetchRun(CurrentUserKey(), manual: true);
+                run.AttachManualProgressReporter(TrayHost.SetManualFileRefreshProgress);
+                _activePrefetchRun = run;
+                _ = Task.Run(() => PreFetchAllDisksAsync(run, _cts.Token));
+            }
             return true;
         }
         catch (Exception error)
@@ -1805,22 +1860,120 @@ internal static class Program
         }
     }
 
+    private static async Task RunStartupFolderInitializationAsync()
+    {
+        try
+        {
+            var cache = _cache;
+            if (cache is null) return;
+            var userKey = CurrentUserKey();
+            if (cache.HasCompletedFullPrefetch(userKey))
+            {
+                Log.Information("[PREFETCH] 当前账户已完成全量拉取，启动时仅从持久化数据恢复目录占位");
+                await Task.Run(() => RestorePersistedDirectoryTreeAsync(_cts.Token), _cts.Token)
+                    .ConfigureAwait(false);
+                return;
+            }
+
+            Log.Information("[PREFETCH] 当前账户尚未完成全量拉取，启动低优先级首次预拉取");
+            StartFullPrefetch(userKey, manual: false);
+        }
+        catch (OperationCanceledException) when (_cts.IsCancellationRequested) { }
+        catch (Exception error) { Log.Warning(error, "[PREFETCH] 启动目录初始化失败"); }
+    }
+
+    private static void StartFullPrefetch(string userKey, bool manual)
+    {
+        lock (_prefetchRunLock)
+        {
+            if (_activePrefetchRun is { } active)
+            {
+                if (manual)
+                    active.AttachManualProgressReporter(TrayHost.SetManualFileRefreshProgress);
+                return;
+            }
+
+            var run = new PrefetchRun(userKey, manual);
+            if (manual) run.AttachManualProgressReporter(TrayHost.SetManualFileRefreshProgress);
+            _activePrefetchRun = run;
+            _ = Task.Run(() => PreFetchAllDisksAsync(run, _cts.Token));
+        }
+    }
+
+    private static async Task RestorePersistedDirectoryTreeAsync(CancellationToken ct)
+    {
+        var cache = _cache;
+        if (cache is null) return;
+        var loaded = await Task.Run(() => Callbacks.LoadPersistedDirectoryListings(ct), ct)
+            .ConfigureAwait(false);
+        Log.Information("[PREFETCH] 已从持久化数据异步读取 {Count} 个目录清单；本次启动不进行全量云端拉取",
+            loaded);
+    }
+
+    internal static bool QueueDirectoryRefreshFromShell(string path)
+    {
+        if (!TryResolveRealFolder(path, out var identity, out var localPath)) return false;
+        _ = Task.Run(() =>
+        {
+            try
+            {
+                if (!_cts.IsCancellationRequested)
+                    Callbacks.RefreshDirectoryNow(identity, localPath);
+            }
+            catch (OperationCanceledException) when (_cts.IsCancellationRequested) { }
+            catch (Exception error) { Log.Error(error, "[REFRESH] 资源管理器刷新目录失败: {Path}", localPath); }
+        });
+        return true;
+    }
+
+    internal static bool ToggleDirectoryRefreshFromShell(string path)
+    {
+        if (!TryResolveRealFolder(path, out var identity, out var localPath)) return false;
+        var kept = _cache?.IsDirectoryRefreshKept(CurrentUserKey(), identity.DiskId, identity.FileId) == true;
+        return Callbacks.SetDirectoryRefreshKept(identity, localPath, !kept);
+    }
+
+    internal static IReadOnlyList<KeptDirectoryRefreshInfo> GetKeptDirectoryRefreshes()
+        => _cache?.ListKeptDirectoryRefreshes(CurrentUserKey())
+            .Select(item => new KeptDirectoryRefreshInfo(item.diskId, item.folderId, item.path, item.name))
+            .ToList() ?? [];
+
+    internal static bool RemoveKeptDirectoryRefresh(KeptDirectoryRefreshInfo item)
+    {
+        var identity = new FileIdentity(item.DiskId, 0, item.FolderId, 0);
+        return Callbacks.SetDirectoryRefreshKept(identity, item.Path, false);
+    }
+
+    private static bool TryResolveRealFolder(string path, out FileIdentity identity, out string localPath)
+    {
+        identity = default;
+        localPath = "";
+        try
+        {
+            localPath = Path.GetFullPath(path);
+            var root = Path.GetFullPath(_ctx.SyncRootPath).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+            if (!localPath.StartsWith(root, StringComparison.OrdinalIgnoreCase)
+                || !ProviderIdentity.TryReadPlaceholderIdentity(localPath, out identity)
+                || identity.IsVirtual || identity.Type != 0)
+                return false;
+            return true;
+        }
+        catch { return false; }
+    }
+
     /// <summary>
-    /// 后台预拉取全部磁盘的目录结构入库；启动时复用新鲜缓存，托盘手动刷新会强制查询云端。
-    /// 递归 ListFolder 每个磁盘的每个目录，入库 folders（含 local_path）+ files。
-    /// 完成后触发 ReconcileDirectoryTimes（此时 files/folders 有数据，对账有效）。
+    /// 后台预拉取全部磁盘的目录结构，仅更新持久化清单，不创建子目录占位或探测权限。
+    /// 启动首次预拉取使用低优先级；托盘手动刷新可接管同一任务继续扫描。
     ///
     /// **为什么需要**：之前启动对账在浏览前跑，files/folders 表空 → derived 全 null → "刷新 0 个"。
     ///   浏览期 self Force 虽能修正被浏览的目录，但未浏览目录时间仍错（开机自启后用户不浏览则全错）。
     ///   预拉取让启动对账立即有全盘数据，开机后所有目录时间一次到位。
     ///
-    /// **不阻塞主循环**：后台 Task 跑，用户可立即用 Explorer 浏览（回调照常工作）。
-    ///   启动预拉取与回调可能请求同一目录：IsFolderCached 去重；托盘强制刷新绕过缓存，且与其他预拉取串行。
-    /// **限流**：每目录间 100ms，避免服务器封禁（育网云限速 ~3.5MB/s，ListFolder 响应 30~80KB）。
+    /// **不阻塞主循环**：后台任务运行，用户可立即用 Explorer 浏览；同一目录的回调和预拉取共享目录锁。
+    /// **限流**：启动预拉取每目录间 400ms，手动刷新每目录间 100ms。
     /// **容错**：单目录失败 log + 继续；整体异常也兜底调一次对账。
     /// </summary>
-    private static async Task PreFetchAllDisksAsync(CancellationToken ct, bool forceRefresh = false,
-        Action<int?>? reportProgress = null)
+    private static async Task PreFetchAllDisksAsync(PrefetchRun run, CancellationToken ct)
     {
         var gateAcquired = false;
         try
@@ -1829,11 +1982,9 @@ internal static class Program
             gateAcquired = true;
             var sw = System.Diagnostics.Stopwatch.StartNew();
             var cache = _cache ?? throw new InvalidOperationException("同步缓存尚未初始化。");
-            // Materialize every virtual ancestor and the known cached directory tree before
-            // issuing HTTP. A SQLite local_path does not imply that its parent exists on disk.
             var directoryTree = new PlaceholderDirectoryTree(_ctx.SyncRootPath, cache, CurrentUserKey(),
                 _ctx.RootContainerTypeId, message => Log.Information("{Msg}", message));
-            var diskPaths = directoryTree.PrepareCachedTree(ct);
+            var diskPaths = RunPrefetchAction(run.IsManual, () => directoryTree.PrepareVirtualTree(ct));
             if (diskPaths.Count == 0)
             {
                 Log.Warning("[PREFETCH] disk_tree 无磁盘节点，跳过预拉取（直接对账）");
@@ -1841,27 +1992,27 @@ internal static class Program
                 return;
             }
 
-            var totalFolders = diskPaths.Count;
-            var totalFiles = 0L;
+            var persistedCounts = cache.GetPersistedListingCounts(run.UserKey);
+            var totalFolders = Math.Max(diskPaths.Count, persistedCounts.folders);
+            var totalFiles = persistedCounts.files;
             long completedFolders = 0;
             long completedFiles = 0;
-            var lastReportedProgress = -1;
+            long lastReportedProgress = -1;
 
             void ReportProgress()
             {
                 var totalItems = totalFolders + totalFiles;
                 var completedItems = completedFolders + completedFiles;
-                var percentage = totalItems <= 0
-                    ? 0
-                    : (int)Math.Clamp(completedItems * 100 / totalItems, 0, 99);
-                if (percentage <= lastReportedProgress) return;
-                lastReportedProgress = percentage;
-                reportProgress?.Invoke(percentage);
+                if (completedItems <= lastReportedProgress) return;
+                lastReportedProgress = completedItems;
+                run.UpdateProgress(completedItems, totalItems);
             }
 
-            Log.Information(forceRefresh
-                ? "[PREFETCH] 开始立即刷新 {N} 个磁盘的目录结构"
-                : "[PREFETCH] 开始预拉取 {N} 个磁盘的目录结构（后台填充，不阻塞浏览）", diskPaths.Count);
+            Log.Information(run.IsManual
+                ? "[PREFETCH] 开始手动全量刷新 {N} 个磁盘，基于持久化数据估算总量 {F} 目录 / {Fl} 文件"
+                : "[PREFETCH] 开始首次全量预拉取 {N} 个磁盘，基于持久化数据估算总量 {F} 目录 / {Fl} 文件（低优先级）",
+                diskPaths.Count, totalFolders, totalFiles);
+            run.UpdateProgress(0, totalFolders + totalFiles);
 
             var skipped = 0;
             var failed = 0;
@@ -1877,53 +2028,20 @@ internal static class Program
                     var (folderId, parentId, localPath) = queue.Dequeue();
                     try
                     {
-                        directoryTree.EnsureDirectory(diskId, folderId, localPath, ct);
-                        // A valid HTTP cache can still have missing local placeholders after
-                        // restart or a directory deletion. Repair locally even on a cache hit.
-                        if (!forceRefresh && cache.IsFolderCached(diskId, folderId, CloudFiles.Callbacks.FolderCache))
-                        {
-                            skipped++;
-                            var cached = cache.ListCachedItems(diskId, folderId);
-                            var cachedFiles = cached.LongCount(item => !item.isFolder);
-                            totalFiles += cachedFiles;
-                            completedFiles += cachedFiles;
-                            var safeChildFolderIds = new HashSet<ulong>();
-                            var safeCachedItems = cached.Where(item =>
+                        var identity = new FileIdentity(diskId, parentId, folderId, 0);
+                        var (listing, previousFiles, previousFolderIds) = RunPrefetchAction(run.IsManual,
+                            () => Callbacks.FetchAndStoreDirectoryListingForPrefetch(identity, localPath, items =>
                             {
-                                if (!item.isFolder) return true;
-                                if (visitedFolders.Contains(item.id) || !safeChildFolderIds.Add(item.id))
-                                {
-                                    Log.Warning("[PREFETCH] 跳过重复或循环目录 disk={Disk} folder={Folder} parent={Parent}",
-                                        diskId, item.id, folderId);
-                                    return false;
-                                }
-                                return true;
-                            }).ToList();
-                            directoryTree.PopulateDirectory(diskId, folderId, localPath, safeCachedItems, ct);
-                            foreach (var sub in safeCachedItems.Where(i => i.isFolder))
-                            {
-                                visitedFolders.Add(sub.id);
-                                var path = Path.Combine(localPath, sub.name);
-                                cache.SaveSubFolder(diskId, sub.id, folderId, sub.name, path);
-                                totalFolders++;
-                                queue.Enqueue((sub.id, folderId, path));
-                            }
-                            continue;
-                        }
-                        var listing = await _client!.ListFolderWithPermissionsAsync(diskId, folderId)
-                            .ConfigureAwait(false);
-                        if (!listing.IsValidPage) throw new InvalidDataException("服务器没有返回请求的目录页面。");
+                                EnsureUniqueChildFolders(items.Where(item => item.IsFolder).Select(item => item.Id),
+                                    visitedFolders, diskId, folderId);
+                                foreach (var item in items.Where(item => item.IsFolder))
+                                    _ = GetValidatedChildDirectoryPath(_ctx.SyncRootPath, localPath, item.Name);
+                            }));
                         var items = listing.Items.ToList();
-                        EnsureUniqueChildFolders(items.Where(item => item.IsFolder).Select(item => item.Id),
-                            visitedFolders, diskId, folderId);
                         var listedFiles = items.LongCount(item => !item.IsFolder);
-                        totalFiles += listedFiles;
+                        totalFiles += Math.Max(0, listedFiles - previousFiles);
                         completedFiles += listedFiles;
-                        cache.SaveDirectoryPermission(CurrentUserKey(), diskId, folderId, listing.Permission);
-                        cache.SaveFolder(diskId, folderId, parentId,
-                            Path.GetFileName(localPath.TrimEnd('\\')), localPath, items);
-                        Callbacks.ReconcileDirectorySnapshot(diskId, folderId, localPath, items);
-                        // 子文件夹：SaveSubFolder（含 local_path，供下次对账反查）+ 入队继续递归
+                        // SaveFolder 已写入子目录路径；入队时只扩展本轮未遍历的目录。
                         foreach (var sub in items.Where(i => i.IsFolder))
                         {
                             if (!visitedFolders.Add(sub.Id))
@@ -1932,29 +2050,11 @@ internal static class Program
                                     diskId, sub.Id, folderId);
                                 continue;
                             }
-                            var subPath = Path.Combine(localPath, sub.Name);
-                            cache.SaveSubFolder(diskId, sub.Id, folderId, sub.Name, subPath);
-                            totalFolders++;
+                            var subPath = GetValidatedChildDirectoryPath(_ctx.SyncRootPath, localPath, sub.Name);
+                            if (!previousFolderIds.Contains(sub.Id)) totalFolders++;
                             queue.Enqueue((sub.Id, folderId, subPath));
                         }
-                        // 清内存/CFAPI 快照后立即把新增项落成真实占位。仅清缓存不够：
-                        // 已填充目录关闭按需填充后，Explorer 不一定再触发 FETCH_PLACEHOLDERS。
                         Callbacks.InvalidateFolderListing(diskId, folderId);
-                        try
-                        {
-                            var cachedItems = cache.ListCachedItems(diskId, folderId);
-                            var created = directoryTree.PopulateDirectory(diskId, folderId, localPath, cachedItems, ct);
-                            if (created > 0)
-                            {
-                                ExplorerStateNotifier.NotifyDirectory(localPath);
-                                Log.Information("[PREFETCH] 已为目录补建 {Count} 个新占位并通知 Explorer: {Path}",
-                                    created, localPath);
-                            }
-                        }
-                        catch (Exception ex)
-                        {
-                            Log.Warning(ex, "[PREFETCH] 补建目录占位失败（浏览回调仍可自愈）: {Path}", localPath);
-                        }
                         if (totalFolders % 20 == 0)
                             Log.Information("[PREFETCH] 进度：已拉取 {F} 目录 / {Fl} 文件，队列剩 {Q}",
                                 totalFolders, totalFiles, queue.Count);
@@ -1970,13 +2070,18 @@ internal static class Program
                         completedFolders++;
                         ReportProgress();
                     }
-                    await Task.Delay(100, ct).ConfigureAwait(false);  // 限流：每目录 100ms 间隔
+                    await Task.Delay(run.IsManual ? 100 : 400, ct).ConfigureAwait(false);
                 }
             }
-            Log.Information("[PREFETCH] 完成：{F} 目录 / {Fl} 文件 / 跳过{S} / 失败{Fa}，用时{T:F1}s → 触发目录时间对账",
-                totalFolders, totalFiles, skipped, failed, sw.Elapsed.TotalSeconds);
-            ReconcileDirectoryTimes();  // 预拉取完成后对账（此时 files/folders 有数据）
-            reportProgress?.Invoke(100);
+            if (ct.IsCancellationRequested) return;
+            Log.Information("[PREFETCH] 完成：处理 {F} 目录 / {Fl} 文件 / 跳过{S} / 失败{Fa}，用时{T:F1}s",
+                completedFolders, completedFiles, skipped, failed, sw.Elapsed.TotalSeconds);
+            ReconcileDirectoryTimes();
+            if (failed == 0 && string.Equals(run.UserKey, CurrentUserKey(), StringComparison.Ordinal))
+                cache.MarkFullPrefetchCompleted(CurrentUserKey());
+            else
+                Log.Warning("[PREFETCH] 存在失败目录，不记录全量拉取完成状态；下次启动会继续预拉取");
+            run.UpdateProgress(completedFolders + completedFiles, totalFolders + totalFiles, completed: true);
         }
         catch (OperationCanceledException)
         {
@@ -1984,13 +2089,60 @@ internal static class Program
         }
         catch (Exception ex)
         {
-            Log.Warning(ex, "[PREFETCH] 预拉取异常（不影响运行，浏览期 self Force 仍工作）；尝试用已有数据对账");
+            Log.Warning(ex, "[PREFETCH] 预拉取异常；尝试用已有数据对账");
             try { ReconcileDirectoryTimes(); } catch { /* 对账失败不影响运行 */ }
         }
         finally
         {
             if (gateAcquired) _preFetchGate.Release();
+            lock (_prefetchRunLock)
+            {
+                if (ReferenceEquals(_activePrefetchRun, run))
+                    _activePrefetchRun = null;
+            }
+            if (run.IsManual)
+            {
+                Volatile.Write(ref _manualRefreshQueued, 0);
+                run.ClearManualProgressReporter();
+            }
         }
+    }
+
+    private static T RunPrefetchAction<T>(bool manual, Func<T> action)
+    {
+        if (manual) return action();
+        var thread = Thread.CurrentThread;
+        ThreadPriority original;
+        try
+        {
+            original = thread.Priority;
+            thread.Priority = ThreadPriority.BelowNormal;
+        }
+        catch (Exception error) when (error is ThreadStateException or PlatformNotSupportedException
+            or UnauthorizedAccessException)
+        {
+            return action();
+        }
+        try { return action(); }
+        finally
+        {
+            try { thread.Priority = original; }
+            catch (Exception error) when (error is ThreadStateException or PlatformNotSupportedException
+                or UnauthorizedAccessException) { }
+        }
+    }
+
+    private static string GetValidatedChildDirectoryPath(string syncRoot, string parentPath, string name)
+    {
+        if (string.IsNullOrWhiteSpace(name) || name is "." or ".." || Path.GetFileName(name) != name
+            || name.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0)
+            throw new InvalidDataException("云端目录名称不是合法的本地目录项名称。");
+        var root = Path.GetFullPath(syncRoot).TrimEnd(Path.DirectorySeparatorChar)
+            + Path.DirectorySeparatorChar;
+        var path = Path.GetFullPath(Path.Combine(parentPath, name));
+        if (!path.StartsWith(root, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidDataException("云端目录路径越出了同步根目录。");
+        return path;
     }
 
     private static void EnsureUniqueChildFolders(IEnumerable<ulong> childFolderIds,
@@ -2169,6 +2321,30 @@ internal static class Program
 
     /// <summary>供托盘菜单"退出"项调用：引到与 Ctrl+C 完全一致的优雅退出链。</summary>
     internal static void RequestShutdownFromUi() => RequestShutdown(CtrlType.CTRL_C_EVENT);
+
+    private static string? HandleInstanceControlCommand(string command)
+    {
+        if (string.Equals(command, "stop", StringComparison.Ordinal))
+            return Environment.ProcessId.ToString();
+        if (command.StartsWith("refresh-folder|", StringComparison.Ordinal))
+        {
+            var path = command["refresh-folder|".Length..];
+            return QueueDirectoryRefreshFromShell(path) ? "ok" : "error";
+        }
+        if (command.StartsWith("toggle-refresh-folder|", StringComparison.Ordinal))
+        {
+            var path = command["toggle-refresh-folder|".Length..];
+            return ToggleDirectoryRefreshFromShell(path) ? "ok" : "error";
+        }
+        if (command.StartsWith("refresh-state|", StringComparison.Ordinal))
+        {
+            return TryResolveRealFolder(command["refresh-state|".Length..], out var identity, out _)
+                ? (_cache?.IsDirectoryRefreshKept(CurrentUserKey(), identity.DiskId, identity.FileId) == true
+                    ? "kept" : "not-kept")
+                : "error";
+        }
+        return "error";
+    }
 
     /// <summary>供托盘菜单"打开同步目录"读取同步根目录路径。</summary>
     internal static string SyncRootPath => _ctx.SyncRootPath;
@@ -2403,7 +2579,6 @@ internal static class Program
             Server = "https://example.invalid",
             Username = "winui-selftest",
             ProviderName = "WinUI Self Test",
-            FolderCacheMinutes = 30,
         };
 
         try
@@ -2498,6 +2673,7 @@ internal static class Program
         {
             Username = account.Username,
             ProtectedPassword = account.ProtectedPassword,
+            DirectoryRefreshIntervalMinutes = account.DirectoryRefreshIntervalMinutes,
         }).ToList();
         _pendingAccountSwitch = switchContext;
         Callbacks.SuppressDeleteRecovery = true;
@@ -2508,13 +2684,12 @@ internal static class Program
 
     /// <summary>
     /// 把 <see cref="_ctx"/> 中支持热生效的项下发到运行时的 Callbacks 静态字段。
-    /// 覆盖：目录缓存 / 自动刷新周期（含 1~120 归一化）、按需填充策略、SyncRootPath、UserKey 和容器 TypeId。
+    /// 覆盖：保持目录刷新周期、按需填充策略、SyncRootPath、UserKey 和容器 TypeId。
     /// </summary>
     internal static void ApplyHotConfig()
     {
-        _ctx.FolderCacheMinutes = NormalizeCacheMinutes(_ctx.FolderCacheMinutes,
-            nameof(SyncRootContext.FolderCacheMinutes));
-        Callbacks.FolderCache = TimeSpan.FromMinutes(_ctx.FolderCacheMinutes);
+        Callbacks.DirectoryRefreshInterval = TimeSpan.FromMinutes(CurrentDirectoryRefreshIntervalMinutes());
+        _cache?.SetDirectoryRefreshIntervalMinutes(CurrentUserKey(), CurrentDirectoryRefreshIntervalMinutes());
         Callbacks.DisablePopulationAfterPopulate = true;
         Callbacks.SyncRootPath = Path.GetFullPath(_ctx.SyncRootPath);
         Callbacks.UserKey = CurrentUserKey();
@@ -2754,7 +2929,7 @@ internal static class Program
 
         // 11. 重启后台修正线程 + 重新预拉取（让新目录树的时间与内容一次到位）
         PlaceholderFixer.Start(msg => Log.Information("{Msg}", msg));
-        _ = Task.Run(() => PreFetchAllDisksAsync(_cts.Token));
+        _ = Task.Run(() => RestorePersistedDirectoryTreeAsync(_cts.Token));
     }
 
     /// <summary>

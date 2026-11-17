@@ -9,6 +9,7 @@ public sealed class AccountCredential
 {
     public string Username { get; set; } = "";
     public string ProtectedPassword { get; set; } = "";
+    public int DirectoryRefreshIntervalMinutes { get; set; } = 5;
 }
 
 /// <summary>
@@ -156,11 +157,6 @@ public sealed class SyncRootContext
     /// 这里在启动时尽力清掉（失败不影响主流程）。
     /// </summary>
     public string[] LegacySyncRootPaths { get; set; } = [];
-    /// <summary>
-    /// 首次目录填充与后台预拉取的缓存周期（分钟）；资源管理器重新枚举目录时会绕过该缓存查询云端，
-    /// 后台预拉取也使用同一周期去重。合法区间 1~120；无效值启动时重置为 30 分钟并告警。
-    /// </summary>
-    public int FolderCacheMinutes { get; set; } = 30;
     /// <summary>定期释放已同步、未固定的文件缓存。</summary>
     public bool AutomaticFileCacheCleanup { get; set; }
     public int FileCacheCleanupHours { get; set; } = 24;
