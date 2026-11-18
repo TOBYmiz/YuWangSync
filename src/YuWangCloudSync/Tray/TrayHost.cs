@@ -21,12 +21,14 @@ internal static class TrayHost
     private static bool _started;
     private static TrayIcon? _tray;
     private static PopupMenu? _trayContextMenu;
+    private static PopupMenuItem? _mainWindowMenuItem;
     private static PopupMenuItem? _aboutMenuItem;
     private static PopupMenuItem? _refreshFilesMenuItem;
     private static IntPtr _trayIconHandle;
     private static IntPtr _trayUpdateIconHandle;
     private static IntPtr _activeTrayIconHandle;
     private static bool _trayUpdateHintEnabled = true;
+    private static bool _mainWindowEnabled = true;
     private static bool _trayCreated;
     private static readonly ManualResetEventSlim ShutdownComplete = new(false);
     private static readonly CancellationTokenSource TrayLifetime = new();
@@ -118,7 +120,8 @@ internal static class TrayHost
     private static WindowProcDelegate? _shutdownWindowProc;
     private static IntPtr _shutdownWindow;
 
-    public static void Start(bool showUi, bool showTrayUpdateHint = true, Guid? trayIdOverride = null)
+    public static void Start(bool showUi, bool showTrayUpdateHint = true, Guid? trayIdOverride = null,
+        bool mainWindowEnabled = true)
     {
         lock (Gate)
         {
@@ -126,6 +129,7 @@ internal static class TrayHost
             _started = true;
             _showUi = showUi;
             _trayIdOverride = trayIdOverride;
+            Volatile.Write(ref _mainWindowEnabled, mainWindowEnabled);
             Volatile.Write(ref _trayUpdateHintEnabled, showTrayUpdateHint);
             if (_showUi) UpdateService.StateChanged += OnUpdateStateChanged;
             if (!WinUiUiHost.IsReady)
@@ -190,6 +194,8 @@ internal static class TrayHost
             catch { }
             _tray = null;
             _trayContextMenu = null;
+            _mainWindowMenuItem = null;
+            _refreshFilesMenuItem = null;
             Volatile.Write(ref _trayCreated, false);
             if (_trayIconHandle != IntPtr.Zero)
             {
@@ -242,6 +248,11 @@ internal static class TrayHost
     private static void BuildTrayIcon()
     {
         var menu = new PopupMenu();
+        _mainWindowMenuItem = new PopupMenuItem("开启主界面", (_, _) => OpenMainWindow())
+        {
+            Enabled = Volatile.Read(ref _mainWindowEnabled),
+        };
+        menu.Items.Add(_mainWindowMenuItem);
         menu.Items.Add(new PopupMenuItem("打开同步目录", (_, _) => OpenSyncDirectory()));
         _refreshFilesMenuItem = new PopupMenuItem("立即刷新文件", (_, _) => RefreshFilesNow());
         menu.Items.Add(_refreshFilesMenuItem);
@@ -508,6 +519,23 @@ internal static class TrayHost
             Process.Start(new ProcessStartInfo("explorer.exe", $"\"{Program.SyncRootPath}\"") { UseShellExecute = true });
         }
         catch (Exception ex) { Log.Warning(ex, "打开同步目录失败"); }
+    }
+
+    private static void OpenMainWindow()
+    {
+        if (!Volatile.Read(ref _mainWindowEnabled)) return;
+        WinUiUiHost.ShowMainWindow();
+    }
+
+    internal static void SetMainWindowEnabled(bool enabled)
+    {
+        Volatile.Write(ref _mainWindowEnabled, enabled);
+        if (!WinUiUiHost.Post(() =>
+            {
+                if (_mainWindowMenuItem is not null) _mainWindowMenuItem.Enabled = enabled;
+                if (!enabled) WinUiUiHost.CloseMainWindow();
+            }))
+            Log.Debug("WinUI UI 线程不可用，稍后按主界面启用设置建立托盘菜单");
     }
 
     private static void RefreshFilesNow()

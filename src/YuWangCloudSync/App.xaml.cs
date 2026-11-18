@@ -22,6 +22,18 @@ public partial class App : Application
         UnhandledException += (_, args) =>
         {
             args.Handled = true;
+            if (IsNonFatalPlatformFeatureProbeFailure(args.Exception, args.Message))
+            {
+                // Windows App SDK text-input components probe Windows.ApplicationModel.LimitedAccessFeatures.
+                // Some Windows builds cannot activate that class; the probe failure leaves the UI intact.
+                try
+                {
+                    Serilog.Log.Warning(args.Exception,
+                        "已忽略 Windows App SDK 受限功能探测失败（UI 不受影响）：{Message}", args.Message);
+                }
+                catch { }
+                return;
+            }
             Program.HandleFatalException(args.Exception, "WinUI UI 线程未处理异常");
             try { Serilog.Log.CloseAndFlush(); } catch { }
             Environment.Exit(1);
@@ -34,6 +46,15 @@ public partial class App : Application
         Program.SetStartupStage("加载 WinUI App.xaml");
         InitializeComponent();
         Program.SetStartupStage("WinUI App.xaml 加载完成");
+    }
+
+    private static bool IsNonFatalPlatformFeatureProbeFailure(Exception? exception, string? message)
+    {
+        const int ClassNotAvailable = unchecked((int)0x80040111); // CLASS_E_CLASSNOTAVAILABLE
+        const string FeatureClass = "Windows.ApplicationModel.LimitedAccessFeatures";
+        return exception is COMException { HResult: ClassNotAvailable } comException
+            && ((comException.Message?.Contains(FeatureClass, StringComparison.Ordinal) ?? false)
+                || (message?.Contains(FeatureClass, StringComparison.Ordinal) ?? false));
     }
 
     private static void ValidateFluentResources(ResourceDictionary resources)
@@ -50,6 +71,10 @@ public partial class App : Application
             "YuWangCaptionTextBlockStyle",
             "YuWangCardStyle",
             "YuWangImageFrameStyle",
+            "YuWangNavigationRootTemplate",
+            "YuWangNavigationContainerTemplate",
+            "YuWangNavigationDiskTemplate",
+            "YuWangNavigationFolderTemplate",
         ];
         var missing = requiredStyles.Where(key => !resources.ContainsKey(key)).ToArray();
         if (missing.Length != 0)

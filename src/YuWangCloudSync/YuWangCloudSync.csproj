@@ -32,6 +32,8 @@
     <SatelliteResourceLanguages>zh-Hans</SatelliteResourceLanguages>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
+    <!-- CsWinRT uses unsafe generic-interface marshalling for StorageItems drag-and-drop under NativeAOT. -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <LangVersion>latest</LangVersion>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <!-- 主程序（exe）内嵌与托盘相同的多帧 ICO：文件管理器/任务管理器/控制台窗口标题栏

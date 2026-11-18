@@ -57,6 +57,7 @@ internal static class WinUiUiHost
     private static CaptchaWindow? _captcha;
     private static CacheCleanupConfirmationWindow? _cacheCleanupConfirmation;
     private static KeptDirectoriesWindow? _keptDirectories;
+    private static MainWindow? _mainWindow;
     private static int _uiThreadId;
 
     internal static bool IsReady => Ready.IsSet && _dispatcher is not null;
@@ -69,6 +70,9 @@ internal static class WinUiUiHost
 
     internal static Brush? GetBrushResource(string key)
         => GetResource<Brush>(key);
+
+    internal static DataTemplate? GetDataTemplateResource(string key)
+        => GetResource<DataTemplate>(key);
 
     private static T? GetResource<T>(string key) where T : class
     {
@@ -158,6 +162,41 @@ internal static class WinUiUiHost
     {
         if (!Post(() => ShowSettingsOnUi(snapshot)))
             Serilog.Log.Warning("WinUI UI 线程不可用，无法打开设置窗口");
+    }
+
+    internal static void ShowMainWindow()
+    {
+        if (!Program.SnapshotConfig().EnableMainWindow) return;
+        if (!Post(ShowMainWindowOnUi))
+            Serilog.Log.Warning("WinUI UI 线程不可用，无法打开主界面");
+    }
+
+    internal static void CloseMainWindow()
+    {
+        if (!Post(() =>
+            {
+                try { _mainWindow?.Close(); } catch { }
+                _mainWindow = null;
+            }))
+            Serilog.Log.Debug("WinUI UI 线程不可用，无法关闭主界面");
+    }
+
+    private static void ShowMainWindowOnUi()
+    {
+        if (!Program.SnapshotConfig().EnableMainWindow) return;
+        if (_mainWindow is not null)
+        {
+            ActivateWindow(_mainWindow);
+            return;
+        }
+
+        var window = new MainWindow(Program.SnapshotConfig());
+        _mainWindow = window;
+        window.Closed += (_, _) =>
+        {
+            if (ReferenceEquals(_mainWindow, window)) _mainWindow = null;
+        };
+        window.Activate();
     }
 
     internal static void ShowAbout()
@@ -365,12 +404,14 @@ internal static class WinUiUiHost
         try { _about?.Close(); } catch { }
         try { _captcha?.Close(); } catch { }
         try { _cacheCleanupConfirmation?.Close(); } catch { }
+        try { _mainWindow?.Close(); } catch { }
         _settings = null;
         _accountManager = null;
         _keptDirectories = null;
         _about = null;
         _captcha = null;
         _cacheCleanupConfirmation = null;
+        _mainWindow = null;
         while (CaptchaQueue.TryDequeue(out var request)) request.Completion.TrySetResult("");
     }
 

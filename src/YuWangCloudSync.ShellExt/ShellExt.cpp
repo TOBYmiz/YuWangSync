@@ -1,5 +1,6 @@
 ﻿#include <windows.h>
 #include <shlobj.h>
+#include <shobjidl_core.h>
 #include <bcrypt.h>
 #include <cfapi.h>
 #include <atlbase.h>
@@ -41,37 +42,72 @@ public:
         COM_INTERFACE_ENTRY(IContextMenu)
     END_COM_MAP()
 
-    STDMETHOD(Initialize)(LPCITEMIDLIST folder, IDataObject*, HKEY) override
+    STDMETHOD(Initialize)(LPCITEMIDLIST folder, IDataObject* dataObject, HKEY) override
     {
         _folderPath.clear();
         _keptRefresh = false;
-        if (folder == nullptr) return S_FALSE;
-        wchar_t path[32768]{};
-        if (!SHGetPathFromIDListW(folder, path) || path[0] == L'\0') return S_FALSE;
-        const DWORD attributes = GetFileAttributesW(path);
-        if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0) return S_FALSE;
+        // S_FALSE 仍属成功码，Explorer 会继续调用 QueryContextMenu；非本同步根时必须返回失败码，
+        // 且只在全部校验通过后才写入 _folderPath。
+        std::wstring candidate;
+        if (dataObject != nullptr)
+        {
+            ATL::CComPtr<IShellItemArray> selectedItems;
+            if (FAILED(SHCreateShellItemArrayFromDataObject(dataObject, IID_PPV_ARGS(&selectedItems))))
+                return E_FAIL;
+            DWORD count = 0;
+            if (FAILED(selectedItems->GetCount(&count)) || count != 1) return E_FAIL;
 
-        alignas(CF_SYNC_ROOT_STANDARD_INFO) BYTE rootBuffer[sizeof(CF_SYNC_ROOT_STANDARD_INFO) + sizeof(GUID)]{};
-        DWORD returned = 0;
-        if (FAILED(CfGetSyncRootInfoByPath(path, CF_SYNC_ROOT_INFO_STANDARD, rootBuffer,
-            static_cast<DWORD>(sizeof(rootBuffer)), &returned))) return S_FALSE;
-        const auto* root = reinterpret_cast<const CF_SYNC_ROOT_STANDARD_INFO*>(rootBuffer);
-        if (returned < FIELD_OFFSET(CF_SYNC_ROOT_STANDARD_INFO, SyncRootIdentity) + sizeof(GUID)
-            || root->SyncRootIdentityLength != sizeof(GUID)
-            || std::memcmp(root->SyncRootIdentity, &ProviderId, sizeof(GUID)) != 0) return S_FALSE;
+            ATL::CComPtr<IShellItem> selectedItem;
+            if (FAILED(selectedItems->GetItemAt(0, &selectedItem))) return E_FAIL;
+            LPWSTR selectedPath = nullptr;
+            if (FAILED(selectedItem->GetDisplayName(SIGDN_FILESYSPATH, &selectedPath)) || selectedPath == nullptr)
+                return E_FAIL;
+            candidate = selectedPath;
+            CoTaskMemFree(selectedPath);
+        }
+        else
+        {
+            if (folder == nullptr) return E_FAIL;
+            wchar_t path[32768]{};
+            if (!SHGetPathFromIDListW(folder, path) || path[0] == L'\0') return E_FAIL;
+            candidate = path;
+        }
 
-        _folderPath = path;
+        if (!IsFolderInOwnSyncRoot(candidate)) return E_FAIL;
+
+        _folderPath = std::move(candidate);
         const auto state = SendProviderCommand(L"refresh-state|" + _folderPath);
         _keptRefresh = state == L"kept";
         return S_OK;
+    }
+
+    static bool IsFolderInOwnSyncRoot(const std::wstring& path)
+    {
+        if (path.empty()) return false;
+        const DWORD attributes = GetFileAttributesW(path.c_str());
+        if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0) return false;
+
+        alignas(CF_SYNC_ROOT_STANDARD_INFO) BYTE rootBuffer[sizeof(CF_SYNC_ROOT_STANDARD_INFO) + sizeof(GUID)]{};
+        DWORD returned = 0;
+        if (FAILED(CfGetSyncRootInfoByPath(path.c_str(), CF_SYNC_ROOT_INFO_STANDARD, rootBuffer,
+            static_cast<DWORD>(sizeof(rootBuffer)), &returned))) return false;
+        const auto* root = reinterpret_cast<const CF_SYNC_ROOT_STANDARD_INFO*>(rootBuffer);
+        return returned >= FIELD_OFFSET(CF_SYNC_ROOT_STANDARD_INFO, SyncRootIdentity) + sizeof(GUID)
+            && root->SyncRootIdentityLength == sizeof(GUID)
+            && std::memcmp(root->SyncRootIdentity, &ProviderId, sizeof(GUID)) == 0;
     }
 
     STDMETHOD(QueryContextMenu)(HMENU menu, UINT index, UINT first, UINT last, UINT flags) override
     {
         if ((flags & CMF_DEFAULTONLY) != 0 || _folderPath.empty() || first + 1 > last) return MAKE_HRESULT(SEVERITY_SUCCESS, 0, 0);
         InsertMenuW(menu, index, MF_BYPOSITION | MF_STRING, first, L"刷新此目录");
-        InsertMenuW(menu, index + 1, MF_BYPOSITION | MF_STRING, first + 1,
-            _keptRefresh ? L"取消目录自动刷新" : L"保持目录刷新");
+        MENUITEMINFOW keepRefresh{};
+        keepRefresh.cbSize = sizeof(keepRefresh);
+        keepRefresh.fMask = MIIM_ID | MIIM_STRING | MIIM_STATE;
+        keepRefresh.wID = first + 1;
+        keepRefresh.dwTypeData = const_cast<LPWSTR>(L"保持目录刷新");
+        keepRefresh.fState = _keptRefresh ? MFS_CHECKED : MFS_UNCHECKED;
+        InsertMenuItemW(menu, index + 1, TRUE, &keepRefresh);
         return MAKE_HRESULT(SEVERITY_SUCCESS, 0, 2);
     }
 
@@ -263,6 +299,8 @@ STDAPI DllRegisterServer()
         {OverlayKey, nullptr, ClassId},
         {ATL::CStringW(L"SOFTWARE\\Classes\\Directory\\Background\\shellex\\ContextMenuHandlers\\") + PRODUCT_IDENTIFIER_W, nullptr, ClassId},
         {ATL::CStringW(L"SOFTWARE\\Classes\\Folder\\Background\\shellex\\ContextMenuHandlers\\") + PRODUCT_IDENTIFIER_W, nullptr, ClassId},
+        {ATL::CStringW(L"SOFTWARE\\Classes\\Directory\\shellex\\ContextMenuHandlers\\") + PRODUCT_IDENTIFIER_W, nullptr, ClassId},
+        {ATL::CStringW(L"SOFTWARE\\Classes\\Folder\\shellex\\ContextMenuHandlers\\") + PRODUCT_IDENTIFIER_W, nullptr, ClassId},
         {L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Shell Extensions\\Approved", ClassId, OverlayDescription}
     };
     for (const auto& entry : entries)
@@ -281,9 +319,12 @@ STDAPI DllUnregisterServer()
     const ATL::CStringW classKey = ATL::CStringW(L"Classes\\CLSID\\") + ClassId;
     const ATL::CStringW progKey = ATL::CStringW(L"Classes\\") + ProgId;
     // machine is already opened at HKLM\SOFTWARE; all paths here are relative.
-    const ATL::CStringW directoryMenu = ATL::CStringW(L"Classes\\Directory\\Background\\shellex\\ContextMenuHandlers\\") + PRODUCT_IDENTIFIER_W;
-    const ATL::CStringW folderMenu = ATL::CStringW(L"Classes\\Folder\\Background\\shellex\\ContextMenuHandlers\\") + PRODUCT_IDENTIFIER_W;
-    const wchar_t* keys[] = {classKey, progKey, OverlayKey + wcslen(L"SOFTWARE\\"), directoryMenu, folderMenu};
+    const ATL::CStringW directoryBackgroundMenu = ATL::CStringW(L"Classes\\Directory\\Background\\shellex\\ContextMenuHandlers\\") + PRODUCT_IDENTIFIER_W;
+    const ATL::CStringW folderBackgroundMenu = ATL::CStringW(L"Classes\\Folder\\Background\\shellex\\ContextMenuHandlers\\") + PRODUCT_IDENTIFIER_W;
+    const ATL::CStringW directoryItemMenu = ATL::CStringW(L"Classes\\Directory\\shellex\\ContextMenuHandlers\\") + PRODUCT_IDENTIFIER_W;
+    const ATL::CStringW folderItemMenu = ATL::CStringW(L"Classes\\Folder\\shellex\\ContextMenuHandlers\\") + PRODUCT_IDENTIFIER_W;
+    const wchar_t* keys[] = {classKey, progKey, OverlayKey + wcslen(L"SOFTWARE\\"),
+        directoryBackgroundMenu, folderBackgroundMenu, directoryItemMenu, folderItemMenu};
     for (const auto* key : keys)
     {
         status = machine.RecurseDeleteKey(key);

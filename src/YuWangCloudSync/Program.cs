@@ -180,6 +180,7 @@ internal static class Program
     private static bool _accountSwitchRestart;
     private static SyncRootContext? _pendingAccountSwitch;
     private static bool _restartAfterAccountSwitch;
+    private static bool _cloudFilesConnected;
     private static int _crashDialogShown;
     private static int _crashHandlersInstalled;
     private static string _startupStage = "进程入口";
@@ -267,6 +268,14 @@ internal static class Program
             ConfigureLogger();
             Log.Information("启动入口：进程={Process}; Windows={Windows}; .NET={Runtime}",
                 Environment.ProcessPath, Environment.OSVersion.VersionString, Environment.Version);
+            var featureOptionsIndex = Array.FindIndex(args, argument => string.Equals(argument,
+                "--set-feature-options", StringComparison.OrdinalIgnoreCase));
+            if (featureOptionsIndex >= 0)
+            {
+                Environment.ExitCode = SetFeatureOptions(args, featureOptionsIndex);
+                Log.CloseAndFlush();
+                return;
+            }
             var prepareSyncRootForSetup = args.Any(argument => string.Equals(argument,
                 "--prepare-syncroot-for-setup", StringComparison.OrdinalIgnoreCase));
             var cleanupSelectedSyncRootForSetupIndex = Array.FindIndex(args, argument => string.Equals(argument,
@@ -350,9 +359,6 @@ internal static class Program
                 File.Exists(Path.Combine(AppContext.BaseDirectory, ProductIdentity.Identifier + ".pri")),
                 File.Exists(Path.Combine(AppContext.BaseDirectory, "Microsoft.UI.Xaml.Controls.pri")),
                 File.Exists(Path.Combine(AppContext.BaseDirectory, "Microsoft.UI.pri")));
-            SetStartupStage("校验 Windows Cloud Files 平台");
-            CloudFilesPlatform.EnsureSupported();
-            Log.Information("Cloud Files 平台：{Platform}", CloudFilesPlatform.Describe());
             SetStartupStage("校验 WinUI XAML 进程要求");
             XamlCheckProcessRequirements();
             SetStartupStage("初始化 WinRT COM 包装器");
@@ -770,6 +776,9 @@ internal static class Program
         _showAbout = args.Any(a => string.Equals(a, "-about", StringComparison.OrdinalIgnoreCase));
         // 1. 加载配置
         LoadConfig(args);
+        SetStartupStage("校验 Windows Cloud Files 平台");
+        CloudFilesPlatform.EnsureSupported();
+        Log.Information("Cloud Files 平台：{Platform}", CloudFilesPlatform.Describe());
         // 双模收口：解析运行模式。
         //   --quiet  : 无头模式（无 UI、无控制台、仅文件日志；无会话则直接退出）。
         //   --console: 显式分配调试控制台（控制台日志 + 控制台读验证码）。
@@ -899,7 +908,8 @@ internal static class Program
         // 1c. 初始化 WinUI UI 线程上的系统托盘。
         //     须在登录之前启动：纯 GUI 模式下验证码走 WinUI 弹窗，需要 DispatcherQueue 就绪；
         //     即便 --quiet 无头模式也启动（仅建立关机监听窗口，不显示托盘图标/不弹验证码）。
-        TrayHost.Start(!_quiet, _ctx.TrayUpdateHintEnabled);
+        TrayHost.Start(!_quiet, _ctx.TrayUpdateHintEnabled,
+            mainWindowEnabled: _ctx.EnableMainWindow);
         TrayHost.WaitForUiReady();
         if (!_quiet)
         {
@@ -1135,7 +1145,8 @@ internal static class Program
             {
                 try
                 {
-                    if (SyncRootShellRegistration.NeedsHydrationPolicyRefresh(_ctx.SyncRootPath))
+                    if (SyncRootShellRegistration.NeedsHydrationPolicyRefresh(_ctx.SyncRootPath,
+                            requireNavigationEntry: _ctx.EnableExplorerNavigationEntry))
                     {
                         SyncRootRegistrar.Register(_ctx.SyncRootPath, _ctx.ProviderName,
                             _ctx.RootContainerTypeId, update: true);
@@ -1286,11 +1297,14 @@ internal static class Program
             Log.Error(ex, "CfConnectSyncRoot 异常");
             return;
         }
+        _cloudFilesConnected = true;
 
         // 8b. 监视 Explorer 固定/释放意图，并启动目录时间修正线程。
         // Cloud Files 不提供独立 pin-state callback；平台通过文件属性变化表达菜单操作。
         StartPinStateWatcher();
         PlaceholderFixer.Start(msg => Log.Information("{Msg}", msg));
+        TryConfigureNavigationEntry(_ctx.SyncRootPath, _ctx.ProviderName,
+            _ctx.EnableExplorerNavigationEntry, "启动时", out _);
 
         if (_openFolder)
             OpenSyncFolder();
@@ -1383,38 +1397,41 @@ internal static class Program
         }
 
         // 11c. 断开回调通道
-        Log.Information("正在断开 SyncRoot...");
-        try
+        if (_cloudFilesConnected)
         {
-            var disconnect = CfDisconnectSyncRoot(_connectionKey);
-            if (disconnect.Failed)
-                Log.Warning("CfDisconnectSyncRoot 失败: 0x{Hresult:X}（可能未连接或已断开）", disconnect.Code);
-            else
-                Log.Information("回调通道已断开");
-        }
-        catch (Exception ex)
-        {
-            Log.Warning(ex, "CfDisconnectSyncRoot 异常（忽略，继续反注册）");
-        }
-
-        // 11d. 断开后再释放按目录缓存的占位数组非托管内存并统计
-        CloudFiles.Callbacks.ReleasePlaceholderArrays();
-        CloudFiles.Callbacks.LogCallbackStats();
-
-        if (_ctx.PersistSyncRoot)
-        {
-            Log.Information("常驻模式：保留 SyncRoot 注册（下次启动直接复用；彻底卸载请用 --unregister）");
-        }
-        else
-        {
+            Log.Information("正在断开 SyncRoot...");
             try
             {
-                SyncRootRegistrar.Unregister(_ctx.SyncRootPath, _ctx.ProviderName);
-                Log.Information("SyncRoot 反注册完成");
+                var disconnect = CfDisconnectSyncRoot(_connectionKey);
+                if (disconnect.Failed)
+                    Log.Warning("CfDisconnectSyncRoot 失败: 0x{Hresult:X}（可能未连接或已断开）", disconnect.Code);
+                else
+                    Log.Information("回调通道已断开");
             }
             catch (Exception ex)
             {
-                Log.Warning(ex, "SyncRoot 反注册失败（可能已反注册或目录状态异常）");
+                Log.Warning(ex, "CfDisconnectSyncRoot 异常（忽略，继续反注册）");
+            }
+
+            // 11d. 断开后再释放按目录缓存的占位数组非托管内存并统计
+            CloudFiles.Callbacks.ReleasePlaceholderArrays();
+            CloudFiles.Callbacks.LogCallbackStats();
+
+            if (_ctx.PersistSyncRoot)
+            {
+                Log.Information("常驻模式：保留 SyncRoot 注册（下次启动直接复用；彻底卸载请用 --unregister）");
+            }
+            else
+            {
+                try
+                {
+                    SyncRootRegistrar.Unregister(_ctx.SyncRootPath, _ctx.ProviderName);
+                    Log.Information("SyncRoot 反注册完成");
+                }
+                catch (Exception ex)
+                {
+                    Log.Warning(ex, "SyncRoot 反注册失败（可能已反注册或目录状态异常）");
+                }
             }
         }
 
@@ -2348,6 +2365,9 @@ internal static class Program
 
     /// <summary>供托盘菜单"打开同步目录"读取同步根目录路径。</summary>
     internal static string SyncRootPath => _ctx.SyncRootPath;
+    internal static YuWangClient? ClientForUi => _client;
+    internal static DirectoryPermission GetCachedDirectoryPermission(ulong diskId, ulong folderId)
+        => _cache?.GetDirectoryPermission(CurrentUserKey(), diskId, folderId) ?? DirectoryPermission.Unknown;
 
     /// <summary>
     /// 按运行模式建立/附着控制台（双模收口）。
@@ -2560,6 +2580,26 @@ internal static class Program
                 || argument.Equals("--dehydrate", StringComparison.OrdinalIgnoreCase)));
     }
 
+    private static int SetFeatureOptions(string[] args, int optionsIndex)
+    {
+        if (optionsIndex + 2 >= args.Length
+            || !bool.TryParse(args[optionsIndex + 1], out var navigationEntryEnabled)
+            || !bool.TryParse(args[optionsIndex + 2], out var mainWindowEnabled)
+            || (!navigationEntryEnabled && !mainWindowEnabled))
+        {
+            Log.Error("--set-feature-options 需要两个布尔值，且导航栏入口与主界面至少启用一项");
+            return 2;
+        }
+
+        _ctx = ConfigurationStore.Load(AppContext.BaseDirectory, decryptPassword: false);
+        _ctx.EnableExplorerNavigationEntry = navigationEntryEnabled;
+        _ctx.EnableMainWindow = mainWindowEnabled;
+        ConfigurationStore.SaveEncrypted(_ctx);
+        Log.Information("已更新安装选项：NavigationEntry={NavigationEntry}; MainWindow={MainWindow}",
+            navigationEntryEnabled, mainWindowEnabled);
+        return 0;
+    }
+
     // ============== 设置界面支持（供 Tray/SettingsWindow 调用） ==============
 
     /// <summary>防止并发应用设置（"确定"与"应用"都可能触发）：同时只允许一个应用流程。</summary>
@@ -2698,6 +2738,35 @@ internal static class Program
         _fileCacheCleanup?.Configure(_ctx.AutomaticFileCacheCleanup, _ctx.FileCacheCleanupHours);
     }
 
+    private static bool _navigationEntryConfigurationPending;
+
+    /// <summary>
+    /// Explorer 的 StorageProvider 元数据与 CFAPI SyncRoot 注册相互独立。
+    /// 入口注册或移除失败时保留同步，并在下次启动或设置应用时重试。
+    /// </summary>
+    private static bool TryConfigureNavigationEntry(string syncRootPath, string providerName, bool enabled,
+        string operation, out string? error)
+    {
+        try
+        {
+            SyncRootRegistrar.ConfigureNavigationEntry(syncRootPath, providerName, enabled);
+            _navigationEntryConfigurationPending = false;
+            error = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _navigationEntryConfigurationPending = true;
+            try
+            {
+                Log.Warning(ex, "{Operation} Explorer 导航栏入口更新失败；Cloud Files SyncRoot 保持运行，后续会重试", operation);
+            }
+            catch { /* Explorer 元数据与日志故障均不能中断 CFAPI。 */ }
+            error = ex.Message;
+            return false;
+        }
+    }
+
     /// <summary>
     /// 应用设置（由托盘"设置"窗口调用，必须跑在线程池线程，不可在 UI 线程或 cfapi 回调线程）。
     ///
@@ -2722,6 +2791,7 @@ internal static class Program
         // 放在 try 外，供 catch 里回滚使用（避免用 Exception.Data 这种弱类型传递）
         var oldPath = Path.GetFullPath(_ctx.SyncRootPath);
         var oldProviderName = _ctx.ProviderName;
+        var navigationEntryChanged = _ctx.EnableExplorerNavigationEntry != edit.EnableExplorerNavigationEntry;
         try
         {
             var newPath = Path.GetFullPath(edit.SyncRootPath);
@@ -2744,6 +2814,7 @@ internal static class Program
             UpdateService.SetAutomaticCheckEnabled(_ctx.AutomaticUpdateCheck);
             UpdateService.SetAutomaticDownloadEnabled(_ctx.AutomaticUpdateDownload);
             TrayHost.SetTrayUpdateHintEnabled(_ctx.TrayUpdateHintEnabled);
+            TrayHost.SetMainWindowEnabled(_ctx.EnableMainWindow);
 
             // 4) 重建 SyncRoot
             if (registrationChanged)
@@ -2762,15 +2833,31 @@ internal static class Program
                     if (!probe.Ok)
                     {
                         _ctx.SyncRootPath = oldPath;
+                        _ctx.ProviderName = oldProviderName;
                         Callbacks.SyncRootPath = oldPath;
+                        string? navigationError = null;
+                        var probeNavigationEntryApplied = true;
+                        if (navigationEntryChanged || _navigationEntryConfigurationPending)
+                        {
+                            probeNavigationEntryApplied = TryConfigureNavigationEntry(oldPath, oldProviderName,
+                                _ctx.EnableExplorerNavigationEntry, "新路径探测失败后应用设置时", out navigationError);
+                        }
                         SaveConfig();
-                        return (false, $"新位置不可用，已保留原挂载点（{oldPath}）：{probe.Describe()}");
+                        var message = $"新位置不可用，已保留原挂载点（{oldPath}）：{probe.Describe()}";
+                        if (!probeNavigationEntryApplied)
+                            message += $"；Explorer 导航栏入口更新失败（{navigationError}），Cloud Files 同步继续运行，后续会重试";
+                        return (false, message);
                     }
                 }
 
                 _ctx.SyncRootPath = newPath;
-                await SwitchSyncRootAsync(oldPath, oldProviderName).ConfigureAwait(false);
+                var navigationEntryApplied = await SwitchSyncRootAsync(oldPath, oldProviderName).ConfigureAwait(false);
                 msgs.Add(pathChanged ? $"挂载目录已切换：{oldPath} → {newPath}" : "已按新 Provider 显示名重建 SyncRoot");
+                if (!navigationEntryApplied)
+                {
+                    applied = false;
+                    msgs.Add("Explorer 导航栏入口更新失败；Cloud Files 同步已切换，入口会在下次启动或设置应用时重试");
+                }
             }
             else if (containerChanged)
             {
@@ -2787,6 +2874,22 @@ internal static class Program
                     Log.Error(ex, "[SETTINGS] 顶层占位重建失败");
                     msgs.Add("顶层占位重建失败（详见日志）");
                     applied = false;
+                }
+            }
+
+            if (!registrationChanged && (navigationEntryChanged || _navigationEntryConfigurationPending))
+            {
+                if (TryConfigureNavigationEntry(_ctx.SyncRootPath, _ctx.ProviderName,
+                        _ctx.EnableExplorerNavigationEntry, "应用设置时", out var navigationError))
+                {
+                    msgs.Add(_ctx.EnableExplorerNavigationEntry
+                        ? "已显示 Explorer 导航栏入口"
+                        : "已隐藏 Explorer 导航栏入口；Cloud Files 同步继续运行");
+                }
+                else
+                {
+                    applied = false;
+                    msgs.Add($"Explorer 导航栏入口更新失败（{navigationError}）；Cloud Files 同步继续运行，后续会重试");
                 }
             }
 
@@ -2816,7 +2919,7 @@ internal static class Program
     ///   → 重置 DB 本地路径缓存（local_path/last_listed）→ 重建顶层占位 → 重启 Fixer → 重新预拉取。
     /// 任一步失败都会尝试 <see cref="RestoreSyncRootAsync"/> 回到旧路径。
     /// </summary>
-    private static async Task SwitchSyncRootAsync(string oldPath, string oldProviderName)
+    private static async Task<bool> SwitchSyncRootAsync(string oldPath, string oldProviderName)
     {
         var newPath = Path.GetFullPath(_ctx.SyncRootPath);
         Log.Information("[SETTINGS] 开始热切换 SyncRoot: {Old} → {New}", oldPath, newPath);
@@ -2879,7 +2982,10 @@ internal static class Program
             }
             SyncRootRegistrar.Register(newPath, _ctx.ProviderName,
                 _ctx.RootContainerTypeId);
+            var navigationEntryApplied = TryConfigureNavigationEntry(newPath, _ctx.ProviderName,
+                _ctx.EnableExplorerNavigationEntry, "切换 SyncRoot 时", out _);
             Log.Information("[SETTINGS] 新 SyncRoot 注册成功: {Path}", newPath);
+            _navigationEntryConfigurationPending |= !navigationEntryApplied;
         }
         catch (Exception ex)
         {
@@ -2930,6 +3036,7 @@ internal static class Program
         // 11. 重启后台修正线程 + 重新预拉取（让新目录树的时间与内容一次到位）
         PlaceholderFixer.Start(msg => Log.Information("{Msg}", msg));
         _ = Task.Run(() => RestorePersistedDirectoryTreeAsync(_cts.Token));
+        return !_navigationEntryConfigurationPending;
     }
 
     /// <summary>
@@ -2948,6 +3055,8 @@ internal static class Program
             try { SyncRootRegistrar.Unregister(oldSnapshotPath, oldProviderName); } catch { /* 防御性，忽略 */ }
             SyncRootRegistrar.Register(oldSnapshotPath, oldProviderName,
                 _ctx.RootContainerTypeId);
+            TryConfigureNavigationEntry(oldSnapshotPath, oldProviderName,
+                _ctx.EnableExplorerNavigationEntry, "回滚 SyncRoot 时", out _);
             _callbackTable = CallbackTable.Build();
             var hr = CfConnectSyncRoot(oldSnapshotPath, _callbackTable, IntPtr.Zero,
                 CF_CONNECT_FLAGS.CF_CONNECT_FLAG_NONE, out _connectionKey);

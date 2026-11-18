@@ -48,6 +48,8 @@ internal sealed class SettingsWindow : Window
         MinWidth = 0,
     };
     private readonly CheckBox _persist = new() { Name = "PersistSyncRootCheckBox" };
+    private readonly CheckBox _enableNavigationEntry = new() { Name = "EnableExplorerNavigationEntryCheckBox" };
+    private readonly CheckBox _enableMainWindow = new() { Name = "EnableMainWindowCheckBox" };
     private readonly CheckBox _automaticUpdateCheck = new() { Name = "AutomaticUpdateCheckCheckBox" };
     private readonly CheckBox _trayUpdateHint = new() { Name = "TrayUpdateHintCheckBox" };
     private readonly CheckBox _automaticUpdateDownload = new() { Name = "AutomaticUpdateDownloadCheckBox" };
@@ -212,6 +214,14 @@ internal sealed class SettingsWindow : Window
         AddCheck(persistGrid, _persist, 0);
         AddCard(content, "退出与常驻", persistGrid);
 
+        _enableNavigationEntry.Content = "导航栏入口";
+        _enableMainWindow.Content = "启用主界面（远程文件浏览与拖放）";
+        var featuresGrid = NewGrid(RowHeight, RowHeight, 0);
+        AddCheck(featuresGrid, _enableNavigationEntry, 0);
+        AddCheck(featuresGrid, _enableMainWindow, 1);
+        Add(featuresGrid, NewNote("至少保留一项。关闭导航栏入口只隐藏 Explorer 中的同步目录图标，不影响 Cloud Files 同步；开机启动只在托盘运行，需要时从托盘首项打开主界面。"), 2, 0, 2);
+        AddCard(content, "功能选择", featuresGrid);
+
         var cloudGrid = NewGrid(RowHeight, 0, RowHeight, 0);
         Add(cloudGrid, NewLabel("目录树顶层容器 TypeId"), 0, 0);
         Add(cloudGrid, TypeIdRow(), 0, 1);
@@ -284,6 +294,8 @@ internal sealed class SettingsWindow : Window
         _containerTypeId.Text = snapshot.RootContainerTypeId.ToString();
         _providerName.Text = snapshot.ProviderName;
         _persist.IsChecked = snapshot.PersistSyncRoot;
+        _enableNavigationEntry.IsChecked = snapshot.EnableExplorerNavigationEntry;
+        _enableMainWindow.IsChecked = snapshot.EnableMainWindow;
         _automaticUpdateCheck.IsChecked = snapshot.AutomaticUpdateCheck;
         _trayUpdateHint.IsChecked = snapshot.TrayUpdateHintEnabled;
         _automaticUpdateDownload.IsChecked = snapshot.AutomaticUpdateDownload;
@@ -677,6 +689,8 @@ internal sealed class SettingsWindow : Window
 
         var validationError = ValidateEditableValues(out var refreshMinutes, out var containerTypeId);
         if (validationError is not null) return validationError;
+        if (_enableNavigationEntry.IsChecked != true && _enableMainWindow.IsChecked != true)
+            return "导航栏入口与主界面至少需要启用一项。";
 
         var providerName = _providerName.Text.Trim();
         var selectedAccount = (_accountSelector.SelectedItem as ComboBoxItem)?.Tag as string;
@@ -723,6 +737,8 @@ internal sealed class SettingsWindow : Window
             AutomaticFileCacheCleanup = _automaticFileCacheCleanup.IsChecked == true,
             FileCacheCleanupHours = (_fileCacheCleanupInterval.SelectedItem as ComboBoxItem)?.Tag as int? ?? 24,
             PersistSyncRoot = _persist.IsChecked == true,
+            EnableExplorerNavigationEntry = _enableNavigationEntry.IsChecked == true,
+            EnableMainWindow = _enableMainWindow.IsChecked == true,
             AutomaticUpdateCheck = _automaticUpdateCheck.IsChecked == true,
             TrayUpdateHintEnabled = _trayUpdateHint.IsChecked == true,
             AutomaticUpdateDownload = _automaticUpdateDownload.IsChecked == true,
@@ -1053,6 +1069,10 @@ internal sealed class SettingsWindow : Window
         _providerName.TextChanged += (_, _) => MarkDirty();
         _persist.Checked += (_, _) => MarkDirty();
         _persist.Unchecked += (_, _) => MarkDirty();
+        _enableNavigationEntry.Checked += (_, _) => MarkDirty();
+        _enableNavigationEntry.Unchecked += (_, _) => MarkDirty();
+        _enableMainWindow.Checked += (_, _) => MarkDirty();
+        _enableMainWindow.Unchecked += (_, _) => MarkDirty();
         _automaticUpdateCheck.Checked += (_, _) => MarkDirty();
         _automaticUpdateCheck.Unchecked += (_, _) => MarkDirty();
         _trayUpdateHint.Checked += (_, _) => MarkDirty();

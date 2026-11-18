@@ -177,6 +177,12 @@ public sealed class SyncRootContext
     /// </summary>
     public bool PersistSyncRoot { get; set; } = true;
 
+    /// <summary>Whether the registered SyncRoot is also exposed as an Explorer navigation pane entry.</summary>
+    public bool EnableExplorerNavigationEntry { get; set; } = true;
+
+    /// <summary>Whether the remote file browser main window is available from the tray menu.</summary>
+    public bool EnableMainWindow { get; set; } = true;
+
     /// <summary>是否每日自动检查 GitHub Release 更新。</summary>
     public bool AutomaticUpdateCheck { get; set; } = true;
 

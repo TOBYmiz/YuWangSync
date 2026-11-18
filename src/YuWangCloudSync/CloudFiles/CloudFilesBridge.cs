@@ -75,15 +75,6 @@ public static class SyncRootRegistrar
                 throw new Win32Exception(result.Code, $"CfRegisterSyncRoot 失败: {result}");
 
             Callbacks.SyncRootPath = Path.GetFullPath(syncRootPath);
-            try
-            {
-                var iconPath = Path.Combine(AppContext.BaseDirectory, ProductIdentity.ExecutableFileName);
-                SyncRootShellRegistration.Update(syncRootPath, providerName, iconPath);
-            }
-            catch (Exception ex)
-            {
-                Callbacks.Log?.Invoke($"更新资源管理器同步根元数据失败（忽略）: {ex.Message}");
-            }
             var refreshed = CfRegisterSyncRoot(syncRootPath, registration, policies,
                 CF_REGISTER_FLAGS.CF_REGISTER_FLAG_UPDATE);
             if (refreshed.Failed)
@@ -97,11 +88,36 @@ public static class SyncRootRegistrar
         }
     }
 
+    public static void ConfigureNavigationEntry(string syncRootPath, string providerName, bool enabled)
+    {
+        if (!ProviderIdentity.OwnsRoot(syncRootPath, allowLegacy: true, providerName: providerName))
+            throw new InvalidOperationException("无法更改未注册的 Cloud Files 同步根导航入口。");
+        if (enabled)
+        {
+            var iconPath = Path.Combine(AppContext.BaseDirectory, ProductIdentity.ExecutableFileName);
+            SyncRootShellRegistration.Update(syncRootPath, providerName, iconPath);
+        }
+        else
+        {
+            SyncRootShellRegistration.RemoveNavigationEntry(syncRootPath);
+        }
+    }
+
+    private static void LogShellIntegrationFailure(string message)
+    {
+        try { Callbacks.Log?.Invoke(message); }
+        catch { /* 日志回调不能让 Explorer 集成故障影响 CFAPI 注册流程。 */ }
+    }
+
     public static void Unregister(string syncRootPath, string? providerName = null)
     {
         if (!ProviderIdentity.OwnsRoot(syncRootPath, allowLegacy: true, providerName: providerName))
             throw new InvalidOperationException("目标不是本程序的 SyncRoot，拒绝反注册。");
-        SyncRootShellRegistration.Remove(syncRootPath);
+        try { SyncRootShellRegistration.Remove(syncRootPath); }
+        catch (Exception ex)
+        {
+            LogShellIntegrationFailure($"Explorer 导航栏/搜索集成清理失败，继续注销 Cloud Files SyncRoot：{ex.Message}");
+        }
         if (ProviderIdentity.OwnsRoot(syncRootPath, allowLegacy: true, providerName: providerName))
         {
             var result = CfUnregisterSyncRoot(syncRootPath);
@@ -128,10 +144,14 @@ public static class SyncRootRegistrar
                 && ProviderIdentity.OwnsRoot(syncRootPath, allowLegacy: true, providerName: providerName))
                 throw new Win32Exception(result.Code, $"CfUnregisterSyncRoot 失败: {result}");
             if (result.Failed && !rootExists)
-                Callbacks.Log?.Invoke($"SyncRoot 目录已不存在，CfUnregisterSyncRoot 返回 0x{result.Code:X}；继续移除 shell 残留项。");
+                LogShellIntegrationFailure($"SyncRoot 目录已不存在，CfUnregisterSyncRoot 返回 0x{result.Code:X}；继续移除 shell 残留项。");
         }
 
-        SyncRootShellRegistration.Remove(registrationId, syncRootPath);
+        try { SyncRootShellRegistration.Remove(registrationId, syncRootPath); }
+        catch (Exception ex)
+        {
+            LogShellIntegrationFailure($"残留 Explorer 导航栏/搜索集成清理失败，继续处理 Cloud Files SyncRoot：{ex.Message}");
+        }
         ExplorerStateNotifier.NotifyItem(syncRootPath);
     }
 }
@@ -514,6 +534,34 @@ public static class Callbacks
             RefreshKeptDirectoryPaths(cache, identity.DiskId, identity.FileId, localDir, listing.Items);
             InvalidateFolderListing(identity.DiskId, identity.FileId);
             return (listing, previousFiles, previousFolderIds);
+        }
+    }
+
+    /// <summary>Persist a directory listing fetched by the main window using the same SQLite snapshot path as Explorer.</summary>
+    public static void StoreMainWindowDirectoryListing(FileIdentity identity, ulong parentFolderId,
+        string folderName, IReadOnlyList<Net.YuWangItem> remoteItems, DirectoryPermission permission)
+    {
+        var cache = Cache;
+        if (cache is null || !identity.IsValid || identity.IsVirtual || identity.Type != 0) return;
+
+        var localDir = cache.GetFolderLocalPath(identity.DiskId, identity.FileId) ?? "";
+        var nodeKey = new NodeKey(identity);
+        lock (GetDirectoryListingGate(identity))
+        {
+            cache.SaveDirectoryPermission(UserKey, identity.DiskId, identity.FileId, permission);
+            cache.SaveFolder(identity.DiskId, identity.FileId, parentFolderId, folderName, localDir, remoteItems);
+            if (!string.IsNullOrWhiteSpace(localDir))
+            {
+                RefreshKeptDirectoryPaths(cache, identity.DiskId, identity.FileId, localDir, remoteItems);
+                if (Directory.Exists(localDir))
+                    ReconcileRemovedPlaceholders(identity, localDir, remoteItems);
+            }
+
+            var items = EnrichFolderTimes(cache, identity.DiskId,
+                cache.ListCachedItems(identity.DiskId, identity.FileId));
+            InvalidateFolderListing(identity.DiskId, identity.FileId);
+            SetMem(nodeKey, items);
+            Log?.Invoke($"[MAIN] 已将目录清单与权限写入 SQLite folder={nodeKey} items={items.Count} access={permission}");
         }
     }
 

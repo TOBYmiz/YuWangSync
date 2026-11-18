@@ -33,13 +33,14 @@ internal static class SyncRootShellRegistration
         ExplorerStateNotifier.NotifyItem(syncRootPath);
     }
 
-    public static bool NeedsHydrationPolicyRefresh(string syncRootPath)
+    public static bool NeedsHydrationPolicyRefresh(string syncRootPath, bool requireNavigationEntry = true)
     {
         var registered = StorageProviderSyncRootManager.GetCurrentSyncRoots()
             .FirstOrDefault(root => root.Id == RegistrationId);
-        return registered == null
-            || !PathsEqual(registered.Path.Path, syncRootPath)
-            || registered.HydrationPolicy != StorageProviderHydrationPolicy.Progressive;
+        return (registered == null && requireNavigationEntry)
+            || (registered != null &&
+                (!PathsEqual(registered.Path.Path, syncRootPath)
+                 || registered.HydrationPolicy != StorageProviderHydrationPolicy.Progressive));
     }
 
     public static string[] GetRegisteredRootPaths()
@@ -84,6 +85,20 @@ internal static class SyncRootShellRegistration
 
     public static void Remove(string registrationId, string syncRootPath)
     {
+        RemoveNavigationRegistration(registrationId, syncRootPath);
+        SyncRootSearchIndex.Remove(syncRootPath, Callbacks.Log);
+        ExplorerStateNotifier.NotifyRegistrationChange();
+    }
+
+    /// <summary>Remove only the Explorer navigation metadata and preserve SyncRoot and Search integration.</summary>
+    public static void RemoveNavigationEntry(string syncRootPath)
+    {
+        RemoveNavigationRegistration(RegistrationId, syncRootPath);
+        ExplorerStateNotifier.NotifyRegistrationChange();
+    }
+
+    private static void RemoveNavigationRegistration(string registrationId, string syncRootPath)
+    {
         try
         {
             var registered = StorageProviderSyncRootManager.GetCurrentSyncRoots()
@@ -96,8 +111,6 @@ internal static class SyncRootShellRegistration
         catch { /* 注册表兜底仍可清理残留项。 */ }
 
         RemoveRegistryRegistration(registrationId, syncRootPath);
-        SyncRootSearchIndex.Remove(syncRootPath, Callbacks.Log);
-        ExplorerStateNotifier.NotifyRegistrationChange();
     }
 
     public static void Remove(string syncRootPath)

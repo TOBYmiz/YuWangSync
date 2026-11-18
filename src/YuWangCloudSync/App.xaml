@@ -21,6 +21,32 @@
                 <Setter Property="CornerRadius" Value="{ThemeResource OverlayCornerRadius}" />
                 <Setter Property="Padding" Value="16,12,16,14" />
             </Style>
+            <!-- Main window navigation tree. TreeViewNode.Content is a plain string (as in the stock
+                 TreeViewItemDataTemplate); MainWindow picks one of these fixed-icon templates per node kind. -->
+            <DataTemplate x:Key="YuWangNavigationRootTemplate">
+                <StackPanel Orientation="Horizontal" Spacing="10" ToolTipService.ToolTip="{Binding Content}">
+                    <FontIcon Glyph="&#xE753;" FontSize="16" VerticalAlignment="Center" />
+                    <TextBlock Text="{Binding Content}" TextTrimming="CharacterEllipsis" VerticalAlignment="Center" />
+                </StackPanel>
+            </DataTemplate>
+            <DataTemplate x:Key="YuWangNavigationContainerTemplate">
+                <StackPanel Orientation="Horizontal" Spacing="10" ToolTipService.ToolTip="{Binding Content}">
+                    <FontIcon Glyph="&#xE8F1;" FontSize="16" VerticalAlignment="Center" />
+                    <TextBlock Text="{Binding Content}" TextTrimming="CharacterEllipsis" VerticalAlignment="Center" />
+                </StackPanel>
+            </DataTemplate>
+            <DataTemplate x:Key="YuWangNavigationDiskTemplate">
+                <StackPanel Orientation="Horizontal" Spacing="10" ToolTipService.ToolTip="{Binding Content}">
+                    <FontIcon Glyph="&#xEDA2;" FontSize="16" VerticalAlignment="Center" />
+                    <TextBlock Text="{Binding Content}" TextTrimming="CharacterEllipsis" VerticalAlignment="Center" />
+                </StackPanel>
+            </DataTemplate>
+            <DataTemplate x:Key="YuWangNavigationFolderTemplate">
+                <StackPanel Orientation="Horizontal" Spacing="10" ToolTipService.ToolTip="{Binding Content}">
+                    <FontIcon Glyph="&#xE8B7;" FontSize="16" VerticalAlignment="Center" />
+                    <TextBlock Text="{Binding Content}" TextTrimming="CharacterEllipsis" VerticalAlignment="Center" />
+                </StackPanel>
+            </DataTemplate>
             <Style x:Key="YuWangImageFrameStyle" TargetType="Border" BasedOn="{StaticResource YuWangCardStyle}">
                 <Setter Property="Padding" Value="8" />
             </Style>

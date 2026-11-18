@@ -69,6 +69,11 @@ VIAddVersionKey "OriginalFilename" "@@SETUP_FILE_NAME@@"
 !define MUI_UNFINISHPAGE_TITLE "${PRODUCT_NAME_ZH}卸载完成"
 !define MUI_UNFINISHPAGE_TEXT "${PRODUCT_NAME_ZH}已从此计算机中移除。"
 
+; Variables used by the MUI finish-page reboot prompt must be declared before the page macros.
+Var ExplorerRestartDeferred
+Var FinishRebootText
+Var FinishRebootNowText
+
 !define MUI_PAGE_CUSTOMFUNCTION_PRE WelcomePagePre
 !define MUI_PAGE_CUSTOMFUNCTION_SHOW WelcomePageShow
 !insertmacro MUI_PAGE_WELCOME
@@ -88,6 +93,9 @@ PageExEnd
 !insertmacro MUI_PAGE_INSTFILES
 !define MUI_PAGE_CUSTOMFUNCTION_PRE FinishPagePre
 !define MUI_PAGE_CUSTOMFUNCTION_SHOW FinishPageShow
+!define MUI_PAGE_CUSTOMFUNCTION_LEAVE FinishPageLeave
+!define MUI_FINISHPAGE_TEXT_REBOOT "$FinishRebootText"
+!define MUI_FINISHPAGE_TEXT_REBOOTNOW "$FinishRebootNowText"
 !insertmacro MUI_PAGE_FINISH
 PageEx custom
   PageCallbacks FailurePageShow FailurePageLeave
@@ -98,7 +106,11 @@ PageExEnd
 UninstPage custom un.UninstallOptionsPage un.UninstallOptionsLeave
 !insertmacro MUI_UNPAGE_CONFIRM
 !insertmacro MUI_UNPAGE_INSTFILES
+!define MUI_PAGE_CUSTOMFUNCTION_PRE un.FinishPagePre
 !define MUI_PAGE_CUSTOMFUNCTION_SHOW un.UninstallerPageShow
+!define MUI_PAGE_CUSTOMFUNCTION_LEAVE un.FinishPageLeave
+!define MUI_FINISHPAGE_TEXT_REBOOT "$FinishRebootText"
+!define MUI_FINISHPAGE_TEXT_REBOOTNOW "$FinishRebootNowText"
 !insertmacro MUI_UNPAGE_FINISH
 
 !insertmacro MUI_LANGUAGE "SimpChinese"
@@ -124,6 +136,9 @@ Var SyncRoot
 Var SyncRootRecoveryFailed
 Var SyncRootRecoveryPayloadExtracted
 Var CreateDesktopShortcut
+Var EnableExplorerNavigationEntry
+Var EnableMainWindow
+Var ApplyFeatureOptions
 Var KeepDownloadedFiles
 Var KeepUserConfiguration
 Var InstallDirectoryEdit
@@ -145,6 +160,8 @@ Var SessionUsername
 Var SyncRootEdit
 Var SyncRootBrowse
 Var DesktopShortcutCheckbox
+Var NavigationEntryOptionCheckbox
+Var MainWindowOptionCheckbox
 Var KeepDownloadedCheckbox
 Var KeepConfigurationCheckbox
 Var SummaryText
@@ -290,6 +307,9 @@ quick_update_argument_missing:
   StrCpy $InstallDirectory "$PROGRAMFILES64\${PRODUCT_IDENTIFIER}"
   StrCpy $SyncRoot "$PROFILE\YuWangCloud"
   StrCpy $CreateDesktopShortcut "1"
+  StrCpy $EnableExplorerNavigationEntry "true"
+  StrCpy $EnableMainWindow "true"
+  StrCpy $ApplyFeatureOptions "0"
   StrCpy $IsInstalled "0"
   StrCpy $InstallationBlocked "0"
   StrCpy $PreviousShellExtensionFileName "${PRODUCT_IDENTIFIER}ShellExt.dll"
@@ -474,6 +494,12 @@ FunctionEnd
 Function FinishPagePre
   ${If} $InstallationBlocked == "1"
     Abort
+  ${EndIf}
+  StrCpy $FinishRebootNowText "$(MUI_TEXT_FINISH_REBOOTNOW)"
+  StrCpy $FinishRebootText "$(MUI_TEXT_FINISH_INFO_REBOOT)"
+  ${If} $ExplorerRestartDeferred == "1"
+    StrCpy $FinishRebootNowText "重启资源管理器(&Y)"
+    StrCpy $FinishRebootText "需要重启资源管理器，或注销/重启计算机，才能完成${PRODUCT_NAME_ZH}的安装。是否立即重启资源管理器？"
   ${EndIf}
   ${If} $QuickUpdateRequested == "1"
   ${AndIf} $IsInstalled == "1"
@@ -1044,24 +1070,36 @@ Function SyncRootPage
     ${EndIf}
     DeleteRegKey HKCU "SOFTWARE\${PRODUCT_IDENTIFIER}\SetupRecovery"
   ${EndIf}
-  !insertmacro MUI_HEADER_TEXT "选择同步目录与快捷方式" "选择同步根目录，需选择空目录。"
+  !insertmacro MUI_HEADER_TEXT "选择同步目录与功能" "同步目录由 Cloud Files 使用；导航栏入口与主界面可分别设置。"
   nsDialogs::Create 1018
   Pop $PageDialog
   ${If} $PageDialog == error
     Abort
   ${EndIf}
-  ${NSD_CreateLabel} 0 0 100% 12u "本地同步根目录"
+  ${NSD_CreateLabel} 0 0 100% 12u "Cloud Files 本地同步根目录"
   Pop $0
   ${NSD_CreateText} 0 14u 78% 13u "$SyncRoot"
   Pop $SyncRootEdit
   ${NSD_CreateButton} 81% 13u 19% 15u "浏览"
   Pop $SyncRootBrowse
   ${NSD_OnClick} $SyncRootBrowse BrowseSyncRoot
-  ${NSD_CreateCheckbox} 0 48u 100% 14u "创建桌面快捷方式（可打开同步目录）"
+  ${NSD_CreateCheckbox} 0 48u 100% 14u "创建桌面快捷方式（启动后可从托盘开启主界面）"
   Pop $DesktopShortcutCheckbox
   ${If} $CreateDesktopShortcut == "1"
     ${NSD_SetState} $DesktopShortcutCheckbox ${BST_CHECKED}
   ${EndIf}
+  ${NSD_CreateCheckbox} 0 76u 100% 16u "显示 Explorer 导航栏入口"
+  Pop $NavigationEntryOptionCheckbox
+  ${If} $EnableExplorerNavigationEntry == "true"
+    ${NSD_SetState} $NavigationEntryOptionCheckbox ${BST_CHECKED}
+  ${EndIf}
+  ${NSD_CreateCheckbox} 0 96u 100% 16u "启用主界面（远程文件浏览与拖放）"
+  Pop $MainWindowOptionCheckbox
+  ${If} $EnableMainWindow == "true"
+    ${NSD_SetState} $MainWindowOptionCheckbox ${BST_CHECKED}
+  ${EndIf}
+  ${NSD_CreateLabel} 0 117u 100% 24u "至少启用导航栏入口或主界面一项。关闭入口不影响 Cloud Files 同步；开机启动只在托盘运行。"
+  Pop $0
   nsDialogs::Show
 FunctionEnd
 
@@ -1083,6 +1121,21 @@ Function SyncRootPageLeave
   ${If} $0 == ${BST_CHECKED}
     StrCpy $CreateDesktopShortcut "1"
   ${EndIf}
+  ${NSD_GetState} $NavigationEntryOptionCheckbox $0
+  StrCpy $EnableExplorerNavigationEntry "false"
+  ${If} $0 == ${BST_CHECKED}
+    StrCpy $EnableExplorerNavigationEntry "true"
+  ${EndIf}
+  ${NSD_GetState} $MainWindowOptionCheckbox $0
+  StrCpy $EnableMainWindow "false"
+  ${If} $0 == ${BST_CHECKED}
+    StrCpy $EnableMainWindow "true"
+  ${EndIf}
+  ${If} $EnableExplorerNavigationEntry == "false"
+  ${AndIf} $EnableMainWindow == "false"
+    MessageBox MB_OK|MB_ICONEXCLAMATION "导航栏入口与主界面至少需要启用一项。"
+    Abort
+  ${EndIf}
   ${If} $SyncRoot == ""
     MessageBox MB_OK|MB_ICONEXCLAMATION "请选择本地同步目录。"
     Abort
@@ -1091,6 +1144,7 @@ Function SyncRootPageLeave
   ${If} $R9 != 0
     Abort
   ${EndIf}
+  StrCpy $ApplyFeatureOptions "1"
 FunctionEnd
 
 Function ValidateSyncRoot
@@ -1240,10 +1294,159 @@ Function SummaryPage
   ${Else}
     StrCpy $0 "$0不创建"
   ${EndIf}
+  StrCpy $0 "$0$\r$\nExplorer 导航栏入口："
+  ${If} $EnableExplorerNavigationEntry == "true"
+    StrCpy $0 "$0启用"
+  ${Else}
+    StrCpy $0 "$0关闭"
+  ${EndIf}
+  StrCpy $0 "$0$\r$\n主界面："
+  ${If} $EnableMainWindow == "true"
+    StrCpy $0 "$0启用"
+  ${Else}
+    StrCpy $0 "$0关闭"
+  ${EndIf}
   ${NSD_CreateLabel} 0 0 100% 100u "$0"
   Pop $SummaryText
   nsDialogs::Show
 FunctionEnd
+
+Function FinishPageLeave
+  ${If} $ExplorerRestartDeferred == "1"
+  ${AndIf} ${RebootFlag}
+    SendMessage $mui.FinishPage.RebootNow ${BM_GETCHECK} 0 0 $0
+    ${If} $0 == ${BST_CHECKED}
+      Call RestartExplorerNow
+      ; The remaining pending file operations finish at the next logoff/reboot; do not let MUI reboot now.
+      SetRebootFlag false
+      ; Upgrades stopped the running app, and the reboot prompt replaced the launch checkbox.
+      ExecShell "open" "$INSTDIR\${PRODUCT_IDENTIFIER}.exe"
+    ${EndIf}
+  ${EndIf}
+FunctionEnd
+
+Function un.FinishPagePre
+  StrCpy $FinishRebootNowText "$(MUI_TEXT_FINISH_REBOOTNOW)"
+  StrCpy $FinishRebootText "$(MUI_UNTEXT_FINISH_INFO_REBOOT)"
+  ${If} $ExplorerRestartDeferred == "1"
+    StrCpy $FinishRebootNowText "重启资源管理器(&Y)"
+    StrCpy $FinishRebootText "需要重启资源管理器，或注销/重启计算机，才能完成${PRODUCT_NAME_ZH}的卸载。是否立即重启资源管理器？"
+  ${EndIf}
+FunctionEnd
+
+Function un.FinishPageLeave
+  ${If} $ExplorerRestartDeferred == "1"
+  ${AndIf} ${RebootFlag}
+    SendMessage $mui.FinishPage.RebootNow ${BM_GETCHECK} 0 0 $0
+    ${If} $0 == ${BST_CHECKED}
+      Call un.RestartExplorerNow
+      SetRebootFlag false
+    ${EndIf}
+  ${EndIf}
+FunctionEnd
+
+!macro DEFINE_EXPLORER_RESTART_FUNCTIONS UN
+; Restart the current session's Explorer shell. Terminating it lets Winlogon (AutoRestartShell)
+; relaunch it with the user's normal token; only fall back to starting it from Setup if that does not happen.
+Function ${UN}RestartExplorerNow
+  Push $0
+  Push $1
+  Push $2
+  Push $3
+  FindWindow $0 "Shell_TrayWnd"
+  ${If} $0 == 0
+    Goto ${UN}restart_explorer_done
+  ${EndIf}
+  DetailPrint "正在重启资源管理器…"
+  StrCpy $1 0
+  System::Call 'user32::GetWindowThreadProcessId(p r0, *i .r1) i'
+  ${If} $1 == 0
+    Goto ${UN}restart_explorer_done
+  ${EndIf}
+  ; SYNCHRONIZE | PROCESS_TERMINATE
+  System::Call 'kernel32::OpenProcess(i 0x00100001, i 0, i r1) p .r2'
+  ${If} $2 == 0
+    DetailPrint "无法重启资源管理器。"
+    Goto ${UN}restart_explorer_done
+  ${EndIf}
+  System::Call 'kernel32::TerminateProcess(p r2, i 1) i'
+  System::Call 'kernel32::WaitForSingleObject(p r2, i 5000) i'
+  System::Call 'kernel32::CloseHandle(p r2) i'
+  StrCpy $3 0
+${UN}restart_explorer_wait:
+  Sleep 250
+  FindWindow $0 "Shell_TrayWnd"
+  ${If} $0 != 0
+    Goto ${UN}restart_explorer_done
+  ${EndIf}
+  IntOp $3 $3 + 1
+  IntCmp $3 40 0 ${UN}restart_explorer_wait
+  Exec '"$WINDIR\explorer.exe"'
+${UN}restart_explorer_done:
+  Pop $3
+  Pop $2
+  Pop $1
+  Pop $0
+FunctionEnd
+
+; Called right after the shell extension has been (un)registered.
+; "确定" restarts Explorer now so the DLL is released; "稍后" changes the finish-page reboot prompt.
+Function ${UN}PromptExplorerRestart
+  Push $0
+  Push $1
+  Push $2
+  Push $3
+  Push $4
+  Push $5
+  Push $6
+  Push $7
+  FindWindow $0 "Shell_TrayWnd"
+  ${If} $0 == 0
+    Goto ${UN}prompt_explorer_done
+  ${EndIf}
+  ${If} ${Silent}
+    StrCpy $ExplorerRestartDeferred "1"
+    Goto ${UN}prompt_explorer_done
+  ${EndIf}
+  StrCpy $6 0
+  System::Call '*(&w${NSIS_MAX_STRLEN} "${PRODUCT_NAME_ZH}") p .r1'
+  System::Call '*(&w64 "即将重启资源管理器。") p .r2'
+  System::Call '*(&w8 "确定") p .r3'
+  System::Call '*(&w8 "稍后") p .r4'
+  ; TASKDIALOG_BUTTON[2]: IDOK = 确定, 100 = 稍后.
+  System::Call '*(i 1, p r3, i 100, p r4) p .r5'
+  ; TASKDIALOGCONFIG (x86, 96 bytes): TDF_ALLOW_DIALOG_CANCELLATION, TD_INFORMATION_ICON, default IDOK.
+  System::Call '*(i 96, p $HWNDPARENT, p 0, i 0x8, i 0, p r1, p 0xFFFD, p 0, p r2, i 2, p r5, i 1, i 0, p 0, i 0, p 0, p 0, p 0, p 0, p 0, p 0, p 0, p 0, i 0) p .r0'
+  System::Call 'comctl32::TaskDialogIndirect(p r0, *i .r6, p 0, p 0) i .r7'
+  System::Free $0
+  System::Free $5
+  System::Free $4
+  System::Free $3
+  System::Free $2
+  System::Free $1
+  ${If} $7 != 0
+    StrCpy $6 100
+    MessageBox MB_OKCANCEL|MB_ICONINFORMATION "即将重启资源管理器。" IDCANCEL +2
+    StrCpy $6 1
+  ${EndIf}
+  ${If} $6 == 1
+    Call ${UN}RestartExplorerNow
+  ${Else}
+    StrCpy $ExplorerRestartDeferred "1"
+  ${EndIf}
+${UN}prompt_explorer_done:
+  Pop $7
+  Pop $6
+  Pop $5
+  Pop $4
+  Pop $3
+  Pop $2
+  Pop $1
+  Pop $0
+FunctionEnd
+!macroend
+!insertmacro DEFINE_EXPLORER_RESTART_FUNCTIONS ""
+!insertmacro DEFINE_EXPLORER_RESTART_FUNCTIONS "un."
 
 Function FinishPageShow
   ${NSD_OnClick} $mui.FinishPage.Run FinishPageLaunchClicked
@@ -1267,6 +1470,9 @@ Function FinishPageLaunchClicked
     EnableWindow $mui.FinishPage.ShowReadme 0
   ${ElseIf} $SyncRoot != ""
     EnableWindow $mui.FinishPage.ShowReadme 1
+  ${Else}
+    SendMessage $mui.FinishPage.ShowReadme ${BM_SETCHECK} ${BST_UNCHECKED} 0
+    EnableWindow $mui.FinishPage.ShowReadme 0
   ${EndIf}
 FunctionEnd
 
@@ -1376,7 +1582,7 @@ save_config_password_ok:
   StrCpy $ConfigPath "$ConfigDirectory\appsettings.json"
   FileOpen $R0 "$ConfigPath" w
   IfErrors save_config_failed
-  FileWriteUTF16LE /BOM $R0 "{$\"SyncRootPath$\":$\"$SyncRoot$\",$\"Server$\":$\"$Server$\",$\"Username$\":$\"$Username$\",$\"UserKey$\":$\"$Username$\",$\"ProtectedPassword$\":$\"$ProtectedPassword$\"}"
+  FileWriteUTF16LE /BOM $R0 "{$\"SyncRootPath$\":$\"$SyncRoot$\",$\"Server$\":$\"$Server$\",$\"Username$\":$\"$Username$\",$\"UserKey$\":$\"$Username$\",$\"ProtectedPassword$\":$\"$ProtectedPassword$\",$\"EnableExplorerNavigationEntry$\":$EnableExplorerNavigationEntry,$\"EnableMainWindow$\":$EnableMainWindow}"
   FileClose $R0
   StrCpy $ProtectedPassword ""
 
@@ -2057,6 +2263,18 @@ install_shell_file_done:
     ${EndIf}
   ${EndIf}
 
+  ${If} $IsInstalled == "1"
+  ${AndIf} $ApplyFeatureOptions == "1"
+    nsExec::ExecToStack /TIMEOUT=30000 '"$INSTDIR\${PRODUCT_IDENTIFIER}.exe" --set-feature-options $EnableExplorerNavigationEntry $EnableMainWindow'
+    Pop $R9
+    Pop $R8
+    ${If} $R9 != "0"
+      MessageBox MB_OK|MB_ICONSTOP "无法保存导航栏入口与主界面安装选项。"
+      SetErrorLevel 1
+      Abort
+    ${EndIf}
+  ${EndIf}
+
   ${If} $IsInstalled != "1"
     nsExec::ExecToStack /TIMEOUT=30000 '"$SYSDIR\schtasks.exe" /Create /TN "${PRODUCT_IDENTIFIER}-$UserSid" /SC ONLOGON /TR "\"$INSTDIR\${PRODUCT_IDENTIFIER}.exe\"" /RL HIGHEST /F'
     Pop $R9
@@ -2082,6 +2300,7 @@ install_shell_file_done:
     SetErrorLevel 1
     Abort
   ${EndIf}
+  Call PromptExplorerRestart
 
   WriteRegStr HKLM "${UNINSTALL_KEY}" "ShellExtensionDll" "${SHELL_EXTENSION_FILE_NAME}"
   ${If} $IsInstalled == "1"
@@ -2093,7 +2312,7 @@ install_shell_file_done:
   ; Preserve the user's shortcut name and contents during upgrades.
   ${If} $IsInstalled != "1"
   ${AndIf} $CreateDesktopShortcut == "1"
-    CreateShortCut "$DESKTOP\${PRODUCT_NAME_ZH}.lnk" "$INSTDIR\${PRODUCT_IDENTIFIER}.exe" "-open-folder" "$INSTDIR\Assets\${PRODUCT_IDENTIFIER}-shortcut-${PRODUCT_VERSION}.ico" 0 SW_SHOWNORMAL "" "启动${PRODUCT_NAME_ZH}并打开同步目录"
+    CreateShortCut "$DESKTOP\${PRODUCT_NAME_ZH}.lnk" "$INSTDIR\${PRODUCT_IDENTIFIER}.exe" "" "$INSTDIR\Assets\${PRODUCT_IDENTIFIER}-shortcut-${PRODUCT_VERSION}.ico" 0 SW_SHOWNORMAL "" "启动${PRODUCT_NAME_ZH}（主界面可从托盘打开）"
   ${EndIf}
   Call RefreshDesktopShortcutIcons
 
@@ -2161,6 +2380,7 @@ uninstall_shell_present:
     SetErrorLevel 1
     Abort
   ${EndIf}
+  Call un.PromptExplorerRestart
 uninstall_shell_done:
 
   SetRegView 64
