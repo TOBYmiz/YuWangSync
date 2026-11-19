@@ -23,6 +23,7 @@ internal static class AutomationRegression
             Environment.SetEnvironmentVariable("TEMP", testTemp);
             Environment.SetEnvironmentVariable("TMP", testTemp);
             CheckConfiguration(check);
+            CheckCleanupHistory(check, testTemp);
             await CheckCleanupScheduleAsync(check);
             await CheckAutomaticDownloadAsync(check);
         }
@@ -62,6 +63,43 @@ internal static class AutomationRegression
                 new[] { 0, -1, 7, 999 }.All(value => SyncRootContext.NormalizeFileCacheCleanupHours(value) == 24));
         }
         finally { Directory.Delete(root, recursive: true); }
+    }
+
+    private static void CheckCleanupHistory(Action<string, bool> check, string testRoot)
+    {
+        var path = Path.Combine(testRoot, "cleanup-history.json");
+        var now = new DateTimeOffset(new DateTime(2026, 11, 19, 12, 0, 0, DateTimeKind.Local));
+        var completed = now.LocalDateTime.AddHours(-2);
+        var record = new FileCacheCleanupRecord(new DateTimeOffset(completed), 1572864);
+        check("missing cleanup history displays no record",
+            FileCacheCleanupHistory.Format(FileCacheCleanupHistory.Read(path), now) == "上次清理：无记录");
+        FileCacheCleanupHistory.Write(path, record);
+        check("cleanup history survives a reload with its completion time and total bytes",
+            FileCacheCleanupHistory.Read(path) == record);
+        check("same-day cleanup omits year month and day",
+            FileCacheCleanupHistory.Format(record, now) == "上次清理：10:00 [1.5 MB]");
+        check("previous-day cleanup shows the day",
+            FileCacheCleanupHistory.Format(record with { CompletedAt = new DateTimeOffset(completed.AddDays(-1)) }, now)
+                == "上次清理：18 日 10:00 [1.5 MB]");
+        check("previous-month cleanup independently omits the matching day and year",
+            FileCacheCleanupHistory.Format(record with { CompletedAt = new DateTimeOffset(completed.AddMonths(-1)) }, now)
+                == "上次清理：10 月 10:00 [1.5 MB]");
+        check("previous-year cleanup independently omits the matching month and day",
+            FileCacheCleanupHistory.Format(record with { CompletedAt = new DateTimeOffset(completed.AddYears(-1)) }, now)
+                == "上次清理：2025 年 10:00 [1.5 MB]");
+        check("cleanup in a different year month and day shows the full date",
+            FileCacheCleanupHistory.Format(record with
+                { CompletedAt = new DateTimeOffset(completed.AddYears(-1).AddMonths(-1).AddDays(-1)) }, now)
+                == "上次清理：2025 年 10 月 18 日 10:00 [1.5 MB]");
+        check("cleanup without freed files still records a zero-byte total",
+            FileCacheCleanupHistory.Format(record with { FreedBytes = 0 }, now)
+                == "上次清理：10:00 [0 B]");
+        check("cleanup timestamps are compared and displayed in local time",
+            FileCacheCleanupHistory.Format(record with { CompletedAt = record.CompletedAt.ToUniversalTime() }, now)
+                == "上次清理：10:00 [1.5 MB]");
+        check("cleanup history re-evaluates the date after midnight",
+            FileCacheCleanupHistory.Format(record, now.AddDays(1))
+                == "上次清理：19 日 10:00 [1.5 MB]");
     }
 
     private static async Task CheckCleanupScheduleAsync(Action<string, bool> check)

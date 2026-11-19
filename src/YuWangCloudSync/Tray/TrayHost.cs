@@ -30,6 +30,7 @@ internal static class TrayHost
     private static bool _trayUpdateHintEnabled = true;
     private static bool _mainWindowEnabled = true;
     private static bool _trayCreated;
+    private static bool _showingTrayMenu;
     private static readonly ManualResetEventSlim ShutdownComplete = new(false);
     private static readonly CancellationTokenSource TrayLifetime = new();
     private static readonly SemaphoreSlim TrayRecoveryRequested = new(0, 1);
@@ -53,9 +54,6 @@ internal static class TrayHost
 
     [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
     private static extern IntPtr FindWindow(string? className, string? windowName);
-
-    [DllImport("user32.dll", SetLastError = true)]
-    private static extern bool GetCursorPos(out CursorPoint point);
 
     [DllImport("user32.dll", SetLastError = true)]
     private static extern bool SetForegroundWindow(IntPtr window);
@@ -90,6 +88,27 @@ internal static class TrayHost
     [DllImport("kernel32.dll", CharSet = CharSet.Auto)]
     private static extern IntPtr GetModuleHandle(string? moduleName);
 
+    [DllImport("shell32.dll", ExactSpelling = true)]
+    private static extern int Shell_NotifyIconGetRect(ref NotifyIconIdentifier identifier, out NativeRect rect);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct NotifyIconIdentifier
+    {
+        public uint Size;
+        public IntPtr Window;
+        public uint Id;
+        public Guid Guid;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct NativeRect
+    {
+        public int Left;
+        public int Top;
+        public int Right;
+        public int Bottom;
+    }
+
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Auto)]
     private struct WndClassEx
     {
@@ -105,13 +124,6 @@ internal static class TrayHost
         public string? MenuName;
         public string ClassName;
         public IntPtr SmallIcon;
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct CursorPoint
-    {
-        public int X;
-        public int Y;
     }
 
     [UnmanagedFunctionPointer(CallingConvention.Winapi)]
@@ -187,6 +199,7 @@ internal static class TrayHost
                 if (_tray != null)
                 {
                     _tray.MessageWindow.MouseEventReceived -= OnTrayMouseEvent;
+                    _tray.MessageWindow.KeyboardEventReceived -= OnTrayKeyboardEvent;
                     _tray.MessageWindow.TaskbarCreated -= OnTaskbarCreated;
                 }
                 _tray?.Dispose();
@@ -271,6 +284,7 @@ internal static class TrayHost
             ToolTip = ProductIdentity.DisplayNameZh,
         };
         _tray.MessageWindow.MouseEventReceived += OnTrayMouseEvent;
+        _tray.MessageWindow.KeyboardEventReceived += OnTrayKeyboardEvent;
         _tray.MessageWindow.TaskbarCreated += OnTaskbarCreated;
         _tray.MessageWindow.Create();
         // Setup starts us elevated; Explorer normally runs at medium integrity. Allow just
@@ -496,20 +510,64 @@ internal static class TrayHost
 
     private static void OnTrayMouseEvent(object? sender, MessageWindow.MouseEventReceivedEventArgs args)
     {
-        if (args.MouseEvent != MouseEvent.IconRightMouseUp || _trayContextMenu == null || _tray == null)
+        if (args.MouseEvent == MouseEvent.IconLeftMouseUp)
+        {
+            try
+            {
+                if (Program.SnapshotConfig().ShouldTrayClickOpenMainWindow()) OpenMainWindow();
+                else OpenSyncDirectory();
+            }
+            catch (Exception ex) { Log.Warning(ex, "托盘单击动作失败"); }
+            return;
+        }
+        if (args.MouseEvent != MouseEvent.IconRightMouseUp || _tray == null)
             return;
 
+        // Version 4 provides a reliable context-menu anchor with WM_CONTEXTMENU.
+        // wParam is undefined for a raw WM_RBUTTONUP in that protocol.
+        if (_tray.Version != IconVersion.Vista) ShowTrayContextMenu(args.Point);
+    }
+
+    private static void OnTrayKeyboardEvent(object? sender, MessageWindow.KeyboardEventReceivedEventArgs args)
+    {
+        // H.NotifyIcon routes WM_CONTEXTMENU here, including mouse and touch requests.
+        if (args.KeyboardEvent == KeyboardEvent.ContextMenu) ShowTrayContextMenu(args.Point);
+    }
+
+    private static void ShowTrayContextMenu(System.Drawing.Point point)
+    {
+        var tray = _tray;
+        var menu = _trayContextMenu;
+        if (tray is null || menu is null || _showingTrayMenu || TrayLifetime.IsCancellationRequested) return;
+        _showingTrayMenu = true;
         try
         {
-            if (!GetCursorPos(out var point)) return;
-            SetForegroundWindow(_tray.WindowHandle);
-            _trayContextMenu.Show(_tray.WindowHandle, point.X, point.Y);
-            _tray.SetFocus();
+            // The library unpacks version-4 coordinates as unsigned words. Restore signed
+            // screen coordinates for monitors positioned to the left/above the main monitor.
+            if (tray.Version == IconVersion.Vista)
+                point = new System.Drawing.Point(unchecked((short)point.X), unchecked((short)point.Y));
+            if (point.X == -1 && point.Y == -1)
+            {
+                // Keyboard requests can omit a location. Anchor those to the tray icon.
+                var identifier = new NotifyIconIdentifier
+                {
+                    Size = (uint)Marshal.SizeOf<NotifyIconIdentifier>(),
+                    Window = tray.WindowHandle,
+                    Guid = tray.Id,
+                };
+                if (Shell_NotifyIconGetRect(ref identifier, out var bounds) < 0
+                    || bounds.Right <= bounds.Left || bounds.Bottom <= bounds.Top) return;
+                point = new System.Drawing.Point(bounds.Left + (bounds.Right - bounds.Left) / 2, bounds.Bottom);
+            }
+            SetForegroundWindow(tray.WindowHandle);
+            menu.Show(tray.WindowHandle, point.X, point.Y);
+            tray.SetFocus();
         }
         catch (Exception ex)
         {
             Log.Warning(ex, "托盘菜单显示失败（忽略）");
         }
+        finally { _showingTrayMenu = false; }
     }
 
     private static void OpenSyncDirectory()

@@ -10,6 +10,7 @@ using Microsoft.UI.Xaml.Media.Imaging;
 using Windows.Graphics.Imaging;
 using Windows.Storage.Streams;
 using WinRT.Interop;
+using YuWangCloudSync.CloudFiles;
 using YuWangCloudSync.Models;
 using VirtualKey = Windows.System.VirtualKey;
 
@@ -163,6 +164,9 @@ internal static class WinUiUiHost
         if (!Post(() => ShowSettingsOnUi(snapshot)))
             Serilog.Log.Warning("WinUI UI 线程不可用，无法打开设置窗口");
     }
+
+    internal static void UpdateFileCacheCleanupHistory(FileCacheCleanupRecord record)
+        => Post(() => _settings?.UpdateFileCacheCleanupHistory(record));
 
     internal static void ShowMainWindow()
     {

@@ -17,5 +17,6 @@
     <Compile Include="..\..\src\YuWangCloudSync\Updates\UpdateService.cs" Link="UpdateService.cs" />
     <Compile Include="..\..\src\YuWangCloudSync\Updates\UpdateInstallVariant.cs" Link="UpdateInstallVariant.cs" />
     <Compile Include="..\..\src\YuWangCloudSync\CloudFiles\FileCacheCleanupService.cs" Link="FileCacheCleanupService.cs" />
+    <Compile Include="..\..\src\YuWangCloudSync\CloudFiles\FileCacheCleanupHistory.cs" Link="FileCacheCleanupHistory.cs" />
   </ItemGroup>
 </Project>

@@ -1083,7 +1083,7 @@ Function SyncRootPage
   ${NSD_CreateButton} 81% 13u 19% 15u "浏览"
   Pop $SyncRootBrowse
   ${NSD_OnClick} $SyncRootBrowse BrowseSyncRoot
-  ${NSD_CreateCheckbox} 0 48u 100% 14u "创建桌面快捷方式（启动后可从托盘开启主界面）"
+  ${NSD_CreateCheckbox} 0 48u 100% 14u "创建桌面快捷方式（打开同步目录或主界面，可在设置中选择）"
   Pop $DesktopShortcutCheckbox
   ${If} $CreateDesktopShortcut == "1"
     ${NSD_SetState} $DesktopShortcutCheckbox ${BST_CHECKED}
@@ -1457,7 +1457,7 @@ FunctionEnd
 Function LaunchAppOnFinish
   SendMessage $mui.FinishPage.ShowReadme ${BM_GETCHECK} 0 0 $R0
   ${If} $R0 == ${BST_CHECKED}
-    ExecShell "open" "$INSTDIR\${PRODUCT_IDENTIFIER}.exe" "-open-folder"
+    ExecShell "open" "$INSTDIR\${PRODUCT_IDENTIFIER}.exe" "--open-sync-folder"
   ${Else}
     ExecShell "open" "$INSTDIR\${PRODUCT_IDENTIFIER}.exe"
   ${EndIf}
@@ -1477,7 +1477,7 @@ Function FinishPageLaunchClicked
 FunctionEnd
 
 Function OpenSyncFolder
-  ; LaunchAppOnFinish passes -open-folder so the app opens its configured path.
+  ; LaunchAppOnFinish passes --open-sync-folder so the app always opens its configured sync folder.
 FunctionEnd
 
 Function EscapeJson
@@ -2312,7 +2312,7 @@ install_shell_file_done:
   ; Preserve the user's shortcut name and contents during upgrades.
   ${If} $IsInstalled != "1"
   ${AndIf} $CreateDesktopShortcut == "1"
-    CreateShortCut "$DESKTOP\${PRODUCT_NAME_ZH}.lnk" "$INSTDIR\${PRODUCT_IDENTIFIER}.exe" "" "$INSTDIR\Assets\${PRODUCT_IDENTIFIER}-shortcut-${PRODUCT_VERSION}.ico" 0 SW_SHOWNORMAL "" "启动${PRODUCT_NAME_ZH}（主界面可从托盘打开）"
+    CreateShortCut "$DESKTOP\${PRODUCT_NAME_ZH}.lnk" "$INSTDIR\${PRODUCT_IDENTIFIER}.exe" "-open-folder" "$INSTDIR\Assets\${PRODUCT_IDENTIFIER}-shortcut-${PRODUCT_VERSION}.ico" 0 SW_SHOWNORMAL "" "启动${PRODUCT_NAME_ZH}并打开同步目录或主界面（可在设置中选择）"
   ${EndIf}
   Call RefreshDesktopShortcutIcons
 

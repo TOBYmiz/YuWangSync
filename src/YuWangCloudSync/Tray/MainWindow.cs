@@ -6,6 +6,7 @@ using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Controls.Primitives;
 using Microsoft.UI.Xaml.Input;
 using Microsoft.UI.Xaml.Media;
+using Microsoft.UI.Xaml.Media.Animation;
 using Microsoft.UI.Xaml.Media.Imaging;
 using Windows.ApplicationModel.DataTransfer;
 using Windows.Storage;
@@ -21,7 +22,9 @@ using YuWangCloudSync.Net;
 namespace YuWangCloudSync.Tray;
 
 /// <summary>On-demand WinUI cloud browser. The tray-hosted engine remains alive when this window closes.</summary>
-internal sealed class MainWindow : Window
+// CsWinRT also requires containing types to be partial before it can generate the
+// nested NavigationTreeTemplateSelector's WinRT interfaces for NativeAOT.
+internal sealed partial class MainWindow : Window
 {
     private enum SortColumn { Name, Modified, Type, Size }
 
@@ -31,6 +34,7 @@ internal sealed class MainWindow : Window
     private sealed partial class NavigationTreeTemplateSelector(
         Func<TreeViewNode, NavigationNodeKind?> resolveKind) : DataTemplateSelector
     {
+        private readonly HashSet<NavigationNodeKind> _tracedKinds = [];
         private readonly Dictionary<NavigationNodeKind, DataTemplate?> _templates = new()
         {
             [NavigationNodeKind.Root] = WinUiUiHost.GetDataTemplateResource("YuWangNavigationRootTemplate"),
@@ -42,7 +46,10 @@ internal sealed class MainWindow : Window
         protected override DataTemplate SelectTemplateCore(object item)
         {
             var kind = item is TreeViewNode node ? resolveKind(node) : null;
-            return _templates[kind ?? NavigationNodeKind.Folder]!;
+            var resolvedKind = kind ?? NavigationNodeKind.Folder;
+            if (_tracedKinds.Add(resolvedKind))
+                TraceUiStage($"首次选择导航模板：{resolvedKind}; ItemType={item?.GetType().FullName ?? "null"}");
+            return _templates[resolvedKind]!;
         }
 
         protected override DataTemplate SelectTemplateCore(object item, DependencyObject container)
@@ -52,12 +59,15 @@ internal sealed class MainWindow : Window
     private sealed record RemoteFolder(DiskTreeNode Disk, ulong Id, ulong ParentId, string Name,
         DirectoryPermission Permission, TreeViewNode NavigationNode);
 
+    // A menu keeps its own target so a navigation-tree click never acts on the list selection.
+    private sealed record ItemActionTarget(RemoteFolder Parent, IReadOnlyList<YuWangItem> Items);
+
     private sealed class NavigationFolderState
     {
         public required DiskTreeNode Disk { get; init; }
         public required ulong Id { get; init; }
         public required ulong ParentId { get; init; }
-        public required string Name { get; init; }
+        public required string Name { get; set; }
         public required TreeViewNode Node { get; init; }
         public DirectoryPermission Permission { get; set; } = DirectoryPermission.Unknown;
         public bool ChildrenLoaded { get; set; }
@@ -83,6 +93,10 @@ internal sealed class MainWindow : Window
     }
 
     private const double SidebarWidth = 264;
+    private const double MinimumSidebarWidth = 200;
+    private const double MaximumSidebarWidth = 480;
+    private const double MinimumContentWidth = 560;
+    private const double SidebarGripWidth = 8;
     private const double ListHorizontalMargin = 8;
     private const double ItemContentLeftPadding = 16;
     private const double ItemContentRightPadding = 12;
@@ -93,6 +107,13 @@ internal sealed class MainWindow : Window
 
     private readonly SyncRootContext _config;
     private readonly Grid _root;
+    private readonly ColumnDefinition _sidebarColumn;
+    private readonly MainWindowState _savedState;
+    private double _preferredSidebarWidth;
+    private bool _isClosed;
+    private bool _resizingSidebar;
+    private double _resizeStartX;
+    private double _resizeStartWidth;
 
     // Sidebar
     private readonly TreeView _navigationTree = new() { SelectionMode = TreeViewSelectionMode.Single };
@@ -173,6 +194,19 @@ internal sealed class MainWindow : Window
         Margin = new Thickness(16, 0, 16, 8),
     };
     private readonly Grid _columnsHeader = new() { ColumnSpacing = 12 };
+    private readonly Grid _fileSurface = new();
+    private readonly ScrollViewer _fileScroller = new()
+    {
+        HorizontalScrollMode = ScrollMode.Enabled,
+        HorizontalScrollBarVisibility = ScrollBarVisibility.Auto,
+        VerticalScrollMode = ScrollMode.Disabled,
+        VerticalScrollBarVisibility = ScrollBarVisibility.Disabled,
+    };
+    // A zero name width means fill the available space until explicitly resized.
+    private readonly double[] _fileColumnWidths = [0, 140, 110, 90];
+    private static readonly double[] MinimumFileColumnWidths = [160, 100, 90, 70];
+    private static readonly double[] MaximumFileColumnWidths = [1600, 480, 640, 400];
+    private readonly List<Grid> _fileRows = [];
     private readonly List<SortHeader> _sortHeaders = [];
     private readonly ListView _items = new()
     {
@@ -252,10 +286,10 @@ internal sealed class MainWindow : Window
     private readonly MenuFlyoutItem _menuNewFolder = NewMenuItem("\uE8F4", "新建文件夹");
     private readonly MenuFlyoutItem _menuUpload = NewMenuItem("\uE898", "上传文件…");
     private readonly MenuFlyoutItem _menuRefresh = NewMenuItem("\uE72C", "刷新");
+    private ItemActionTarget? _itemMenuTarget;
 
-    private readonly Stack<RemoteFolder> _backHistory = new();
-    private readonly Stack<RemoteFolder> _forwardHistory = new();
-    private readonly List<RemoteFolder> _breadcrumbs = [];
+    private readonly Stack<TreeViewNode> _backHistory = new();
+    private readonly Stack<TreeViewNode> _forwardHistory = new();
     private readonly Dictionary<(ulong Disk, ulong Folder), RemoteFolder> _knownFolders = [];
     private readonly Dictionary<TreeViewNode, NavigationFolderState> _folderNodes = [];
     private readonly Dictionary<(ulong Disk, ulong Folder), NavigationFolderState> _folderNodesByKey = [];
@@ -263,33 +297,76 @@ internal sealed class MainWindow : Window
     private readonly Dictionary<TreeViewNode, NavigationNodeKind> _nodeKinds = [];
     private readonly Dictionary<(ulong Disk, ulong Item), IStorageItem> _downloadedItems = [];
     private readonly Dictionary<string, Task<BitmapImage?>> _systemFileIconTasks = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, string> _systemFileTypes = new(StringComparer.OrdinalIgnoreCase);
+    private string _systemFolderType = "文件夹";
+    private bool _typeSortQueued;
     private Task<BitmapImage?>? _systemFolderIconTask;
     private List<DiskTreeNode> _diskTree = [];
     private List<YuWangItem> _currentItems = [];
     private RemoteFolder? _currentFolder;
+    private TreeViewNode? _currentNode;
+    private TreeViewNode? _pendingSelection;
+    private TreeViewNode? _pendingCollapsedNode;
+    private bool _navigationChangeQueued;
+    private bool _updatingNavigationTree;
     private SortColumn _sortColumn = SortColumn.Name;
     private bool _sortAscending = true;
     private int _visibleCount;
     private bool _busyNow;
     private bool _suppressNavigationSelection;
 
+    // Kept as plain managed data so the unhandled-exception path need not access XAML objects.
+    private static string _lastDiagnosticStage = "尚未打开主界面";
+    internal static string LastDiagnosticStage => Volatile.Read(ref _lastDiagnosticStage);
+
+    private static void TraceUiStage(string stage)
+    {
+        Volatile.Write(ref _lastDiagnosticStage, stage);
+        try
+        {
+            var threadId = Environment.CurrentManagedThreadId;
+            Serilog.Log.Information("[MAIN-UI] {Stage}; ThreadId={ThreadId}; IsUiThread={IsUiThread}",
+                stage, threadId, threadId == WinUiUiHost.UiThreadId);
+        }
+        catch { }
+    }
+
     private YuWangClient? Client => Program.ClientForUi;
 
     internal MainWindow(SyncRootContext config)
     {
+        TraceUiStage("开始构造主界面");
         _config = config;
+        _savedState = MainWindowStateStore.Load(config);
+        if (_savedState.ColumnWidths is { Length: 4 } widths)
+            for (var index = 0; index < widths.Length; index++)
+                if (double.IsFinite(widths[index]) && widths[index] > 0)
+                    _fileColumnWidths[index] = Math.Clamp(widths[index],
+                        MinimumFileColumnWidths[index], MaximumFileColumnWidths[index]);
+        _preferredSidebarWidth = double.IsFinite(_savedState.SidebarWidth)
+            ? Math.Clamp(_savedState.SidebarWidth, MinimumSidebarWidth, MaximumSidebarWidth) : SidebarWidth;
         Title = $"{ProductIdentity.DisplayNameZh} - 主界面";
 
         _root = new Grid { Name = "MainWindowRoot" };
-        _root.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(SidebarWidth) });
+        _sidebarColumn = new ColumnDefinition
+        {
+            Width = new GridLength(_preferredSidebarWidth),
+            MinWidth = MinimumSidebarWidth,
+            MaxWidth = MaximumSidebarWidth,
+        };
+        _root.ColumnDefinitions.Add(_sidebarColumn);
+        _root.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(SidebarGripWidth) });
         _root.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
 
         var sidebar = BuildSidebar();
         Grid.SetColumn(sidebar, 0);
         _root.Children.Add(sidebar);
+        var resizeGrip = BuildSidebarResizeGrip();
+        Grid.SetColumn(resizeGrip, 1);
+        _root.Children.Add(resizeGrip);
 
         var content = BuildContentSurface();
-        Grid.SetColumn(content, 1);
+        Grid.SetColumn(content, 2);
         _root.Children.Add(content);
 
         BuildContextMenus();
@@ -298,13 +375,72 @@ internal sealed class MainWindow : Window
         WinUiUiHost.ConfigureWindow(this, 1180, 760, resizable: true,
             minimumWidthDip: 900, minimumHeightDip: 560);
         _root.Loaded += (_, _) => RunUi(() => LoadDiskTreeAsync());
+        _root.SizeChanged += (_, _) => ConstrainSidebarWidth();
+        Closed += (_, _) =>
+        {
+            _isClosed = true;
+            try { SaveBrowserState(); }
+            catch (Exception error) { Serilog.Log.Warning(error, "关闭主界面时保存浏览状态失败"); }
+        };
 
         RenderBreadcrumbs();
         UpdatePermissionBadge();
         RenderItems();
+        TraceUiStage("主界面构造完成，等待 Loaded");
     }
 
     #region Layout
+
+    private Border BuildSidebarResizeGrip()
+    {
+        var grip = new Border
+        {
+            Name = "NavigationResizeGrip",
+            Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent),
+            Child = new Border
+            {
+                Width = 1,
+                Background = WinUiUiHost.GetBrushResource("DividerStrokeColorDefaultBrush"),
+                HorizontalAlignment = HorizontalAlignment.Center,
+            },
+        };
+        ToolTipService.SetToolTip(grip, "拖动调整导航栏宽度");
+        grip.PointerPressed += (_, args) =>
+        {
+            var point = args.GetCurrentPoint(_root);
+            if (!point.Properties.IsLeftButtonPressed || !grip.CapturePointer(args.Pointer)) return;
+            _resizingSidebar = true;
+            _resizeStartX = point.Position.X;
+            _resizeStartWidth = _sidebarColumn.ActualWidth;
+            args.Handled = true;
+        };
+        grip.PointerMoved += (_, args) =>
+        {
+            if (!_resizingSidebar) return;
+            _preferredSidebarWidth = Math.Clamp(
+                _resizeStartWidth + args.GetCurrentPoint(_root).Position.X - _resizeStartX,
+                MinimumSidebarWidth, _sidebarColumn.MaxWidth);
+            ConstrainSidebarWidth();
+            args.Handled = true;
+        };
+        grip.PointerReleased += (_, args) =>
+        {
+            _resizingSidebar = false;
+            grip.ReleasePointerCapture(args.Pointer);
+        };
+        grip.PointerCaptureLost += (_, _) => _resizingSidebar = false;
+        grip.PointerCanceled += (_, _) => _resizingSidebar = false;
+        return grip;
+    }
+
+    private void ConstrainSidebarWidth()
+    {
+        if (_root.ActualWidth <= 0) return;
+        _sidebarColumn.MaxWidth = Math.Clamp(_root.ActualWidth - MinimumContentWidth - SidebarGripWidth,
+            MinimumSidebarWidth, MaximumSidebarWidth);
+        _sidebarColumn.Width = new GridLength(Math.Clamp(_preferredSidebarWidth,
+            MinimumSidebarWidth, _sidebarColumn.MaxWidth));
+    }
 
     private Grid BuildSidebar()
     {
@@ -329,8 +465,15 @@ internal sealed class MainWindow : Window
         _navigationTree.Name = "CloudNavigationTreeView";
         _navigationTree.ItemTemplateSelector = new NavigationTreeTemplateSelector(
             node => _nodeKinds.TryGetValue(node, out var kind) ? kind : null);
-        _navigationTree.SelectionChanged += (_, args) => RunUi(() => OnNavigationSelectionChangedAsync(args));
+        _navigationTree.ItemContainerTransitions = new TransitionCollection
+        {
+            new AddDeleteThemeTransition(),
+            new RepositionThemeTransition(),
+        };
+        _navigationTree.SelectionChanged += (_, _) => QueueNavigationSelection();
         _navigationTree.Expanding += (_, args) => RunUi(() => OnNavigationExpandingAsync(args.Node));
+        _navigationTree.Collapsed += (_, args) => OnNavigationCollapsed(args.Node);
+        _navigationTree.ContextRequested += OnNavigationContextRequested;
         Grid.SetRow(_navigationTree, 1);
         sidebar.Children.Add(_navigationTree);
 
@@ -409,8 +552,9 @@ internal sealed class MainWindow : Window
         grid.Children.Add(_infoBar);
 
         BuildColumnsHeader();
-        Grid.SetRow(_columnsHeader, 3);
-        grid.Children.Add(_columnsHeader);
+        _fileSurface.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        _fileSurface.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
+        _fileSurface.Children.Add(_columnsHeader);
 
         _items.Name = "CloudFileListView";
         _items.SelectionChanged += (_, _) => UpdateCommandStates();
@@ -424,8 +568,13 @@ internal sealed class MainWindow : Window
         _items.DragLeave += (_, _) => _dropOverlay.Visibility = Visibility.Collapsed;
         _items.Drop += OnDrop;
         _items.ContextRequested += OnListBackgroundContextRequested;
-        Grid.SetRow(_items, 4);
-        grid.Children.Add(_items);
+        Grid.SetRow(_items, 1);
+        _fileSurface.Children.Add(_items);
+        _fileScroller.Content = _fileSurface;
+        _fileScroller.SizeChanged += (_, _) => UpdateFileColumnWidths();
+        Grid.SetRow(_fileScroller, 3);
+        Grid.SetRowSpan(_fileScroller, 2);
+        grid.Children.Add(_fileScroller);
 
         _emptyGlyph.Foreground = WinUiUiHost.GetBrushResource("TextFillColorTertiaryBrush");
         _emptyTitle.Style = WinUiUiHost.GetStyleResource("BodyStrongTextBlockStyle");
@@ -598,6 +747,44 @@ internal sealed class MainWindow : Window
         };
         Grid.SetColumn(button, gridColumn);
         _columnsHeader.Children.Add(button);
+        var grip = new Border
+        {
+            Width = 8,
+            Margin = new Thickness(0, 0, -6, 0),
+            HorizontalAlignment = HorizontalAlignment.Right,
+            Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent),
+            Child = new Border
+            {
+                Width = 1, Margin = new Thickness(0, 6, 0, 6),
+                Background = WinUiUiHost.GetBrushResource("DividerStrokeColorDefaultBrush"),
+            },
+        };
+        ToolTipService.SetToolTip(grip, $"拖动调整“{text}”列宽");
+        var dragging = false;
+        var startX = 0d;
+        var startWidth = 0d;
+        grip.PointerPressed += (_, args) =>
+        {
+            var point = args.GetCurrentPoint(_root);
+            if (!point.Properties.IsLeftButtonPressed || !grip.CapturePointer(args.Pointer)) return;
+            dragging = true;
+            startX = point.Position.X;
+            startWidth = _columnsHeader.ColumnDefinitions[gridColumn].Width.Value;
+            args.Handled = true;
+        };
+        grip.PointerMoved += (_, args) =>
+        {
+            if (!dragging) return;
+            _fileColumnWidths[gridColumn] = Math.Clamp(startWidth + args.GetCurrentPoint(_root).Position.X - startX,
+                MinimumFileColumnWidths[gridColumn], MaximumFileColumnWidths[gridColumn]);
+            UpdateFileColumnWidths();
+            args.Handled = true;
+        };
+        grip.PointerReleased += (_, args) => { dragging = false; grip.ReleasePointerCapture(args.Pointer); };
+        grip.PointerCaptureLost += (_, _) => dragging = false;
+        grip.PointerCanceled += (_, _) => dragging = false;
+        Grid.SetColumn(grip, gridColumn);
+        _columnsHeader.Children.Add(grip);
         _sortHeaders.Add(new SortHeader { Column = column, Chevron = chevron });
     }
 
@@ -616,14 +803,36 @@ internal sealed class MainWindow : Window
         _columnsHeader.Margin = new Thickness(
             ListHorizontalMargin + ItemContentLeftPadding + checkboxOffset, 0,
             ListHorizontalMargin + ItemContentRightPadding, 2);
+        UpdateFileColumnWidths();
     }
 
-    private static void AddFileColumns(Grid grid)
+    private void AddFileColumns(Grid grid)
     {
-        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star), MinWidth = 160 });
-        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(140) });
-        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(110) });
-        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(90) });
+        for (var index = 0; index < 4; index++)
+            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(EffectiveFileColumnWidth(index)) });
+        if (!ReferenceEquals(grid, _columnsHeader)) _fileRows.Add(grid);
+    }
+
+    private double FileColumnChromeWidth => ListHorizontalMargin * 2 + ItemContentLeftPadding
+        + ItemContentRightPadding + 36 + 20
+        + (_items.SelectionMode == ListViewSelectionMode.Multiple ? MultiSelectContentOffset : 0);
+
+    private double EffectiveFileColumnWidth(int index) => index == 0 && _fileColumnWidths[0] == 0
+        ? Math.Max(MinimumFileColumnWidths[0], _fileScroller.ActualWidth - FileColumnChromeWidth
+            - _fileColumnWidths[1] - _fileColumnWidths[2] - _fileColumnWidths[3])
+        : _fileColumnWidths[index];
+
+    private void UpdateFileColumnWidths()
+    {
+        if (_isClosed || _columnsHeader.ColumnDefinitions.Count != 4) return;
+        var widths = Enumerable.Range(0, 4).Select(EffectiveFileColumnWidth).ToArray();
+        _fileSurface.Width = Math.Max(_fileScroller.ActualWidth, widths.Sum() + FileColumnChromeWidth);
+        for (var index = 0; index < widths.Length; index++)
+        {
+            var width = new GridLength(widths[index]);
+            _columnsHeader.ColumnDefinitions[index].Width = width;
+            foreach (var row in _fileRows) row.ColumnDefinitions[index].Width = width;
+        }
     }
 
     private Grid BuildStatusBar()
@@ -745,11 +954,11 @@ internal sealed class MainWindow : Window
         _multiSelect.Unchecked += (_, _) => SetCheckboxSelectionEnabled(false);
         _search.TextChanged += (_, _) => RenderItems();
 
-        _menuOpen.Click += (_, _) => RunUi(() => OpenSelectedAsync());
-        _menuDownload.Click += (_, _) => RunUi(() => DownloadSelectionAsync());
-        _menuRename.Click += (_, _) => RunUi(() => RenameSelectionAsync());
-        _menuMove.Click += (_, _) => RunUi(() => MoveSelectionAsync());
-        _menuDelete.Click += (_, _) => RunUi(() => DeleteSelectionAsync());
+        _menuOpen.Click += (_, _) => RunItemMenuCommand(OpenItemsAsync);
+        _menuDownload.Click += (_, _) => RunItemMenuCommand(DownloadItemsAsync);
+        _menuRename.Click += (_, _) => RunItemMenuCommand(RenameItemsAsync);
+        _menuMove.Click += (_, _) => RunItemMenuCommand(MoveItemsAsync);
+        _menuDelete.Click += (_, _) => RunItemMenuCommand(DeleteItemsAsync);
         _menuNewFolder.Click += (_, _) => RunUi(() => CreateFolderAsync());
         _menuUpload.Click += (_, _) => RunUi(() => ChooseFilesToUploadAsync());
         _menuRefresh.Click += (_, _) => RunUi(() => RefreshAsync());
@@ -757,17 +966,23 @@ internal sealed class MainWindow : Window
 
     private async Task RefreshAsync()
     {
-        if (_currentFolder is null) await LoadDiskTreeAsync();
+        if (_currentFolder is null) await LoadDiskTreeAsync(GetCurrentNodePath());
         else await RefreshCurrentFolderAsync();
     }
 
     #region Navigation tree
 
-    private async Task LoadDiskTreeAsync()
+    private Task LoadDiskTreeAsync() => LoadDiskTreeAsync(GetCurrentNodePath() is { Length: > 0 } path
+        ? path : _savedState.NodePath);
+
+    private async Task LoadDiskTreeAsync(string[]? location)
     {
+        if (_busyNow || _isClosed) return;
+        TraceUiStage("开始加载磁盘树，检查登录状态");
         var client = Client;
         if (client is null || !client.IsLoggedIn)
         {
+            TraceUiStage("会话不可用，跳过磁盘树请求");
             UpdateAccountState();
             ShowInfo(InfoBarSeverity.Informational, "正在连接育网云",
                 "登录完成后即可浏览云端磁盘。", "重试", () => RunUi(LoadDiskTreeAsync));
@@ -777,7 +992,11 @@ internal sealed class MainWindow : Window
         _infoBar.IsOpen = false;
         await RunBusyAsync("正在加载云端磁盘…", async () =>
         {
+            TraceUiStage("等待磁盘树响应");
             _diskTree = await client.FetchDiskTreeAsync(_config.RootContainerTypeId);
+            if (_isClosed) return;
+            TraceUiStage($"磁盘树响应完成：Nodes={_diskTree.Count}; Disks={_diskTree.Count(node => node.IsDisk)}");
+            TraceUiStage("开始清空导航树与目录状态");
             _navigationTree.RootNodes.Clear();
             _folderNodes.Clear();
             _folderNodesByKey.Clear();
@@ -786,15 +1005,19 @@ internal sealed class MainWindow : Window
             _knownFolders.Clear();
             _backHistory.Clear();
             _forwardHistory.Clear();
-            _breadcrumbs.Clear();
+            _currentNode = null;
+            _pendingSelection = null;
+            _pendingCollapsedNode = null;
             _currentFolder = null;
             _currentItems = [];
 
+            TraceUiStage("开始创建导航树节点");
             var root = CreateNavigationNode("育网云", NavigationNodeKind.Root);
             root.IsExpanded = true;
             _navigationTree.RootNodes.Add(root);
             _diskTreeNodes[root] = new DiskTreeEntry { Name = "育网云", Node = root, IsContainer = true };
             AddDiskTreeChildren(root, _config.RootContainerTypeId, []);
+            TraceUiStage($"导航树节点创建完成：Nodes={_nodeKinds.Count}; Folders={_folderNodes.Count}");
 
             var diskCount = _diskTree.Count(node => node.IsDisk);
             if (diskCount == 0)
@@ -803,11 +1026,20 @@ internal sealed class MainWindow : Window
             RenderBreadcrumbs();
             UpdatePermissionBadge();
             RenderItems();
+            TraceUiStage("磁盘树界面更新完成");
         });
 
-        // Open the first disk so the window is immediately useful.
-        if (_currentFolder is null && FindFirstDisk(_navigationTree.RootNodes) is { } firstDisk)
+        if (_isClosed) return;
+        // Restore by stable identifiers, loading only the ancestors needed for this location.
+        if (await TryRestoreLocationAsync(location ?? _savedState.NodePath)) return;
+        if (_currentNode is null && FindFirstDisk(_navigationTree.RootNodes) is { } firstDisk)
+        {
+            TraceUiStage($"开始自动导航首个磁盘：Disk={firstDisk.Disk.Id}");
             await NavigateToFolderAsync(firstDisk, addToHistory: false);
+        }
+        else if (_currentNode is null && _navigationTree.RootNodes.FirstOrDefault() is { } root)
+            await NavigateToNodeAsync(root, addToHistory: false);
+        TraceUiStage("磁盘树加载流程结束");
     }
 
     private NavigationFolderState? FindFirstDisk(IList<TreeViewNode> nodes)
@@ -873,24 +1105,48 @@ internal sealed class MainWindow : Window
         _diskTreeNodes[state.Node] = new DiskTreeEntry { Name = state.Name, Node = state.Node, Model = state.Disk };
     }
 
-    private async Task OnNavigationSelectionChangedAsync(TreeViewSelectionChangedEventArgs args)
+    private void QueueNavigationSelection()
     {
-        if (_suppressNavigationSelection || _busyNow) return;
-        var selectedNode = args.AddedItems.OfType<TreeViewNode>().FirstOrDefault();
-        if (selectedNode is null) return;
-        if (!_folderNodes.TryGetValue(selectedNode, out var state))
+        if (_suppressNavigationSelection || _busyNow || _isClosed || _updatingNavigationTree) return;
+        _pendingSelection = _navigationTree.SelectedNodes.FirstOrDefault();
+        QueueNavigationChange();
+    }
+
+    private void OnNavigationCollapsed(TreeViewNode node)
+    {
+        if (_isClosed || _updatingNavigationTree || !IsDescendantOf(_currentNode, node)) return;
+        _pendingCollapsedNode = node;
+        QueueNavigationChange();
+    }
+
+    private static bool IsDescendantOf(TreeViewNode? node, TreeViewNode ancestor)
+    {
+        for (var parent = node?.Parent; parent is not null; parent = parent.Parent)
+            if (ReferenceEquals(parent, ancestor)) return true;
+        return false;
+    }
+
+    // TreeView updates its flattened selection during expansion/collapse. Navigate after that
+    // callback returns; never change the same selection collection from SelectionChanged.
+    private void QueueNavigationChange()
+    {
+        if (_navigationChangeQueued) return;
+        _navigationChangeQueued = DispatcherQueue.TryEnqueue(() =>
         {
-            // Groupings are not browsable: toggle them instead and keep the current selection.
-            selectedNode.IsExpanded = !selectedNode.IsExpanded;
-            if (_currentFolder is { } current) SetNavigationSelection(current.NavigationNode);
-            else SetNavigationSelection(null);
-            return;
-        }
-        await NavigateToFolderAsync(state, addToHistory: true);
+            _navigationChangeQueued = false;
+            if (_isClosed) return;
+            if (_busyNow) return; // RunBusyAsync drains a pending collapse when it finishes.
+            var target = _pendingCollapsedNode ?? _pendingSelection;
+            _pendingCollapsedNode = null;
+            _pendingSelection = null;
+            if (target is not null && _nodeKinds.ContainsKey(target))
+                RunUi(() => NavigateToNodeAsync(target));
+        });
     }
 
     private async Task OnNavigationExpandingAsync(TreeViewNode node)
     {
+        if (_isClosed || _updatingNavigationTree) return;
         if (!_folderNodes.TryGetValue(node, out var state) || state.ChildrenLoaded) return;
         try
         {
@@ -898,6 +1154,8 @@ internal sealed class MainWindow : Window
         }
         catch (Exception error)
         {
+            if (_isClosed) return;
+            if (!_folderNodes.ContainsKey(node)) return;
             node.HasUnrealizedChildren = true;
             Serilog.Log.Warning(error, "展开主界面目录导航失败：{Folder}", state.Name);
             ShowInfo(InfoBarSeverity.Error, $"无法加载“{state.Name}”的子文件夹", error.Message);
@@ -906,30 +1164,38 @@ internal sealed class MainWindow : Window
 
     private async Task NavigateToFolderAsync(NavigationFolderState state, bool addToHistory)
     {
-        if (_busyNow) return;
+        if (_busyNow || _isClosed) return;
         var target = state.ToRemoteFolder();
         if (_currentFolder is { } current && current.Disk.Id == target.Disk.Id && current.Id == target.Id)
             return;
 
-        if (addToHistory && _currentFolder is { } previous)
+        if (addToHistory && _currentNode is { } previous)
         {
             _backHistory.Push(previous);
             _forwardHistory.Clear();
         }
 
+        TraceUiStage($"开始展开与选中导航节点：Disk={state.Disk.Id}; Folder={state.Id}");
         _currentFolder = target;
+        _currentNode = state.Node;
         for (var parent = state.Node.Parent; parent is not null; parent = parent.Parent)
             parent.IsExpanded = true;
         SetNavigationSelection(state.Node);
         RebuildBreadcrumbs(state.Node);
         RememberFolder(target);
+        RememberCurrentLocation();
+        TraceUiStage("导航节点选中完成，开始更新搜索框");
         _search.Text = "";
         _search.PlaceholderText = $"搜索“{target.Name}”";
+        TraceUiStage("搜索框更新完成，开始加载目录");
         await LoadCurrentFolderAsync();
     }
 
     private void SetNavigationSelection(TreeViewNode? node)
     {
+        if (node is null && _navigationTree.SelectedNodes.Count == 0) return;
+        if (node is not null && _navigationTree.SelectedNodes.Count == 1
+            && ReferenceEquals(_navigationTree.SelectedNodes[0], node)) return;
         _suppressNavigationSelection = true;
         try
         {
@@ -941,12 +1207,6 @@ internal sealed class MainWindow : Window
 
     private void RebuildBreadcrumbs(TreeViewNode node)
     {
-        var path = new List<RemoteFolder>();
-        for (TreeViewNode? current = node; current is not null; current = current.Parent)
-            if (_folderNodes.TryGetValue(current, out var state)) path.Add(state.ToRemoteFolder());
-        path.Reverse();
-        _breadcrumbs.Clear();
-        _breadcrumbs.AddRange(path);
         RenderBreadcrumbs();
     }
 
@@ -955,9 +1215,9 @@ internal sealed class MainWindow : Window
     {
         _breadcrumbItems.Children.Clear();
         var segments = new List<(string Name, TreeViewNode? Node)>();
-        if (_currentFolder is { } folder)
+        if (_currentNode is { } selected)
         {
-            for (TreeViewNode? current = folder.NavigationNode; current is not null; current = current.Parent)
+            for (TreeViewNode? current = selected; current is not null; current = current.Parent)
             {
                 if (_folderNodes.TryGetValue(current, out var state)) segments.Add((state.Name, current));
                 else if (_diskTreeNodes.TryGetValue(current, out var grouping)) segments.Add((grouping.Name, current));
@@ -999,10 +1259,7 @@ internal sealed class MainWindow : Window
                 VerticalAlignment = VerticalAlignment.Center,
             };
             if (isLast) label.FontWeight = FontWeights.SemiBold;
-            MenuFlyout? groupingMenu = null;
-            var isFolder = node is not null && _folderNodes.ContainsKey(node);
-            if (!isLast && !isFolder && node is not null) groupingMenu = BuildGroupingMenu(node);
-            if (isLast || (!isFolder && groupingMenu is null))
+            if (isLast || node is null)
             {
                 label.Margin = new Thickness(6, 0, 6, 0);
                 if (!isLast) label.Foreground = WinUiUiHost.GetBrushResource("TextFillColorSecondaryBrush");
@@ -1019,16 +1276,8 @@ internal sealed class MainWindow : Window
                 VerticalAlignment = VerticalAlignment.Center,
             };
             ToolTipService.SetToolTip(segment, name);
-            if (groupingMenu is not null)
-            {
-                // Groupings are not browsable folders; offer their disks instead.
-                segment.Flyout = groupingMenu;
-            }
-            else
-            {
-                var destination = node!;
-                segment.Click += (_, _) => RunUi(() => NavigateToNodeAsync(destination));
-            }
+            var destination = node;
+            segment.Click += (_, _) => RunUi(() => NavigateToNodeAsync(destination));
             _breadcrumbItems.Children.Add(segment);
         }
 
@@ -1036,41 +1285,34 @@ internal sealed class MainWindow : Window
         ToolTipService.SetToolTip(_breadcrumbScroller, fullPath);
     }
 
-    private MenuFlyout? BuildGroupingMenu(TreeViewNode grouping)
+    private async Task NavigateToNodeAsync(TreeViewNode node, bool addToHistory = true)
     {
-        var menu = new MenuFlyout { Placement = FlyoutPlacementMode.BottomEdgeAlignedLeft };
-        AddGroupingMenuItems(menu.Items, grouping);
-        return menu.Items.Count == 0 ? null : menu;
-    }
-
-    private void AddGroupingMenuItems(IList<MenuFlyoutItemBase> items, TreeViewNode parent)
-    {
-        foreach (var child in parent.Children)
-        {
-            if (_folderNodes.TryGetValue(child, out var state))
-            {
-                var item = new MenuFlyoutItem
-                {
-                    Text = state.Name,
-                    Icon = new FontIcon { Glyph = state.Id == 0 ? "\uEDA2" : FolderGlyph },
-                };
-                var destination = child;
-                item.Click += (_, _) => RunUi(() => NavigateToNodeAsync(destination));
-                items.Add(item);
-            }
-            else if (_diskTreeNodes.TryGetValue(child, out var grouping))
-            {
-                var sub = new MenuFlyoutSubItem { Text = grouping.Name, Icon = new FontIcon { Glyph = "\uE8F1" } };
-                AddGroupingMenuItems(sub.Items, child);
-                if (sub.Items.Count > 0) items.Add(sub);
-            }
-        }
-    }
-
-    private async Task NavigateToNodeAsync(TreeViewNode node)
-    {
+        if (_busyNow || _isClosed || ReferenceEquals(_currentNode, node)) return;
         if (_folderNodes.TryGetValue(node, out var state))
-            await NavigateToFolderAsync(state, addToHistory: true);
+        {
+            await NavigateToFolderAsync(state, addToHistory);
+            return;
+        }
+        if (!_diskTreeNodes.ContainsKey(node)) return;
+        if (addToHistory && _currentNode is { } previous)
+        {
+            _backHistory.Push(previous);
+            _forwardHistory.Clear();
+        }
+        _currentNode = node;
+        _currentFolder = null;
+        _currentItems = [];
+        for (var parent = node.Parent; parent is not null; parent = parent.Parent)
+            parent.IsExpanded = true;
+        SetNavigationSelection(node);
+        _search.Text = "";
+        _search.PlaceholderText = $"搜索“{node.Content}”";
+        _infoBar.IsOpen = false;
+        SetStatus("");
+        RenderBreadcrumbs();
+        UpdatePermissionBadge();
+        RenderItems();
+        RememberCurrentLocation();
     }
 
     /// <summary>Runs an async UI handler and surfaces failures instead of letting async void crash or vanish.</summary>
@@ -1079,7 +1321,9 @@ internal sealed class MainWindow : Window
         try { await action(); }
         catch (Exception error)
         {
-            Serilog.Log.Error(error, "主界面事件处理失败");
+            if (_isClosed) return;
+            Serilog.Log.Error(error, "主界面事件处理失败；最近阶段={Stage}; HRESULT=0x{HResult:X8}",
+                LastDiagnosticStage, error.HResult);
             try { ShowInfo(InfoBarSeverity.Error, "操作失败", error.Message); } catch { }
         }
     }
@@ -1093,6 +1337,83 @@ internal sealed class MainWindow : Window
             else if (_diskTreeNodes.TryGetValue(current, out var grouping)) path.Push(grouping.Name);
         }
         return string.Join(" / ", path);
+    }
+
+    private string? NodeKey(TreeViewNode node)
+    {
+        if (_folderNodes.TryGetValue(node, out var folder))
+            return folder.Id == 0 ? $"disk:{folder.Disk.Id}" : $"folder:{folder.Id}";
+        if (_nodeKinds.TryGetValue(node, out var kind) && kind == NavigationNodeKind.Root)
+            return "root";
+        return _diskTreeNodes.TryGetValue(node, out var entry) && entry.Model is { IsContainer: true } model
+            ? $"container:{model.Id}" : null;
+    }
+
+    private string[] GetCurrentNodePath()
+    {
+        var path = new Stack<string>();
+        for (var node = _currentNode; node is not null; node = node.Parent)
+        {
+            // TreeView attaches visible root nodes to its own hidden root. Only record
+            // registered browser nodes; the hidden parent is not another cloud root.
+            if (NodeKey(node) is not { } key) break;
+            path.Push(key);
+        }
+        return path.TryPeek(out var root) && root == "root" ? path.ToArray() : [];
+    }
+
+    private void RememberCurrentLocation()
+    {
+        if (_isClosed) return;
+        var path = GetCurrentNodePath();
+        if (path.Length == 0) return;
+        _savedState.NodePath = path;
+        // Persist while the node is still attached. App exit may end the dispatcher
+        // without closing each window, and Closed can run after TreeView teardown.
+        SaveBrowserState();
+        TraceUiStage($"已记录主界面浏览位置：{string.Join("/", path)}");
+    }
+
+    private void SaveBrowserState()
+    {
+        _savedState.SidebarWidth = _preferredSidebarWidth;
+        _savedState.ColumnWidths = _fileColumnWidths.Select(width => double.IsFinite(width) ? width : 0).ToArray();
+        MainWindowStateStore.Save(_config, _savedState);
+    }
+
+    private async Task<bool> TryRestoreLocationAsync(string[]? path)
+    {
+        path = MainWindowStateStore.NormalizeNodePath(path);
+        if (path.Length == 0) return false;
+        TraceUiStage($"开始还原主界面浏览位置：{string.Join("/", path)}");
+        TreeViewNode? restored = null;
+        IList<TreeViewNode> children = _navigationTree.RootNodes;
+        await RunBusyAsync("正在还原上次浏览位置…", async () =>
+        {
+            try
+            {
+                for (var index = 0; index < path.Length; index++)
+                {
+                    if (_isClosed) return;
+                    var next = children.FirstOrDefault(node => NodeKey(node) == path[index]);
+                    if (next is null) break;
+                    restored = next;
+                    // The final location fetch is performed by navigation, so it is not fetched twice.
+                    if (index == path.Length - 1) break;
+                    if (_folderNodes.TryGetValue(next, out var folder)) await GetListingForExpansionAsync(folder);
+                    next.IsExpanded = true;
+                    children = next.Children;
+                }
+            }
+            catch (Exception error)
+            {
+                Serilog.Log.Warning(error, "还原主界面位置时无法加载子目录，将停留在最近可访问的上级");
+            }
+        });
+        if (restored is null || _isClosed) return _isClosed;
+        await NavigateToNodeAsync(restored, addToHistory: false);
+        TraceUiStage($"主界面浏览位置还原结束：Matched={NodeKey(restored)}; RequestedDepth={path.Length}");
+        return true;
     }
 
     #endregion
@@ -1142,6 +1463,28 @@ internal sealed class MainWindow : Window
         var listing = await GetFreshFolderListingAsync(client, state);
         state.PendingListingConsumed = true;
         ApplyCurrentFolderListing(folder, state, listing);
+    }
+
+    private async Task RefreshItemParentAsync(YuWangClient client, RemoteFolder parent)
+    {
+        if (!_folderNodes.TryGetValue(parent.NavigationNode, out var state)) return;
+        var listing = await GetFreshFolderListingAsync(client, state);
+        if (ReferenceEquals(_currentNode, state.Node))
+        {
+            state.PendingListingConsumed = true;
+            ApplyCurrentFolderListing(state.ToRemoteFolder(), state, listing);
+        }
+        else if (_currentNode is { } current && _folderNodes.TryGetValue(current, out var currentState))
+        {
+            // A tree-menu mutation can rename an ancestor without changing the open folder.
+            _currentFolder = currentState.ToRemoteFolder();
+            RememberFolder(_currentFolder);
+            _search.PlaceholderText = $"搜索“{currentState.Name}”";
+            RenderBreadcrumbs();
+            UpdatePermissionBadge();
+        }
+        // PopulateFolderChildren queues navigation to the surviving parent if the open
+        // folder was removed/moved; RunBusyAsync applies it after this operation finishes.
     }
 
     private async Task<FolderListingResult> GetListingForNavigationAsync(NavigationFolderState state)
@@ -1196,7 +1539,13 @@ internal sealed class MainWindow : Window
     private async Task<FolderListingResult> FetchAndStoreFolderListingAsync(YuWangClient client,
         NavigationFolderState state)
     {
+        TraceUiStage($"等待目录与权限响应：Disk={state.Disk.Id}; Folder={state.Id}");
         var listing = await client.ListFolderWithPermissionsAsync(state.Disk.Id, state.Id);
+        if (_isClosed) throw new OperationCanceledException("主界面已关闭。");
+        if (!_folderNodes.TryGetValue(state.Node, out var registered) || !ReferenceEquals(registered, state))
+            throw new OperationCanceledException("导航树已更新，丢弃旧节点的目录响应。");
+        TraceUiStage($"目录与权限响应完成：Disk={state.Disk.Id}; Folder={state.Id}; "
+            + $"Items={listing.Items.Count}; Permission={listing.Permission}; Valid={listing.IsValidPage}");
         if (!listing.IsValidPage)
             throw new IOException("服务器未返回完整的目标目录列表。");
 
@@ -1206,7 +1555,9 @@ internal sealed class MainWindow : Window
         state.Permission = Program.GetCachedDirectoryPermission(state.Disk.Id, state.Id);
         state.PendingListing = listing;
         state.PendingListingConsumed = false;
+        TraceUiStage($"开始更新目录子节点：Disk={state.Disk.Id}; Folder={state.Id}");
         PopulateFolderChildren(state, listing.Items);
+        TraceUiStage($"目录子节点更新完成：Disk={state.Disk.Id}; Folder={state.Id}");
         RememberFolder(state.ToRemoteFolder());
         return listing;
     }
@@ -1214,13 +1565,25 @@ internal sealed class MainWindow : Window
     private void PopulateFolderChildren(NavigationFolderState parent,
         IReadOnlyList<YuWangItem> items)
     {
-        foreach (var oldChild in parent.Node.Children.ToArray())
-            RemoveFolderNode(oldChild);
-        parent.Node.Children.Clear();
-
-        foreach (var item in items.Where(item => item.IsFolder)
-                     .OrderBy(item => item.Name, StringComparer.CurrentCultureIgnoreCase))
+        // Preserve surviving node instances, their descendants and history when a parent refreshes.
+        // Reject a folder pointing to itself/an ancestor before handing the hierarchy to TreeView.
+        var ancestors = new HashSet<ulong>();
+        for (var node = parent.Node; node is not null; node = node.Parent)
+            if (_folderNodes.TryGetValue(node, out var folder)) ancestors.Add(folder.Id);
+        var folders = items.Where(item => item.IsFolder && !ancestors.Contains(item.Id))
+            .DistinctBy(item => item.Id)
+            .OrderBy(item => item.Name, StringComparer.CurrentCultureIgnoreCase).ToList();
+        var desired = new List<TreeViewNode>();
+        foreach (var item in folders)
         {
+            if (_folderNodesByKey.TryGetValue((parent.Disk.Id, item.Id), out var existing)
+                && ReferenceEquals(existing.Node.Parent, parent.Node))
+            {
+                existing.Name = item.Name;
+                existing.Node.Content = item.Name;
+                desired.Add(existing.Node);
+                continue;
+            }
             var node = CreateNavigationNode(item.Name, NavigationNodeKind.Folder);
             node.HasUnrealizedChildren = true;
             var state = new NavigationFolderState
@@ -1231,12 +1594,33 @@ internal sealed class MainWindow : Window
                 Name = item.Name,
                 Node = node,
             };
-            parent.Node.Children.Add(node);
             RegisterFolderNode(state);
+            desired.Add(node);
         }
-
-        parent.ChildrenLoaded = true;
-        parent.Node.HasUnrealizedChildren = false;
+        _updatingNavigationTree = true;
+        try
+        {
+            foreach (var oldChild in parent.Node.Children.ToArray())
+            {
+                if (desired.Contains(oldChild)) continue;
+                if (ReferenceEquals(_currentNode, oldChild) || IsDescendantOf(_currentNode, oldChild))
+                    _pendingCollapsedNode = parent.Node;
+                parent.Node.Children.Remove(oldChild);
+                RemoveFolderNode(oldChild);
+            }
+            for (var index = 0; index < desired.Count; index++)
+            {
+                var node = desired[index];
+                if (index < parent.Node.Children.Count && ReferenceEquals(parent.Node.Children[index], node)) continue;
+                parent.Node.Children.Remove(node);
+                parent.Node.Children.Insert(index, node);
+            }
+            parent.ChildrenLoaded = true;
+            parent.Node.HasUnrealizedChildren = false;
+            if (_currentNode is { } current && _nodeKinds.ContainsKey(current)) SetNavigationSelection(current);
+        }
+        finally { _updatingNavigationTree = false; }
+        if (_pendingCollapsedNode is not null) QueueNavigationChange();
     }
 
     private void RemoveFolderNode(TreeViewNode node)
@@ -1245,13 +1629,18 @@ internal sealed class MainWindow : Window
         _nodeKinds.Remove(node);
         _diskTreeNodes.Remove(node);
         if (!_folderNodes.Remove(node, out var state)) return;
-        _folderNodesByKey.Remove((state.Disk.Id, state.Id));
-        _knownFolders.Remove((state.Disk.Id, state.Id));
+        if (_folderNodesByKey.TryGetValue((state.Disk.Id, state.Id), out var indexed)
+            && ReferenceEquals(indexed, state))
+        {
+            _folderNodesByKey.Remove((state.Disk.Id, state.Id));
+            _knownFolders.Remove((state.Disk.Id, state.Id));
+        }
     }
 
     private void ApplyCurrentFolderListing(RemoteFolder folder, NavigationFolderState state,
         FolderListingResult listing)
     {
+        TraceUiStage($"开始应用目录清单：Disk={folder.Disk.Id}; Folder={folder.Id}");
         _currentItems = listing.Items.ToList();
         state.Permission = Program.GetCachedDirectoryPermission(folder.Disk.Id, folder.Id);
         var loadedFolder = state.ToRemoteFolder();
@@ -1261,6 +1650,7 @@ internal sealed class MainWindow : Window
         UpdatePermissionBadge();
         RenderItems();
         SetStatus("");
+        TraceUiStage($"目录清单应用完成：Disk={folder.Disk.Id}; Folder={folder.Id}");
     }
 
     #endregion
@@ -1269,14 +1659,14 @@ internal sealed class MainWindow : Window
 
     private void SetCheckboxSelectionEnabled(bool enabled)
     {
+        // SelectedItems is read-only in Single mode. Capture the old selection before
+        // changing modes, then restore it through SelectedItem instead of clearing that vector.
+        var first = _items.SelectionMode == ListViewSelectionMode.Single
+            ? _items.SelectedItem
+            : _items.SelectedItems.OfType<ListViewItem>().FirstOrDefault();
         _items.SelectionMode = enabled ? ListViewSelectionMode.Multiple : ListViewSelectionMode.Single;
         _items.IsMultiSelectCheckBoxEnabled = enabled;
-        if (!enabled && _items.SelectedItems.Count > 1)
-        {
-            var first = _items.SelectedItems.OfType<ListViewItem>().FirstOrDefault();
-            _items.SelectedItems.Clear();
-            if (first is not null) first.IsSelected = true;
-        }
+        if (first is not null) _items.SelectedItem = first;
         UpdateColumnsHeaderMargin();
         UpdateCommandStates();
     }
@@ -1302,8 +1692,24 @@ internal sealed class MainWindow : Window
 
     private void RenderItems()
     {
+        if (_isClosed) return;
+        TraceUiStage($"开始更新文件列表：Items={_currentItems.Count}");
         _items.Items.Clear();
+        _fileRows.Clear();
         var filter = _search.Text?.Trim() ?? "";
+        if (_currentFolder is null && _currentNode is { } grouping)
+        {
+            var children = grouping.Children.Where(node => (node.Content?.ToString() ?? "")
+                .Contains(filter, StringComparison.CurrentCultureIgnoreCase));
+            children = _sortAscending
+                ? children.OrderBy(node => node.Content?.ToString(), StringComparer.CurrentCultureIgnoreCase)
+                : children.OrderByDescending(node => node.Content?.ToString(), StringComparer.CurrentCultureIgnoreCase);
+            foreach (var child in children) _items.Items.Add(CreateGroupingRow(child));
+            _visibleCount = _items.Items.Count;
+            UpdateEmptyState(filter);
+            UpdateCommandStates();
+            return;
+        }
         var visible = SortItems(_currentItems
                 .Where(item => filter.Length == 0 || item.Name.Contains(filter, StringComparison.CurrentCultureIgnoreCase)))
             .ToList();
@@ -1314,6 +1720,37 @@ internal sealed class MainWindow : Window
         _visibleCount = visible.Count;
         UpdateEmptyState(filter);
         UpdateCommandStates();
+        TraceUiStage($"文件列表更新完成：Visible={visible.Count}");
+    }
+
+    private ListViewItem CreateGroupingRow(TreeViewNode node)
+    {
+        var row = new Grid { ColumnSpacing = 12 };
+        AddFileColumns(row);
+        var namePanel = new Grid
+        {
+            ColumnSpacing = 12,
+            ColumnDefinitions =
+            {
+                new ColumnDefinition { Width = new GridLength(20) },
+                new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) },
+            },
+            Children =
+            {
+                new FontIcon { Glyph = _folderNodes.ContainsKey(node) ? "\uEDA2" : "\uE8F1", FontSize = 18 },
+                new TextBlock { Text = node.Content?.ToString() ?? "", VerticalAlignment = VerticalAlignment.Center,
+                    TextTrimming = TextTrimming.CharacterEllipsis },
+            },
+        };
+        Grid.SetColumn((FrameworkElement)namePanel.Children[1], 1);
+        row.Children.Add(namePanel);
+        AddRowCell(row, 2, _folderNodes.ContainsKey(node) ? "云端磁盘" : "磁盘分组",
+            WinUiUiHost.GetBrushResource("TextFillColorSecondaryBrush"), TextAlignment.Left);
+        return new ListViewItem
+        {
+            Content = row, Tag = node, MinHeight = 36,
+            HorizontalContentAlignment = HorizontalAlignment.Stretch,
+        };
     }
 
     private ListViewItem CreateItemRow(YuWangItem item)
@@ -1329,12 +1766,14 @@ internal sealed class MainWindow : Window
             VerticalAlignment = VerticalAlignment.Center,
             Child = new FontIcon { Glyph = item.IsFolder ? FolderGlyph : FileGlyph, FontSize = 18 },
         };
-        _ = LoadSystemIconIntoAsync(iconHost,
-            item.IsFolder ? GetSystemFolderIconAsync() : GetSystemFileIconAsync(item.Name), 20);
-        var namePanel = new StackPanel
+        var namePanel = new Grid
         {
-            Orientation = Orientation.Horizontal,
-            Spacing = 12,
+            ColumnSpacing = 12,
+            ColumnDefinitions =
+            {
+                new ColumnDefinition { Width = new GridLength(20) },
+                new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) },
+            },
             VerticalAlignment = VerticalAlignment.Center,
             Children =
             {
@@ -1347,10 +1786,13 @@ internal sealed class MainWindow : Window
                 },
             },
         };
+        Grid.SetColumn((FrameworkElement)namePanel.Children[1], 1);
         row.Children.Add(namePanel);
 
         AddRowCell(row, 1, item.UploadTime?.ToLocalTime().ToString("yyyy-MM-dd HH:mm") ?? "", secondary, TextAlignment.Left);
-        AddRowCell(row, 2, GetTypeLabel(item), secondary, TextAlignment.Left);
+        var typeCell = AddRowCell(row, 2, GetTypeLabel(item), secondary, TextAlignment.Left);
+        _ = LoadSystemIconIntoAsync(iconHost,
+            item.IsFolder ? GetSystemFolderIconAsync() : GetSystemFileIconAsync(item.Name), 20, item, typeCell);
         AddRowCell(row, 3, item.IsFolder ? "" : FormatSize(item.Size), secondary, TextAlignment.Right);
 
         var listItem = new ListViewItem
@@ -1365,7 +1807,7 @@ internal sealed class MainWindow : Window
         return listItem;
     }
 
-    private static void AddRowCell(Grid row, int column, string text, Brush? foreground, TextAlignment alignment)
+    private static TextBlock AddRowCell(Grid row, int column, string text, Brush? foreground, TextAlignment alignment)
     {
         var cell = new TextBlock
         {
@@ -1377,18 +1819,18 @@ internal sealed class MainWindow : Window
         };
         Grid.SetColumn(cell, column);
         row.Children.Add(cell);
+        return cell;
     }
 
-    private static string GetTypeLabel(YuWangItem item)
+    private string GetTypeLabel(YuWangItem item)
     {
-        if (item.IsFolder) return "文件夹";
-        var extension = Path.GetExtension(item.Name).TrimStart('.');
-        return extension.Length is > 0 and <= 12 ? $"{extension.ToUpperInvariant()} 文件" : "文件";
+        if (item.IsFolder) return _systemFolderType;
+        return _systemFileTypes.GetValueOrDefault(SystemFileExtension(item.Name), "文件");
     }
 
     private void UpdateEmptyState(string filter)
     {
-        var hasFolder = _currentFolder is not null;
+        var hasFolder = _currentNode is not null;
         var loading = _busyNow && _currentItems.Count == 0;
         if (_visibleCount > 0 || loading)
         {
@@ -1409,19 +1851,23 @@ internal sealed class MainWindow : Window
         {
             _emptyGlyph.Glyph = "\uE721";
             _emptyTitle.Text = $"没有与“{filter}”匹配的项目";
-            _emptyDetail.Text = "仅搜索当前文件夹中的名称。";
+            _emptyDetail.Text = "仅搜索当前位置中的名称。";
         }
         else
         {
             _emptyGlyph.Glyph = FolderGlyph;
-            _emptyTitle.Text = "此文件夹为空";
+            _emptyTitle.Text = _currentFolder is null ? "此分组为空" : "此文件夹为空";
             _emptyDetail.Text = CanWrite ? "将文件或文件夹拖放到此处，或使用“上传”添加内容。" : "";
         }
     }
 
-    private async Task LoadSystemIconIntoAsync(Border iconHost, Task<BitmapImage?> iconTask, double size)
+    private async Task LoadSystemIconIntoAsync(Border iconHost, Task<BitmapImage?> iconTask, double size,
+        YuWangItem item, TextBlock typeCell)
     {
         var icon = await iconTask;
+        if (_isClosed) return;
+        typeCell.Text = GetTypeLabel(item);
+        ToolTipService.SetToolTip(typeCell, typeCell.Text);
         if (icon is null) return;
         iconHost.Child = new Image
         {
@@ -1434,13 +1880,28 @@ internal sealed class MainWindow : Window
 
     private Task<BitmapImage?> GetSystemFileIconAsync(string fileName)
     {
-        var extension = Path.GetExtension(fileName).ToLowerInvariant();
-        if (string.IsNullOrWhiteSpace(extension) || extension.Length > 20
-            || extension.Skip(1).Any(character => !char.IsAsciiLetterOrDigit(character)))
-            extension = ".file";
+        var extension = SystemFileExtension(fileName);
         if (!_systemFileIconTasks.TryGetValue(extension, out var task))
             _systemFileIconTasks[extension] = task = CreateSystemFileIconAsync(extension);
         return task;
+    }
+
+    private static string SystemFileExtension(string fileName)
+    {
+        var extension = Path.GetExtension(fileName).ToLowerInvariant();
+        return string.IsNullOrWhiteSpace(extension) || extension.Length > 64
+            || extension.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0
+            || extension.EndsWith('.') || extension.EndsWith(' ') ? ".file" : extension;
+    }
+
+    private void QueueSystemTypeSort()
+    {
+        if (_typeSortQueued || _sortColumn != SortColumn.Type || _isClosed) return;
+        _typeSortQueued = DispatcherQueue.TryEnqueue(() =>
+        {
+            _typeSortQueued = false;
+            if (!_isClosed && _sortColumn == SortColumn.Type) RenderItems();
+        });
     }
 
     private Task<BitmapImage?> GetSystemFolderIconAsync()
@@ -1453,7 +1914,7 @@ internal sealed class MainWindow : Window
         return probeDirectory;
     }
 
-    private static async Task<BitmapImage?> CreateSystemFileIconAsync(string extension)
+    private async Task<BitmapImage?> CreateSystemFileIconAsync(string extension)
     {
         string? probePath = null;
         try
@@ -1461,6 +1922,9 @@ internal sealed class MainWindow : Window
             probePath = Path.Combine(SystemIconProbeDirectory(), "file" + extension);
             if (!File.Exists(probePath)) await File.WriteAllBytesAsync(probePath, []);
             var probeFile = await StorageFile.GetFileFromPathAsync(probePath);
+            if (_isClosed) return null;
+            _systemFileTypes[extension] = string.IsNullOrWhiteSpace(probeFile.DisplayType) ? "文件" : probeFile.DisplayType;
+            QueueSystemTypeSort();
             using var thumbnail = await probeFile.GetThumbnailAsync(ThumbnailMode.ListView, 32);
             return await ToIconImageAsync(thumbnail);
         }
@@ -1479,13 +1943,16 @@ internal sealed class MainWindow : Window
         }
     }
 
-    private static async Task<BitmapImage?> CreateSystemFolderIconAsync()
+    private async Task<BitmapImage?> CreateSystemFolderIconAsync()
     {
         try
         {
             var probePath = Path.Combine(SystemIconProbeDirectory(), "folder");
             Directory.CreateDirectory(probePath);
             var probeFolder = await StorageFolder.GetFolderFromPathAsync(probePath);
+            if (_isClosed) return null;
+            _systemFolderType = string.IsNullOrWhiteSpace(probeFolder.DisplayType) ? "文件夹" : probeFolder.DisplayType;
+            QueueSystemTypeSort();
             using var thumbnail = await probeFolder.GetThumbnailAsync(ThumbnailMode.ListView, 32);
             return await ToIconImageAsync(thumbnail);
         }
@@ -1526,22 +1993,19 @@ internal sealed class MainWindow : Window
         _reloadDisks.IsEnabled = idle;
         _multiSelect.IsEnabled = idle && _currentFolder is not null;
         _back.IsEnabled = idle && _backHistory.Count > 0;
-        _up.IsEnabled = idle && _breadcrumbs.Count > 1;
+        _up.IsEnabled = idle && _currentNode?.Parent is not null;
         _forward.IsEnabled = idle && _forwardHistory.Count > 0;
         _refresh.IsEnabled = idle;
         _upload.IsEnabled = canWrite;
         _newFolder.IsEnabled = canWrite;
-        _open.IsEnabled = idle && selected.Count == 1;
+        _open.IsEnabled = idle && (selected.Count == 1
+            || (_items.SelectedItem as ListViewItem)?.Tag is TreeViewNode);
         _download.IsEnabled = idle && selected.Count > 0;
         _rename.IsEnabled = canWrite && selected.Count == 1;
         _move.IsEnabled = canWrite && selected.Count > 0;
         _delete.IsEnabled = canWrite && selected.Count > 0;
 
-        _menuOpen.IsEnabled = _open.IsEnabled;
-        _menuDownload.IsEnabled = _download.IsEnabled;
-        _menuRename.IsEnabled = _rename.IsEnabled;
-        _menuMove.IsEnabled = _move.IsEnabled;
-        _menuDelete.IsEnabled = _delete.IsEnabled;
+        UpdateItemMenuStates();
         _menuNewFolder.IsEnabled = canWrite;
         _menuUpload.IsEnabled = canWrite;
         _menuRefresh.IsEnabled = idle;
@@ -1554,7 +2018,8 @@ internal sealed class MainWindow : Window
     {
         if (_currentFolder is null)
         {
-            _summary.Text = "";
+            _summary.Text = _currentNode is { } grouping
+                ? $"显示 {_visibleCount} / {grouping.Children.Count} 个项目" : "";
             return;
         }
         var text = _visibleCount == _currentItems.Count
@@ -1603,30 +2068,127 @@ internal sealed class MainWindow : Window
         ToolTipService.SetToolTip(_permissionBadge, tooltip);
     }
 
-    private List<YuWangItem> SelectedEntries() => _items.SelectedItems
-        .OfType<ListViewItem>()
-        .Select(item => item.Tag)
-        .OfType<YuWangItem>()
-        .ToList();
+    private List<YuWangItem> SelectedEntries()
+    {
+        if (_items.SelectionMode == ListViewSelectionMode.Single)
+            return _items.SelectedItem is ListViewItem { Tag: YuWangItem item } ? [item] : [];
+        return _items.SelectedItems.OfType<ListViewItem>()
+            .Select(container => container.Tag).OfType<YuWangItem>().ToList();
+    }
+
+    private ItemActionTarget? GetSelectionTarget()
+        => _currentFolder is { } parent ? new ItemActionTarget(parent, SelectedEntries()) : null;
+
+    private bool IsItemTargetAvailable(ItemActionTarget? target)
+        => !_isClosed && !_busyNow && target is { Items.Count: > 0 }
+            && _folderNodes.TryGetValue(target.Parent.NavigationNode, out var state)
+            && state.Disk.Id == target.Parent.Disk.Id && state.Id == target.Parent.Id;
+
+    private bool CanWriteItems(ItemActionTarget? target)
+        => IsItemTargetAvailable(target)
+            && _folderNodes[target!.Parent.NavigationNode].Permission == DirectoryPermission.FullAccess;
+
+    private void UpdateItemMenuStates()
+    {
+        var available = IsItemTargetAvailable(_itemMenuTarget);
+        var canWrite = CanWriteItems(_itemMenuTarget);
+        var count = _itemMenuTarget?.Items.Count ?? 0;
+        _menuOpen.IsEnabled = available && count == 1;
+        _menuDownload.IsEnabled = available;
+        _menuRename.IsEnabled = canWrite && count == 1;
+        _menuMove.IsEnabled = canWrite;
+        _menuDelete.IsEnabled = canWrite;
+    }
+
+    private void RunItemMenuCommand(Func<ItemActionTarget?, Task> command)
+    {
+        var target = _itemMenuTarget;
+        _itemMenuTarget = null;
+        if (IsItemTargetAvailable(target)) RunUi(() => command(target));
+    }
 
     private void OnItemContextRequested(ListViewItem container, ContextRequestedEventArgs args)
     {
+        if (args.Handled) return;
         args.Handled = true;
-        if (!container.IsSelected)
+        RunContextMenu(() =>
         {
-            _items.SelectedItems.Clear();
-            container.IsSelected = true;
-        }
-        UpdateCommandStates();
-        ShowContextMenu(_itemMenu, container, args);
+            if (_busyNow || _isClosed || _currentFolder is null || container.Tag is not YuWangItem) return;
+            _itemMenu.Hide();
+            if (!container.IsSelected)
+            {
+                if (_items.SelectionMode == ListViewSelectionMode.Single)
+                    _items.SelectedItem = container;
+                else
+                {
+                    _items.SelectedItems.Clear();
+                    _items.SelectedItems.Add(container);
+                }
+            }
+            _itemMenuTarget = GetSelectionTarget();
+            UpdateCommandStates();
+            ShowContextMenu(_itemMenu, container, args);
+        });
+    }
+
+    private void OnNavigationContextRequested(UIElement sender, ContextRequestedEventArgs args)
+    {
+        if (args.Handled) return;
+        args.Handled = true;
+        RunContextMenu(() =>
+        {
+            if (_busyNow || _isClosed) return;
+            TreeViewNode? node = null;
+            FrameworkElement anchor = _navigationTree;
+            for (var source = args.OriginalSource as DependencyObject;
+                 source is not null && !ReferenceEquals(source, _navigationTree);
+                 source = VisualTreeHelper.GetParent(source))
+            {
+                if (source is not TreeViewItem container) continue;
+                node = _navigationTree.NodeFromContainer(container);
+                anchor = container;
+                break;
+            }
+            // A keyboard context request may originate from TreeView itself. A pointer
+            // request in empty space must not borrow the previously selected folder.
+            if (node is null && !args.TryGetPosition(_navigationTree, out _))
+                node = _navigationTree.SelectedNode;
+            if (node is null || !_nodeKinds.TryGetValue(node, out var kind)
+                || kind != NavigationNodeKind.Folder
+                || !_folderNodes.TryGetValue(node, out var folder)
+                || node.Parent is not { } parentNode
+                || !_folderNodes.TryGetValue(parentNode, out var parent)) return;
+
+            _itemMenu.Hide();
+            var item = new YuWangItem { Type = 'D', Id = folder.Id, Name = folder.Name };
+            _itemMenuTarget = new ItemActionTarget(parent.ToRemoteFolder(), [item]);
+            UpdateItemMenuStates();
+            ShowContextMenu(_itemMenu, anchor, args);
+        });
     }
 
     private void OnListBackgroundContextRequested(UIElement sender, ContextRequestedEventArgs args)
     {
         if (args.Handled || _currentFolder is null) return;
         args.Handled = true;
-        UpdateCommandStates();
-        ShowContextMenu(_backgroundMenu, _items, args);
+        RunContextMenu(() =>
+        {
+            if (_busyNow || _isClosed) return;
+            UpdateCommandStates();
+            ShowContextMenu(_backgroundMenu, _items, args);
+        });
+    }
+
+    private void RunContextMenu(Action action)
+    {
+        try { action(); }
+        catch (Exception error)
+        {
+            _itemMenuTarget = null;
+            Serilog.Log.Error(error, "打开主界面右键菜单失败；HRESULT=0x{HResult:X8}", error.HResult);
+            if (!_isClosed)
+                try { ShowInfo(InfoBarSeverity.Error, "无法打开右键菜单", error.Message); } catch { }
+        }
     }
 
     private static void ShowContextMenu(MenuFlyout menu, UIElement target, ContextRequestedEventArgs args)
@@ -1662,9 +2224,19 @@ internal sealed class MainWindow : Window
 
     private async Task OpenSelectedAsync()
     {
-        var selected = SelectedEntries();
-        var parent = _currentFolder;
-        if (selected.Count != 1 || parent is null) return;
+        if ((_items.SelectedItem as ListViewItem)?.Tag is TreeViewNode node)
+        {
+            await NavigateToNodeAsync(node);
+            return;
+        }
+        await OpenItemsAsync(GetSelectionTarget());
+    }
+
+    private async Task OpenItemsAsync(ItemActionTarget? target)
+    {
+        if (target is null || !IsItemTargetAvailable(target) || target.Items.Count != 1) return;
+        var selected = target.Items;
+        var parent = target.Parent;
         var item = selected[0];
         if (item.IsFolder)
         {
@@ -1691,30 +2263,32 @@ internal sealed class MainWindow : Window
 
     private async Task GoBackAsync()
     {
-        if (_busyNow || _backHistory.Count == 0 || _currentFolder is null) return;
-        var target = _backHistory.Pop();
-        _forwardHistory.Push(_currentFolder);
-        if (_folderNodes.TryGetValue(target.NavigationNode, out var state))
-            await NavigateToFolderAsync(state, addToHistory: false);
+        if (_busyNow || _currentNode is null) return;
+        while (_backHistory.TryPop(out var target))
+        {
+            if (!_nodeKinds.ContainsKey(target) || ReferenceEquals(target, _currentNode)) continue;
+            _forwardHistory.Push(_currentNode);
+            await NavigateToNodeAsync(target, addToHistory: false);
+            break;
+        }
     }
 
     private async Task GoForwardAsync()
     {
-        if (_busyNow || _forwardHistory.Count == 0 || _currentFolder is null) return;
-        var target = _forwardHistory.Pop();
-        _backHistory.Push(_currentFolder);
-        if (_folderNodes.TryGetValue(target.NavigationNode, out var state))
-            await NavigateToFolderAsync(state, addToHistory: false);
+        if (_busyNow || _currentNode is null) return;
+        while (_forwardHistory.TryPop(out var target))
+        {
+            if (!_nodeKinds.ContainsKey(target) || ReferenceEquals(target, _currentNode)) continue;
+            _backHistory.Push(_currentNode);
+            await NavigateToNodeAsync(target, addToHistory: false);
+            break;
+        }
     }
 
     private async Task GoUpAsync()
     {
-        if (_busyNow || _breadcrumbs.Count <= 1 || _currentFolder is null) return;
-        var target = _breadcrumbs[^2];
-        _backHistory.Push(_currentFolder);
-        _forwardHistory.Clear();
-        if (_folderNodes.TryGetValue(target.NavigationNode, out var state))
-            await NavigateToFolderAsync(state, addToHistory: false);
+        if (_busyNow || _currentNode?.Parent is not { } parent) return;
+        await NavigateToNodeAsync(parent);
     }
 
     #endregion
@@ -1881,13 +2455,15 @@ internal sealed class MainWindow : Window
         });
     }
 
-    private async Task RenameSelectionAsync()
+    private Task RenameSelectionAsync() => RenameItemsAsync(GetSelectionTarget());
+
+    private async Task RenameItemsAsync(ItemActionTarget? target)
     {
-        var selected = SelectedEntries();
-        var parent = _currentFolder;
+        if (target is null || !CanWriteItems(target) || target.Items.Count != 1) return;
+        var selected = target.Items;
+        var parent = target.Parent;
         var client = Client;
-        if (selected.Count != 1 || parent is null || parent.Permission != DirectoryPermission.FullAccess
-            || client is null || !client.IsLoggedIn || _busyNow) return;
+        if (client is null || !client.IsLoggedIn) return;
         var item = selected[0];
         var nameBox = new TextBox { Text = item.Name, MinWidth = 320 };
         nameBox.Loaded += (_, _) =>
@@ -1899,27 +2475,33 @@ internal sealed class MainWindow : Window
         if (await ShowInputDialogAsync("重命名", nameBox, "保存") != ContentDialogResult.Primary) return;
         var newName = nameBox.Text.Trim();
         if (newName.Length == 0 || newName == item.Name) return;
+        if (!CanWriteItems(target)) return;
         await RunBusyAsync("正在重命名…", async () =>
         {
             if (!await client.RenameRemoteItemAsync(parent.Disk.Id, parent.Id, item.Id, item.IsFolder, null, newName))
                 throw new IOException("服务器未确认重命名。");
-            await RefreshCurrentFolderCoreAsync(client, parent);
+            await RefreshItemParentAsync(client, parent);
             SetStatus($"已重命名为“{newName}”");
         });
     }
 
-    private async Task MoveSelectionAsync()
+    private Task MoveSelectionAsync() => MoveItemsAsync(GetSelectionTarget());
+
+    private async Task MoveItemsAsync(ItemActionTarget? target)
     {
-        var selected = SelectedEntries();
-        var source = _currentFolder;
+        if (target is null || !CanWriteItems(target)) return;
+        var selected = target.Items;
+        var source = target.Parent;
         var client = Client;
-        if (selected.Count == 0 || source is null || source.Permission != DirectoryPermission.FullAccess
-            || client is null || !client.IsLoggedIn) return;
+        if (client is null || !client.IsLoggedIn) return;
         var choices = _knownFolders.Values
             .Where(folder => folder.Disk.Id == source.Disk.Id
                 && folder.Id != source.Id
                 && folder.Permission == DirectoryPermission.FullAccess
-                && !selected.Any(item => item.IsFolder && item.Id == folder.Id))
+                && !selected.Any(item => item.IsFolder
+                    && (item.Id == folder.Id
+                        || (_folderNodesByKey.TryGetValue((source.Disk.Id, item.Id), out var moved)
+                            && IsDescendantOf(folder.NavigationNode, moved.Node)))))
             .Select(folder => (Folder: folder, Path: GetNavigationPath(folder.NavigationNode)))
             .OrderBy(choice => choice.Path, StringComparer.CurrentCultureIgnoreCase)
             .ToArray();
@@ -1953,30 +2535,37 @@ internal sealed class MainWindow : Window
             },
         };
         if (await ShowInputDialogAsync("移动", dialogContent, "移动") != ContentDialogResult.Primary) return;
-        if (targetPicker.SelectedItem is not ComboBoxItem { Tag: RemoteFolder target } || target.Id == source.Id) return;
+        if (targetPicker.SelectedItem is not ComboBoxItem { Tag: RemoteFolder destination }
+            || destination.Id == source.Id || !CanWriteItems(target)) return;
 
         await RunBusyAsync("正在移动…", async () =>
         {
             foreach (var item in selected)
             {
                 if (!await client.RenameRemoteItemAsync(source.Disk.Id, source.Id, item.Id, item.IsFolder,
-                        target.Id, item.Name))
+                        destination.Id, item.Name))
                     throw new IOException($"服务器未确认移动“{item.Name}”。");
             }
-            await RefreshCurrentFolderCoreAsync(client, source);
-            SetStatus($"已移动 {selected.Count} 项到“{target.Name}”");
+            await RefreshItemParentAsync(client, source);
+            if (_currentFolder is { } current && current.Disk.Id == destination.Disk.Id
+                && current.Id == destination.Id && _folderNodes.ContainsKey(current.NavigationNode))
+                await RefreshCurrentFolderCoreAsync(client, current);
+            SetStatus($"已移动 {selected.Count} 项到“{destination.Name}”");
         });
     }
 
-    private async Task DeleteSelectionAsync()
+    private Task DeleteSelectionAsync() => DeleteItemsAsync(GetSelectionTarget());
+
+    private async Task DeleteItemsAsync(ItemActionTarget? target)
     {
-        var selected = SelectedEntries();
-        var parent = _currentFolder;
+        if (target is null || !CanWriteItems(target)) return;
+        var selected = target.Items;
+        var parent = target.Parent;
         var client = Client;
-        if (selected.Count == 0 || parent is null || parent.Permission != DirectoryPermission.FullAccess
-            || client is null || !client.IsLoggedIn || _busyNow) return;
+        if (client is null || !client.IsLoggedIn) return;
         var prompt = selected.Count == 1 ? $"删除“{selected[0].Name}”？" : $"删除这 {selected.Count} 项？";
         if (await ShowConfirmDialogAsync(prompt, "删除会作用于云端，此操作无法撤销。", "删除") != ContentDialogResult.Primary) return;
+        if (!CanWriteItems(target)) return;
         await RunBusyAsync($"正在删除 {selected.Count} 项…", async () =>
         {
             var failures = new List<string>();
@@ -1985,7 +2574,7 @@ internal sealed class MainWindow : Window
                 if (!await client.DeleteRemoteItemAsync(parent.Disk.Id, parent.Id, item.Id, item.IsFolder))
                     failures.Add(item.Name);
             }
-            await RefreshCurrentFolderCoreAsync(client, parent);
+            await RefreshItemParentAsync(client, parent);
             if (failures.Count == 0) SetStatus($"已删除 {selected.Count} 项");
             else ShowInfo(InfoBarSeverity.Warning, "部分项目未能删除", "服务器未确认：" + string.Join("、", failures));
         });
@@ -1995,17 +2584,19 @@ internal sealed class MainWindow : Window
 
     #region Download
 
-    private async Task DownloadSelectionAsync()
+    private Task DownloadSelectionAsync() => DownloadItemsAsync(GetSelectionTarget());
+
+    private async Task DownloadItemsAsync(ItemActionTarget? target)
     {
-        var selected = SelectedEntries();
-        var parent = _currentFolder;
-        if (selected.Count == 0 || parent is null || _busyNow) return;
+        if (target is null || !IsItemTargetAvailable(target)) return;
+        var selected = target.Items;
+        var parent = target.Parent;
         var owner = WindowNative.GetWindowHandle(this);
         var userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
         var downloadsFolder = Path.Combine(userProfile, "Downloads");
         if (!Directory.Exists(downloadsFolder)) downloadsFolder = userProfile;
         var destination = await FolderPicker.PickAsync(owner, "选择下载位置", downloadsFolder);
-        if (string.IsNullOrWhiteSpace(destination)) return;
+        if (string.IsNullOrWhiteSpace(destination) || !IsItemTargetAvailable(target)) return;
         await RunBusyAsync($"正在下载 {selected.Count} 项…", async () =>
         {
             foreach (var item in selected)
@@ -2107,7 +2698,7 @@ internal sealed class MainWindow : Window
 
     private async Task RunBusyAsync(string initialStatus, Func<Task> action)
     {
-        if (_busyNow) return;
+        if (_busyNow || _isClosed) return;
         _busyNow = true;
         if (_infoBar.Severity is InfoBarSeverity.Error or InfoBarSeverity.Warning) _infoBar.IsOpen = false;
         _loading.Visibility = Visibility.Visible;
@@ -2117,17 +2708,23 @@ internal sealed class MainWindow : Window
         try { await action(); }
         catch (Exception error)
         {
-            Serilog.Log.Warning(error, "主界面操作失败");
+            if (_isClosed) return;
+            Serilog.Log.Warning(error, "主界面操作失败；最近阶段={Stage}; HRESULT=0x{HResult:X8}",
+                LastDiagnosticStage, error.HResult);
             SetStatus("");
             ShowInfo(InfoBarSeverity.Error, "操作失败", error.Message);
         }
         finally
         {
-            _loading.Visibility = Visibility.Collapsed;
-            _transferProgress.Visibility = Visibility.Collapsed;
             _busyNow = false;
-            UpdateCommandStates();
-            UpdateEmptyState(_search.Text?.Trim() ?? "");
+            if (!_isClosed)
+            {
+                _loading.Visibility = Visibility.Collapsed;
+                _transferProgress.Visibility = Visibility.Collapsed;
+                UpdateCommandStates();
+                UpdateEmptyState(_search.Text?.Trim() ?? "");
+                if (_pendingCollapsedNode is not null || _pendingSelection is not null) QueueNavigationChange();
+            }
         }
     }
 

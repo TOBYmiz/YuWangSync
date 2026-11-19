@@ -154,6 +154,10 @@ internal static class Program
                 message => Log.Debug("{Msg}", message), automatic: true, cancellationToken: token);
             Log.Information("自动清理文件缓存完成：还原 {Count} 个文件，释放 {Bytes} 字节，跳过 {Skipped} 个",
                 result.Dehydrated, result.FreedBytes, result.Skipped);
+            var record = new FileCacheCleanupRecord(DateTimeOffset.Now, result.FreedBytes);
+            try { FileCacheCleanupHistory.Write(FileCacheCleanupHistoryPath, record); }
+            catch (Exception error) { Log.Warning(error, "无法保存自动清理文件缓存记录"); }
+            WinUiUiHost.UpdateFileCacheCleanupHistory(record);
         }, message => Log.Warning("{Msg}", message));
         _fileCacheCleanup.Configure(_ctx.AutomaticFileCacheCleanup, _ctx.FileCacheCleanupHours);
     }
@@ -173,8 +177,12 @@ internal static class Program
     private static bool _console;
     /// <summary>是否存在可用控制台：决定日志是否挂 Console sink，以及验证码用控制台还是 UI 弹窗读取。</summary>
     private static bool _hasConsole;
-    /// <summary>--open-folder：启动同步后打开目录；若已有实例则只打开目录并退出。</summary>
+    /// <summary>
+    /// --open-folder：启动同步后按“快捷方式启动”设置打开主界面或同步目录；若已有实例则交给它打开后退出。
+    /// --open-sync-folder：同上，但总是打开同步目录（安装完成页“打开同步目录”使用）。
+    /// </summary>
     private static bool _openFolder;
+    private static bool _forceOpenSyncFolder;
     /// <summary>-about：完成单实例检查并初始化更新状态后显示关于窗口。</summary>
     private static bool _showAbout;
     private static bool _accountSwitchRestart;
@@ -771,8 +779,10 @@ internal static class Program
         _quiet = args.Any(a => string.Equals(a, "--quiet", StringComparison.OrdinalIgnoreCase)
                                 || string.Equals(a, "--q", StringComparison.OrdinalIgnoreCase));
         _console = args.Any(a => string.Equals(a, "--console", StringComparison.OrdinalIgnoreCase));
-        _openFolder = args.Any(a => string.Equals(a, "--open-folder", StringComparison.OrdinalIgnoreCase)
-            || string.Equals(a, "-open-folder", StringComparison.OrdinalIgnoreCase));
+        _forceOpenSyncFolder = args.Any(a => string.Equals(a, "--open-sync-folder", StringComparison.OrdinalIgnoreCase));
+        _openFolder = _forceOpenSyncFolder
+            || args.Any(a => string.Equals(a, "--open-folder", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(a, "-open-folder", StringComparison.OrdinalIgnoreCase));
         _showAbout = args.Any(a => string.Equals(a, "-about", StringComparison.OrdinalIgnoreCase));
         // 1. 加载配置
         LoadConfig(args);
@@ -1307,7 +1317,7 @@ internal static class Program
             _ctx.EnableExplorerNavigationEntry, "启动时", out _);
 
         if (_openFolder)
-            OpenSyncFolder();
+            OpenShortcutTarget(_forceOpenSyncFolder);
 
         // 8b-2. 目录时间对账：改为后台预拉取完成后触发（开机启动场景）。
         //       之前立即跑对账时 files/folders 表空（浏览前）→ derived 全 null → "刷新 0 个"。
@@ -2343,6 +2353,11 @@ internal static class Program
     {
         if (string.Equals(command, "stop", StringComparison.Ordinal))
             return Environment.ProcessId.ToString();
+        if (string.Equals(command, OpenShortcutTargetCommand, StringComparison.Ordinal))
+        {
+            OpenShortcutTarget(forceSyncFolder: false);
+            return "ok";
+        }
         if (command.StartsWith("refresh-folder|", StringComparison.Ordinal))
         {
             var path = command["refresh-folder|".Length..];
@@ -2594,6 +2609,8 @@ internal static class Program
         _ctx = ConfigurationStore.Load(AppContext.BaseDirectory, decryptPassword: false);
         _ctx.EnableExplorerNavigationEntry = navigationEntryEnabled;
         _ctx.EnableMainWindow = mainWindowEnabled;
+        if (!mainWindowEnabled) _ctx.ShortcutOpensMainWindow = false;
+        if (!mainWindowEnabled) _ctx.TrayClickOpensMainWindow = false;
         ConfigurationStore.SaveEncrypted(_ctx);
         Log.Information("已更新安装选项：NavigationEntry={NavigationEntry}; MainWindow={MainWindow}",
             navigationEntryEnabled, mainWindowEnabled);
@@ -2601,6 +2618,8 @@ internal static class Program
     }
 
     // ============== 设置界面支持（供 Tray/SettingsWindow 调用） ==============
+
+    internal static string FileCacheCleanupHistoryPath => AppPaths.ResolveDataPath("file-cache-cleanup.json");
 
     /// <summary>防止并发应用设置（"确定"与"应用"都可能触发）：同时只允许一个应用流程。</summary>
     private static int _settingsBusy;
@@ -2693,6 +2712,8 @@ internal static class Program
     /// <summary>把 <see cref="_ctx"/> 写回当前 Windows 用户的运行配置。</summary>
     internal static void SaveConfig()
     {
+        if (!_ctx.EnableMainWindow) _ctx.ShortcutOpensMainWindow = false;
+        if (!_ctx.EnableMainWindow) _ctx.TrayClickOpensMainWindow = false;
         ConfigurationStore.Save(_ctx);
         Log.Information("配置已写入 {Path}", AppPaths.ConfigPath);
     }
@@ -3122,8 +3143,19 @@ internal static class Program
 
             if (openFolderIfRunning)
             {
-                Log.Information("检测到已有运行中的实例，直接打开同步目录: {Path}", _ctx.SyncRootPath);
-                OpenSyncFolder();
+                // The running instance owns the current configuration and the WinUI main window,
+                // so let it decide between main window and sync folder. Older instances answer "error".
+                _ = AllowSetForegroundWindow(AsfwAny);
+                if (!_forceOpenSyncFolder
+                    && string.Equals(InstanceControl.TrySendCommand(OpenShortcutTargetCommand), "ok", StringComparison.Ordinal))
+                {
+                    Log.Information("检测到已有运行中的实例，已请求其打开快捷方式目标");
+                }
+                else
+                {
+                    Log.Information("检测到已有运行中的实例，直接打开同步目录: {Path}", _ctx.SyncRootPath);
+                    OpenSyncFolder();
+                }
                 Log.CloseAndFlush();
             }
             else
@@ -3139,6 +3171,24 @@ internal static class Program
             Log.Warning(ex, "单实例检查失败（放行本次启动，若撞上已有实例会报 0x17A）");
             return true;
         }
+    }
+
+    private const string OpenShortcutTargetCommand = "open-shortcut-target";
+    private const int AsfwAny = -1;
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern bool AllowSetForegroundWindow(int processId);
+
+    /// <summary>-open-folder：按设置“快捷方式启动”打开主界面或同步目录（主界面禁用时总是同步目录）。</summary>
+    private static void OpenShortcutTarget(bool forceSyncFolder)
+    {
+        if (!forceSyncFolder && _ctx.ShouldShortcutOpenMainWindow())
+        {
+            Log.Information("快捷方式启动：打开主界面");
+            WinUiUiHost.ShowMainWindow();
+            return;
+        }
+        OpenSyncFolder();
     }
 
     private static void OpenSyncFolder()

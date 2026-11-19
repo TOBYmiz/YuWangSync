@@ -183,6 +183,20 @@ public sealed class SyncRootContext
     /// <summary>Whether the remote file browser main window is available from the tray menu.</summary>
     public bool EnableMainWindow { get; set; } = true;
 
+    /// <summary>
+    /// 安装程序创建的快捷方式（-open-folder 参数）打开主界面而非同步目录。
+    /// 仅在 <see cref="EnableMainWindow"/> 为 true 时生效；禁用主界面时保存配置会自动回退为 false。
+    /// </summary>
+    public bool ShortcutOpensMainWindow { get; set; }
+
+    /// <summary>-open-folder 实际应打开主界面（主界面已启用且选择了“主界面”）。</summary>
+    public bool ShouldShortcutOpenMainWindow() => EnableMainWindow && ShortcutOpensMainWindow;
+
+    /// <summary>托盘单击打开主界面；主界面禁用时回退到同步目录。</summary>
+    public bool TrayClickOpensMainWindow { get; set; } = true;
+
+    public bool ShouldTrayClickOpenMainWindow() => EnableMainWindow && TrayClickOpensMainWindow;
+
     /// <summary>是否每日自动检查 GitHub Release 更新。</summary>
     public bool AutomaticUpdateCheck { get; set; } = true;
 

@@ -46,6 +46,27 @@ public static class InstanceControl
         }
     }
 
+    /// <summary>Send one command line to the running instance; returns its response, or null if unavailable.</summary>
+    public static string? TrySendCommand(string command, int timeoutMilliseconds = 2000)
+    {
+        try
+        {
+            using var client = new NamedPipeClientStream(".", PipeName, PipeDirection.InOut,
+                PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly);
+            client.Connect(timeoutMilliseconds);
+            using var deadline = new CancellationTokenSource(TimeSpan.FromMilliseconds(timeoutMilliseconds * 2));
+            using var writer = new StreamWriter(client, leaveOpen: true) { AutoFlush = true };
+            using var reader = new StreamReader(client, leaveOpen: true);
+            writer.WriteLine(command);
+            return reader.ReadLineAsync(deadline.Token).AsTask().GetAwaiter().GetResult();
+        }
+        catch (Exception error) when (error is IOException or TimeoutException or OperationCanceledException
+            or UnauthorizedAccessException)
+        {
+            return null;
+        }
+    }
+
     public static async Task StopAsync()
     {
         using var client = new NamedPipeClientStream(".", PipeName, PipeDirection.InOut,

@@ -48,8 +48,40 @@ internal sealed class SettingsWindow : Window
         MinWidth = 0,
     };
     private readonly CheckBox _persist = new() { Name = "PersistSyncRootCheckBox" };
+    private readonly TextBlock _fileCacheCleanupStatus = NewNote("上次清理：无记录");
+    private readonly DispatcherTimer _fileCacheCleanupStatusTimer = new() { Interval = TimeSpan.FromMinutes(1) };
+    private FileCacheCleanupRecord? _lastFileCacheCleanup;
     private readonly CheckBox _enableNavigationEntry = new() { Name = "EnableExplorerNavigationEntryCheckBox" };
     private readonly CheckBox _enableMainWindow = new() { Name = "EnableMainWindowCheckBox" };
+    private readonly RadioButton _shortcutOpensMainWindow = new()
+    {
+        Name = "ShortcutOpensMainWindowRadioButton",
+        Content = "主界面",
+        GroupName = "ShortcutLaunchTarget",
+        MinWidth = 0,
+    };
+    private readonly RadioButton _shortcutOpensSyncFolder = new()
+    {
+        Name = "ShortcutOpensSyncFolderRadioButton",
+        Content = "同步目录",
+        GroupName = "ShortcutLaunchTarget",
+        MinWidth = 0,
+    };
+    private readonly RadioButton _trayClickOpensMainWindow = new()
+    {
+        Name = "TrayClickOpensMainWindowRadioButton",
+        Content = "主界面",
+        GroupName = "TrayClickTarget",
+        MinWidth = 0,
+    };
+    private readonly RadioButton _trayClickOpensSyncFolder = new()
+    {
+        Name = "TrayClickOpensSyncFolderRadioButton",
+        Content = "同步目录",
+        GroupName = "TrayClickTarget",
+        MinWidth = 0,
+    };
+    private bool _updatingFeatureAvailability;
     private readonly CheckBox _automaticUpdateCheck = new() { Name = "AutomaticUpdateCheckCheckBox" };
     private readonly CheckBox _trayUpdateHint = new() { Name = "TrayUpdateHintCheckBox" };
     private readonly CheckBox _automaticUpdateDownload = new() { Name = "AutomaticUpdateDownloadCheckBox" };
@@ -193,20 +225,24 @@ internal sealed class SettingsWindow : Window
         Add(pathGrid, NewNote("请选择空目录，更换后旧目录会被清理。"), 1, 0, 2);
         AddCard(content, "挂载位置", pathGrid);
 
-        var cacheGrid = NewGrid(RowHeight, 0, RowHeight, 0, RowHeight);
+        var cacheGrid = NewGrid(RowHeight, 0, RowHeight, RowHeight, 0);
         cacheGrid.ColumnDefinitions[0].Width = new GridLength(LabelColumnWidth * 1.1);
         Add(cacheGrid, NewLabel("保持目录刷新频率（分钟）"), 0, 0);
         Add(cacheGrid, MinutesInputRow(_directoryRefreshInterval, 1, 60), 0, 1);
-        Add(cacheGrid, NewNote("仅对标记为保持刷新的目录生效；普通目录进入时直接拉取云端。"), 1, 0, 2);
+        Add(cacheGrid, NewNote("对选择保持刷新的目录生效，其他目录仅在主界面可实时刷新。"), 1, 0, 2);
         var manageKeptDirectories = new Button { Name = "ManageKeptDirectoriesButton", Content = "管理保持更新的目录", MinWidth = 150 };
         manageKeptDirectories.Click += (_, _) => DirectoryRefreshManagementRequested?.Invoke(this);
         Add(cacheGrid, manageKeptDirectories, 2, 1);
-        Add(cacheGrid, NewNote("有效值 1—60 分钟，默认 5 分钟。"), 3, 0, 2);
         _automaticFileCacheCleanup.Content = "自动清理文件缓存";
         foreach (var (text, hours) in new[] { ("每 8 小时", 8), ("每 12 小时", 12), ("每天", 24), ("每 7 天", 168) })
             _fileCacheCleanupInterval.Items.Add(new ComboBoxItem { Content = text, Tag = hours });
-        Add(cacheGrid, _automaticFileCacheCleanup, 4, 0);
-        Add(cacheGrid, _fileCacheCleanupInterval, 4, 1);
+        Add(cacheGrid, _automaticFileCacheCleanup, 3, 0);
+        Add(cacheGrid, _fileCacheCleanupInterval, 3, 1);
+        _fileCacheCleanupStatus.Name = "FileCacheCleanupStatusTextBlock";
+        Add(cacheGrid, _fileCacheCleanupStatus, 4, 0, 2);
+        try { UpdateFileCacheCleanupHistory(FileCacheCleanupHistory.Read(Program.FileCacheCleanupHistoryPath)); }
+        catch (Exception error) { Serilog.Log.Warning(error, "无法读取自动清理文件缓存记录"); }
+        _fileCacheCleanupStatusTimer.Tick += (_, _) => RefreshFileCacheCleanupStatus();
         AddCard(content, "缓存与刷新", cacheGrid);
 
         _persist.Content = "退出后保留同步目录";
@@ -215,11 +251,34 @@ internal sealed class SettingsWindow : Window
         AddCard(content, "退出与常驻", persistGrid);
 
         _enableNavigationEntry.Content = "导航栏入口";
-        _enableMainWindow.Content = "启用主界面（远程文件浏览与拖放）";
-        var featuresGrid = NewGrid(RowHeight, RowHeight, 0);
-        AddCheck(featuresGrid, _enableNavigationEntry, 0);
-        AddCheck(featuresGrid, _enableMainWindow, 1);
-        Add(featuresGrid, NewNote("至少保留一项。关闭导航栏入口只隐藏 Explorer 中的同步目录图标，不影响 Cloud Files 同步；开机启动只在托盘运行，需要时从托盘首项打开主界面。"), 2, 0, 2);
+        _enableMainWindow.Content = "启用主界面";
+        var featuresGrid = NewGrid(RowHeight, RowHeight, 0, RowHeight);
+        featuresGrid.RowSpacing = 4;
+        _enableNavigationEntry.VerticalAlignment = VerticalAlignment.Center;
+        _enableMainWindow.VerticalAlignment = VerticalAlignment.Center;
+        Add(featuresGrid, _enableNavigationEntry, 0, 0);
+        Add(featuresGrid, _enableMainWindow, 0, 1);
+        Add(featuresGrid, NewLabel("快捷方式启动："), 1, 0);
+        var shortcutTargets = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            Spacing = 24,
+            VerticalAlignment = VerticalAlignment.Center,
+        };
+        shortcutTargets.Children.Add(_shortcutOpensMainWindow);
+        shortcutTargets.Children.Add(_shortcutOpensSyncFolder);
+        Add(featuresGrid, shortcutTargets, 1, 1);
+        Add(featuresGrid, NewNote("对安装程序创建的快捷方式生效，改变“-open-folder”参数行为。"), 2, 0, 2);
+        Add(featuresGrid, NewLabel("托盘单击："), 3, 0);
+        var trayClickTargets = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            Spacing = 24,
+            VerticalAlignment = VerticalAlignment.Center,
+        };
+        trayClickTargets.Children.Add(_trayClickOpensMainWindow);
+        trayClickTargets.Children.Add(_trayClickOpensSyncFolder);
+        Add(featuresGrid, trayClickTargets, 3, 1);
         AddCard(content, "功能选择", featuresGrid);
 
         var cloudGrid = NewGrid(RowHeight, 0, RowHeight, 0);
@@ -296,16 +355,27 @@ internal sealed class SettingsWindow : Window
         _persist.IsChecked = snapshot.PersistSyncRoot;
         _enableNavigationEntry.IsChecked = snapshot.EnableExplorerNavigationEntry;
         _enableMainWindow.IsChecked = snapshot.EnableMainWindow;
+        if (snapshot.ShouldShortcutOpenMainWindow()) _shortcutOpensMainWindow.IsChecked = true;
+        else _shortcutOpensSyncFolder.IsChecked = true;
+        if (snapshot.ShouldTrayClickOpenMainWindow()) _trayClickOpensMainWindow.IsChecked = true;
+        else _trayClickOpensSyncFolder.IsChecked = true;
+        UpdateFeatureAvailability();
         _automaticUpdateCheck.IsChecked = snapshot.AutomaticUpdateCheck;
         _trayUpdateHint.IsChecked = snapshot.TrayUpdateHintEnabled;
         _automaticUpdateDownload.IsChecked = snapshot.AutomaticUpdateDownload;
         WireDirty();
 
-        Root.Loaded += (_, _) => _loaded.TrySetResult(true);
+        Root.Loaded += (_, _) =>
+        {
+            RefreshFileCacheCleanupStatus();
+            _fileCacheCleanupStatusTimer.Start();
+            _loaded.TrySetResult(true);
+        };
         Root.AddHandler(UIElement.KeyDownEvent, new KeyEventHandler(OnKeyDown), true);
         Closed += (_, _) =>
         {
             _isClosed = true;
+            _fileCacheCleanupStatusTimer.Stop();
             _loaded.TrySetResult(false);
         };
 
@@ -739,6 +809,9 @@ internal sealed class SettingsWindow : Window
             PersistSyncRoot = _persist.IsChecked == true,
             EnableExplorerNavigationEntry = _enableNavigationEntry.IsChecked == true,
             EnableMainWindow = _enableMainWindow.IsChecked == true,
+            // “主界面”仅在启用主界面时有效；禁用主界面时自动回退到同步目录。
+            ShortcutOpensMainWindow = _enableMainWindow.IsChecked == true && _shortcutOpensMainWindow.IsChecked == true,
+            TrayClickOpensMainWindow = _enableMainWindow.IsChecked == true && _trayClickOpensMainWindow.IsChecked == true,
             AutomaticUpdateCheck = _automaticUpdateCheck.IsChecked == true,
             TrayUpdateHintEnabled = _trayUpdateHint.IsChecked == true,
             AutomaticUpdateDownload = _automaticUpdateDownload.IsChecked == true,
@@ -1053,6 +1126,29 @@ internal sealed class SettingsWindow : Window
         }
     }
 
+    /// <summary>最后一个入口保持启用并锁定；启动目标随主界面可用状态回退。</summary>
+    private void UpdateFeatureAvailability()
+    {
+        if (_updatingFeatureAvailability) return;
+        _updatingFeatureAvailability = true;
+        try
+        {
+            if (_enableNavigationEntry.IsChecked != true && _enableMainWindow.IsChecked != true)
+                _enableNavigationEntry.IsChecked = true;
+            var mainWindowEnabled = _enableMainWindow.IsChecked == true;
+            _enableNavigationEntry.IsEnabled = mainWindowEnabled;
+            _enableMainWindow.IsEnabled = _enableNavigationEntry.IsChecked == true;
+            _shortcutOpensMainWindow.IsEnabled = mainWindowEnabled;
+            _trayClickOpensMainWindow.IsEnabled = mainWindowEnabled;
+            if (!mainWindowEnabled)
+            {
+                _shortcutOpensSyncFolder.IsChecked = true;
+                _trayClickOpensSyncFolder.IsChecked = true;
+            }
+        }
+        finally { _updatingFeatureAvailability = false; }
+    }
+
     private void WireDirty()
     {
         _accountSelector.SelectionChanged += (_, _) =>
@@ -1069,10 +1165,22 @@ internal sealed class SettingsWindow : Window
         _providerName.TextChanged += (_, _) => MarkDirty();
         _persist.Checked += (_, _) => MarkDirty();
         _persist.Unchecked += (_, _) => MarkDirty();
-        _enableNavigationEntry.Checked += (_, _) => MarkDirty();
-        _enableNavigationEntry.Unchecked += (_, _) => MarkDirty();
-        _enableMainWindow.Checked += (_, _) => MarkDirty();
-        _enableMainWindow.Unchecked += (_, _) => MarkDirty();
+        _enableNavigationEntry.Checked += (_, _) => { UpdateFeatureAvailability(); MarkDirty(); };
+        _enableNavigationEntry.Unchecked += (_, _) => { UpdateFeatureAvailability(); MarkDirty(); };
+        _enableMainWindow.Checked += (_, _) =>
+        {
+            UpdateFeatureAvailability();
+            MarkDirty();
+        };
+        _enableMainWindow.Unchecked += (_, _) =>
+        {
+            UpdateFeatureAvailability();
+            MarkDirty();
+        };
+        _shortcutOpensMainWindow.Checked += (_, _) => MarkDirty();
+        _shortcutOpensSyncFolder.Checked += (_, _) => MarkDirty();
+        _trayClickOpensMainWindow.Checked += (_, _) => MarkDirty();
+        _trayClickOpensSyncFolder.Checked += (_, _) => MarkDirty();
         _automaticUpdateCheck.Checked += (_, _) => MarkDirty();
         _automaticUpdateCheck.Unchecked += (_, _) => MarkDirty();
         _trayUpdateHint.Checked += (_, _) => MarkDirty();
@@ -1086,6 +1194,16 @@ internal sealed class SettingsWindow : Window
         _fileCacheCleanupInterval.IsEnabled = _automaticFileCacheCleanup.IsChecked == true;
         MarkDirty();
     }
+
+    internal void UpdateFileCacheCleanupHistory(FileCacheCleanupRecord? record)
+    {
+        if (_isClosed) return;
+        _lastFileCacheCleanup = record;
+        RefreshFileCacheCleanupStatus();
+    }
+
+    private void RefreshFileCacheCleanupStatus()
+        => _fileCacheCleanupStatus.Text = FileCacheCleanupHistory.Format(_lastFileCacheCleanup, DateTimeOffset.Now);
 
     private void MarkDirty()
     {

@@ -22,19 +22,22 @@ public partial class App : Application
         UnhandledException += (_, args) =>
         {
             args.Handled = true;
-            if (IsNonFatalPlatformFeatureProbeFailure(args.Exception, args.Message))
+            var context = $"WinUI UI 线程未处理异常; 主界面最近阶段={MainWindow.LastDiagnosticStage}; "
+                + $"ThreadId={Environment.CurrentManagedThreadId}; UIThreadId={WinUiUiHost.UiThreadId}; "
+                + $"HRESULT=0x{args.Exception?.HResult ?? 0:X8}; WinUI Message={args.Message}";
+            if (IsLimitedAccessFeatureActivationFailure(args.Exception, args.Message))
             {
-                // Windows App SDK text-input components probe Windows.ApplicationModel.LimitedAccessFeatures.
-                // Some Windows builds cannot activate that class; the probe failure leaves the UI intact.
+                // Handling the activation failure requests continued execution. It does not
+                // establish that WinUI's native caller can recover or identify the triggering control.
                 try
                 {
                     Serilog.Log.Warning(args.Exception,
-                        "已忽略 Windows App SDK 受限功能探测失败（UI 不受影响）：{Message}", args.Message);
+                        "Windows 受限功能类激活失败，已标记为处理，等待后续界面阶段确认能否继续：{Context}", context);
                 }
                 catch { }
                 return;
             }
-            Program.HandleFatalException(args.Exception, "WinUI UI 线程未处理异常");
+            Program.HandleFatalException(args.Exception, context);
             try { Serilog.Log.CloseAndFlush(); } catch { }
             Environment.Exit(1);
         };
@@ -48,7 +51,7 @@ public partial class App : Application
         Program.SetStartupStage("WinUI App.xaml 加载完成");
     }
 
-    private static bool IsNonFatalPlatformFeatureProbeFailure(Exception? exception, string? message)
+    private static bool IsLimitedAccessFeatureActivationFailure(Exception? exception, string? message)
     {
         const int ClassNotAvailable = unchecked((int)0x80040111); // CLASS_E_CLASSNOTAVAILABLE
         const string FeatureClass = "Windows.ApplicationModel.LimitedAccessFeatures";
