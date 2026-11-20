@@ -2657,10 +2657,23 @@ internal static class Program
             _uiSelfTestShot = args.Any(a => a.Equals("--ui-selftest-shot", StringComparison.OrdinalIgnoreCase)
                 || a.Equals("--wpf-ui-selftest-shot", StringComparison.OrdinalIgnoreCase));
 
-            var checks = await WinUiUiHost.RunSelfTestAsync(captchaPath, testRoot,
+            // Exercise the real cache in the published process: UI-only checks cannot
+            // detect a missing SQLite native DLL in an installer payload.
+            var databasePath = Path.Combine(testRoot, "cache.selftest.db");
+            using (var cache = new SqliteCache(databasePath))
+                cache.SetDirectoryRefreshIntervalMinutes("selftest", 17);
+            bool sqlitePassed;
+            using (var cache = new SqliteCache(databasePath))
+                sqlitePassed = cache.GetDirectoryRefreshIntervalMinutes("selftest") == 17;
+            var checks = new List<UiSelfTestCheck>
+            {
+                new("SQLite cache persistence", sqlitePassed,
+                    "Created the cache schema, saved a setting, and read it after reopening the database.")
+            };
+            checks.AddRange(await WinUiUiHost.RunSelfTestAsync(captchaPath, testRoot,
                 _uiSelfTestHoldSeconds, _uiSelfTestShot,
                 args.Any(argument => argument.Equals("--ui-selftest-folder-picker", StringComparison.OrdinalIgnoreCase)))
-                .ConfigureAwait(false);
+                .ConfigureAwait(false));
             var passed = checks.All(check => check.Passed);
             foreach (var check in checks)
             {

@@ -44,6 +44,13 @@
     <Description>$(ProductDisplayNameZh) Cloud Files API 同步引擎（路径 E 实现）</Description>
   </PropertyGroup>
 
+  <PropertyGroup Condition="'$(PublishAot)' == 'true'">
+    <!-- Accepted Vanara.Core 5.0.7 / Serilog 4.0.1 trimming diagnostics.
+         NoWarn is code-scoped (including matching diagnostics in application code),
+         not assembly-scoped. Keep trim/AOT analysis and NuGet auditing enabled. -->
+    <NoWarn>$(NoWarn);IL2026;IL2072;IL2075;IL2090;IL2104</NoWarn>
+  </PropertyGroup>
+
   <ItemGroup>
     <ProjectReference Include="..\YuWangCloudSync.Core\YuWangCloudSync.Core.csproj" />
     <Compile Remove="CloudFiles\SyncRootProbe.cs;Models\FileIdentity.cs" />

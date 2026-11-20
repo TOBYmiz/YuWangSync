@@ -2044,6 +2044,10 @@ Function AddExistingShortcutIconsToManifest
   ClearErrors
   FileOpen $2 "$PLUGINSDIR\installed-files.new.txt" a
   IfErrors record_shortcut_icons_open_failed
+  ; NSIS opens mode "a" at offset zero. Seek before preserving old icon names,
+  ; otherwise they overwrite payload entries and upgrade cleanup deletes live DLLs.
+  FileSeek $2 0 END
+  IfErrors record_shortcut_icons_write_failed
   ${Do}
     StrCmp $1 "${PRODUCT_IDENTIFIER}-shortcut-${PRODUCT_VERSION}.ico" record_shortcut_icon_next
     ClearErrors

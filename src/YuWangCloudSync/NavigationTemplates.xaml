@@ -1,0 +1,32 @@
+<ResourceDictionary
+    x:Class="YuWangCloudSync.Tray.NavigationTemplates"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:controls="using:Microsoft.UI.Xaml.Controls">
+            <!-- Main window navigation tree. TreeViewNode.Content is a plain string (as in the stock
+                 TreeViewItemDataTemplate); MainWindow picks one of these fixed-icon templates per node kind. -->
+            <DataTemplate x:Key="YuWangNavigationRootTemplate" x:DataType="controls:TreeViewNode">
+                <StackPanel Orientation="Horizontal" Spacing="10" ToolTipService.ToolTip="{x:Bind Content, Mode=OneWay}">
+                    <FontIcon Glyph="&#xE753;" FontSize="16" VerticalAlignment="Center" />
+                    <TextBlock Text="{x:Bind Content, Mode=OneWay}" TextTrimming="CharacterEllipsis" VerticalAlignment="Center" />
+                </StackPanel>
+            </DataTemplate>
+            <DataTemplate x:Key="YuWangNavigationContainerTemplate" x:DataType="controls:TreeViewNode">
+                <StackPanel Orientation="Horizontal" Spacing="10" ToolTipService.ToolTip="{x:Bind Content, Mode=OneWay}">
+                    <FontIcon Glyph="&#xE8F1;" FontSize="16" VerticalAlignment="Center" />
+                    <TextBlock Text="{x:Bind Content, Mode=OneWay}" TextTrimming="CharacterEllipsis" VerticalAlignment="Center" />
+                </StackPanel>
+            </DataTemplate>
+            <DataTemplate x:Key="YuWangNavigationDiskTemplate" x:DataType="controls:TreeViewNode">
+                <StackPanel Orientation="Horizontal" Spacing="10" ToolTipService.ToolTip="{x:Bind Content, Mode=OneWay}">
+                    <FontIcon Glyph="&#xEDA2;" FontSize="16" VerticalAlignment="Center" />
+                    <TextBlock Text="{x:Bind Content, Mode=OneWay}" TextTrimming="CharacterEllipsis" VerticalAlignment="Center" />
+                </StackPanel>
+            </DataTemplate>
+            <DataTemplate x:Key="YuWangNavigationFolderTemplate" x:DataType="controls:TreeViewNode">
+                <StackPanel Orientation="Horizontal" Spacing="10" ToolTipService.ToolTip="{x:Bind Content, Mode=OneWay}">
+                    <FontIcon Glyph="&#xE8B7;" FontSize="16" VerticalAlignment="Center" />
+                    <TextBlock Text="{x:Bind Content, Mode=OneWay}" TextTrimming="CharacterEllipsis" VerticalAlignment="Center" />
+                </StackPanel>
+            </DataTemplate>
+</ResourceDictionary>

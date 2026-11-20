@@ -1,4 +1,23 @@
 <Project>
+  <!-- NativeAOT embeds the runtime: use at least the .NET 10 Brotli security fix
+       (GHSA-p3jp-9v83-76w9), including project references built by older SDKs.
+       Keep newer SDK patches. Avoid the global RuntimeFrameworkVersion property,
+       which also overrides the unrelated Windows SDK reference pack version. -->
+  <Target Name="EnsureNativeAotSecurityPatch" BeforeTargets="ProcessFrameworkReferences"
+          Condition="'$(PublishAot)' == 'true'">
+    <ItemGroup>
+      <KnownILCompilerPack Update="Microsoft.DotNet.ILCompiler"
+                           Condition="'%(KnownILCompilerPack.TargetFramework)' == 'net10.0' and $([MSBuild]::VersionLessThan('%(KnownILCompilerPack.ILCompilerPackVersion)', '10.0.14'))"
+                           ILCompilerPackVersion="10.0.14" />
+      <KnownRuntimePack Update="Microsoft.NETCore.App"
+                        Condition="'%(KnownRuntimePack.TargetFramework)' == 'net10.0' and $([MSBuild]::VersionLessThan('%(KnownRuntimePack.LatestRuntimeFrameworkVersion)', '10.0.14'))"
+                        LatestRuntimeFrameworkVersion="10.0.14" />
+      <KnownFrameworkReference Update="Microsoft.NETCore.App"
+                               Condition="'%(KnownFrameworkReference.TargetFramework)' == 'net10.0' and $([MSBuild]::VersionLessThan('%(KnownFrameworkReference.LatestRuntimeFrameworkVersion)', '10.0.14'))"
+                               LatestRuntimeFrameworkVersion="10.0.14" />
+    </ItemGroup>
+  </Target>
+
   <Target Name="GenerateProductIdentityConstants"
           BeforeTargets="CoreCompile"
           Condition="'$(MSBuildProjectName)' == 'YuWangCloudSync.Core'">

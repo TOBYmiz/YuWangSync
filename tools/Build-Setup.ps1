@@ -230,7 +230,7 @@ try {
     $payloadFiles = @(Get-ChildItem -LiteralPath $publish -Recurse -File)
     $shellExtensionBytes = (Get-Item -LiteralPath $shellExtensionPath).Length
     $payloadFileBytes = ($payloadFiles | Measure-Object -Property Length -Sum).Sum + $shellExtensionBytes
-    foreach ($requiredFile in (@($productExecutableName, 'App.xbf', 'resources.pri') + $requiredRuntimeFiles)) {
+    foreach ($requiredFile in (@($productExecutableName, 'e_sqlite3.dll', 'App.xbf', 'resources.pri') + $requiredRuntimeFiles)) {
         if (-not (Test-Path -LiteralPath (Join-Path $publish $requiredFile) -PathType Leaf)) {
             throw "主程序载荷缺少必需文件：$requiredFile"
         }
