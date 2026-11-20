@@ -12,6 +12,18 @@ internal sealed class MainWindowState
     public string[] NodePath { get; set; } = [];
     public double SidebarWidth { get; set; } = 264;
     public double[] ColumnWidths { get; set; } = [];
+    public List<FavoriteFolderState> Favorites { get; set; } = [];
+    public bool FavoritesExpanded { get; set; } = true;
+    public double FavoritesHeight { get; set; } = 180;
+}
+
+internal sealed class FavoriteFolderState
+{
+    public ulong DiskId { get; set; }
+    public ulong FolderId { get; set; }
+    public string Name { get; set; } = "";
+    public string DisplayPath { get; set; } = "";
+    public string[] NodePath { get; set; } = [];
 }
 
 [JsonSerializable(typeof(MainWindowState))]
@@ -37,6 +49,19 @@ internal static class MainWindowStateStore
         NodePath = NormalizeNodePath(state.NodePath),
         SidebarWidth = state.SidebarWidth,
         ColumnWidths = state.ColumnWidths is { } widths ? [.. widths] : [],
+        FavoritesExpanded = state.FavoritesExpanded,
+        FavoritesHeight = double.IsFinite(state.FavoritesHeight) && state.FavoritesHeight >= 80
+            ? state.FavoritesHeight : 180,
+        Favorites = (state.Favorites ?? []).Where(favorite => favorite is { DiskId: > 0 })
+            .DistinctBy(favorite => (favorite.DiskId, favorite.FolderId))
+            .Select(favorite => new FavoriteFolderState
+            {
+                DiskId = favorite.DiskId,
+                FolderId = favorite.FolderId,
+                Name = favorite.Name ?? "",
+                DisplayPath = favorite.DisplayPath ?? "",
+                NodePath = NormalizeNodePath(favorite.NodePath),
+            }).ToList(),
     };
 
     private static string GetPath(SyncRootContext config)

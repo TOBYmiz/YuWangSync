@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Security.Cryptography;
+using Microsoft.UI.Input;
 using Microsoft.UI.Text;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
@@ -280,6 +281,7 @@ internal sealed partial class MainWindow : Window
     private readonly MenuFlyout _backgroundMenu = new();
     private readonly MenuFlyoutItem _menuOpen = NewMenuItem("\uE8E5", "打开");
     private readonly MenuFlyoutItem _menuDownload = NewMenuItem("\uE896", "下载…");
+    private readonly MenuFlyoutItem _menuFavorite = NewMenuItem("\uE734", "添加到收藏");
     private readonly MenuFlyoutItem _menuRename = NewMenuItem("\uE8AC", "重命名");
     private readonly MenuFlyoutItem _menuMove = NewMenuItem("\uE8DE", "移动到…");
     private readonly MenuFlyoutItem _menuDelete = NewMenuItem("\uE74D", "删除");
@@ -391,17 +393,20 @@ internal sealed partial class MainWindow : Window
 
     #region Layout
 
-    private Border BuildSidebarResizeGrip()
+    private Grid BuildSidebarResizeGrip()
     {
-        var grip = new Border
+        var grip = new ResizeGrip(InputSystemCursorShape.SizeWestEast)
         {
             Name = "NavigationResizeGrip",
             Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent),
-            Child = new Border
+            Children =
             {
-                Width = 1,
-                Background = WinUiUiHost.GetBrushResource("DividerStrokeColorDefaultBrush"),
-                HorizontalAlignment = HorizontalAlignment.Center,
+                new Border
+                {
+                    Width = 1,
+                    Background = WinUiUiHost.GetBrushResource("DividerStrokeColorDefaultBrush"),
+                    HorizontalAlignment = HorizontalAlignment.Center,
+                },
             },
         };
         ToolTipService.SetToolTip(grip, "拖动调整导航栏宽度");
@@ -474,8 +479,9 @@ internal sealed partial class MainWindow : Window
         _navigationTree.Expanding += (_, args) => RunUi(() => OnNavigationExpandingAsync(args.Node));
         _navigationTree.Collapsed += (_, args) => OnNavigationCollapsed(args.Node);
         _navigationTree.ContextRequested += OnNavigationContextRequested;
-        Grid.SetRow(_navigationTree, 1);
-        sidebar.Children.Add(_navigationTree);
+        var panes = BuildSidebarPanes();
+        Grid.SetRow(panes, 1);
+        sidebar.Children.Add(panes);
 
         var footer = BuildAccountFooter();
         Grid.SetRow(footer, 2);
@@ -732,7 +738,7 @@ internal sealed partial class MainWindow : Window
             Padding = new Thickness(8, 4, 8, 4),
             Margin = new Thickness(-8, 0, -8, 0),
         };
-        ToolTipService.SetToolTip(button, $"按{text}排序");
+        Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(button, $"按{text}排序");
         button.Click += (_, _) =>
         {
             if (_sortColumn == column) _sortAscending = !_sortAscending;
@@ -747,19 +753,23 @@ internal sealed partial class MainWindow : Window
         };
         Grid.SetColumn(button, gridColumn);
         _columnsHeader.Children.Add(button);
-        var grip = new Border
+        var grip = new ResizeGrip(InputSystemCursorShape.SizeWestEast)
         {
+            Name = $"FileColumnResizeGrip{gridColumn}",
             Width = 8,
             Margin = new Thickness(0, 0, -6, 0),
             HorizontalAlignment = HorizontalAlignment.Right,
             Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent),
-            Child = new Border
+            Children =
             {
-                Width = 1, Margin = new Thickness(0, 6, 0, 6),
-                Background = WinUiUiHost.GetBrushResource("DividerStrokeColorDefaultBrush"),
+                new Border
+                {
+                    Width = 1, Margin = new Thickness(0, 6, 0, 6),
+                    Background = WinUiUiHost.GetBrushResource("DividerStrokeColorDefaultBrush"),
+                },
             },
         };
-        ToolTipService.SetToolTip(grip, $"拖动调整“{text}”列宽");
+        Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(grip, $"调整“{text}”列宽");
         var dragging = false;
         var startX = 0d;
         var startWidth = 0d;
@@ -876,6 +886,7 @@ internal sealed partial class MainWindow : Window
         _menuOpen.FontWeight = FontWeights.SemiBold;
         _itemMenu.Items.Add(_menuOpen);
         _itemMenu.Items.Add(_menuDownload);
+        _itemMenu.Items.Add(_menuFavorite);
         _itemMenu.Items.Add(new MenuFlyoutSeparator());
         _itemMenu.Items.Add(_menuRename);
         _itemMenu.Items.Add(_menuMove);
@@ -956,6 +967,11 @@ internal sealed partial class MainWindow : Window
 
         _menuOpen.Click += (_, _) => RunItemMenuCommand(OpenItemsAsync);
         _menuDownload.Click += (_, _) => RunItemMenuCommand(DownloadItemsAsync);
+        _menuFavorite.Click += (_, _) => RunItemMenuCommand(target =>
+        {
+            if (GetFavoriteTarget(target) is { } folder) ToggleFavorite(folder);
+            return Task.CompletedTask;
+        });
         _menuRename.Click += (_, _) => RunItemMenuCommand(RenameItemsAsync);
         _menuMove.Click += (_, _) => RunItemMenuCommand(MoveItemsAsync);
         _menuDelete.Click += (_, _) => RunItemMenuCommand(DeleteItemsAsync);
@@ -1013,7 +1029,6 @@ internal sealed partial class MainWindow : Window
 
             TraceUiStage("开始创建导航树节点");
             var root = CreateNavigationNode("育网云", NavigationNodeKind.Root);
-            root.IsExpanded = true;
             _navigationTree.RootNodes.Add(root);
             _diskTreeNodes[root] = new DiskTreeEntry { Name = "育网云", Node = root, IsContainer = true };
             AddDiskTreeChildren(root, _config.RootContainerTypeId, []);
@@ -1062,7 +1077,6 @@ internal sealed partial class MainWindow : Window
             {
                 if (!ancestors.Add(model.Id)) continue;
                 var node = CreateNavigationNode(model.Name, NavigationNodeKind.Container);
-                node.IsExpanded = true;
                 parentNode.Children.Add(node);
                 _diskTreeNodes[node] = new DiskTreeEntry { Name = model.Name, Node = node, Model = model, IsContainer = true };
                 AddDiskTreeChildren(node, model.Id, ancestors);
@@ -1093,7 +1107,8 @@ internal sealed partial class MainWindow : Window
     /// </summary>
     private TreeViewNode CreateNavigationNode(string name, NavigationNodeKind kind)
     {
-        var node = new TreeViewNode { Content = name };
+        // Navigation/restoration opens the target's ancestors; unrelated branches stay collapsed.
+        var node = new TreeViewNode { Content = name, IsExpanded = false };
         _nodeKinds[node] = kind;
         return node;
     }
@@ -1349,10 +1364,12 @@ internal sealed partial class MainWindow : Window
             ? $"container:{model.Id}" : null;
     }
 
-    private string[] GetCurrentNodePath()
+    private string[] GetCurrentNodePath() => GetNodePath(_currentNode);
+
+    private string[] GetNodePath(TreeViewNode? start)
     {
         var path = new Stack<string>();
-        for (var node = _currentNode; node is not null; node = node.Parent)
+        for (var node = start; node is not null; node = node.Parent)
         {
             // TreeView attaches visible root nodes to its own hidden root. Only record
             // registered browser nodes; the hidden parent is not another cloud root.
@@ -1365,6 +1382,7 @@ internal sealed partial class MainWindow : Window
     private void RememberCurrentLocation()
     {
         if (_isClosed) return;
+        RenderFavorites();
         var path = GetCurrentNodePath();
         if (path.Length == 0) return;
         _savedState.NodePath = path;
@@ -1620,6 +1638,7 @@ internal sealed partial class MainWindow : Window
             if (_currentNode is { } current && _nodeKinds.ContainsKey(current)) SetNavigationSelection(current);
         }
         finally { _updatingNavigationTree = false; }
+        RenderFavorites();
         if (_pendingCollapsedNode is not null) QueueNavigationChange();
     }
 
@@ -1746,11 +1765,21 @@ internal sealed partial class MainWindow : Window
         row.Children.Add(namePanel);
         AddRowCell(row, 2, _folderNodes.ContainsKey(node) ? "云端磁盘" : "磁盘分组",
             WinUiUiHost.GetBrushResource("TextFillColorSecondaryBrush"), TextAlignment.Left);
-        return new ListViewItem
+        var container = new ListViewItem
         {
             Content = row, Tag = node, MinHeight = 36,
             HorizontalContentAlignment = HorizontalAlignment.Stretch,
         };
+        container.ContextRequested += (_, args) =>
+        {
+            if (args.Handled || !_folderNodes.TryGetValue(node, out var folder)) return;
+            args.Handled = true;
+            RunContextMenu(() =>
+            {
+                if (!_busyNow && !_isClosed) ShowFolderFavoriteMenu(folder, container, args);
+            });
+        };
+        return container;
     }
 
     private ListViewItem CreateItemRow(YuWangItem item)
@@ -1990,6 +2019,7 @@ internal sealed partial class MainWindow : Window
         var canWrite = CanWrite;
         var idle = !_busyNow;
         _navigationTree.IsEnabled = idle;
+        UpdateFavoriteCommands();
         _reloadDisks.IsEnabled = idle;
         _multiSelect.IsEnabled = idle && _currentFolder is not null;
         _back.IsEnabled = idle && _backHistory.Count > 0;
@@ -2095,6 +2125,11 @@ internal sealed partial class MainWindow : Window
         var count = _itemMenuTarget?.Items.Count ?? 0;
         _menuOpen.IsEnabled = available && count == 1;
         _menuDownload.IsEnabled = available;
+        var favoriteTarget = available ? GetFavoriteTarget(_itemMenuTarget) : null;
+        _menuFavorite.Visibility = favoriteTarget is null ? Visibility.Collapsed : Visibility.Visible;
+        _menuFavorite.IsEnabled = favoriteTarget is not null;
+        _menuFavorite.Text = favoriteTarget is not null && IsFavorite(favoriteTarget)
+            ? "取消收藏" : "添加到收藏";
         _menuRename.IsEnabled = canWrite && count == 1;
         _menuMove.IsEnabled = canWrite;
         _menuDelete.IsEnabled = canWrite;
@@ -2153,6 +2188,11 @@ internal sealed partial class MainWindow : Window
             // request in empty space must not borrow the previously selected folder.
             if (node is null && !args.TryGetPosition(_navigationTree, out _))
                 node = _navigationTree.SelectedNode;
+            if (node is not null && _folderNodes.TryGetValue(node, out var disk) && disk.Id == 0)
+            {
+                ShowFolderFavoriteMenu(disk, anchor, args);
+                return;
+            }
             if (node is null || !_nodeKinds.TryGetValue(node, out var kind)
                 || kind != NavigationNodeKind.Folder
                 || !_folderNodes.TryGetValue(node, out var folder)
@@ -2545,6 +2585,7 @@ internal sealed partial class MainWindow : Window
                 if (!await client.RenameRemoteItemAsync(source.Disk.Id, source.Id, item.Id, item.IsFolder,
                         destination.Id, item.Name))
                     throw new IOException($"服务器未确认移动“{item.Name}”。");
+                RelocateFavoritePaths(source, item, destination);
             }
             await RefreshItemParentAsync(client, source);
             if (_currentFolder is { } current && current.Disk.Id == destination.Disk.Id

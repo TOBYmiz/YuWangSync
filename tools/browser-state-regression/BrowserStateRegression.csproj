@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0-windows10.0.19041.0</TargetFramework>
+    <SupportedOSPlatformVersion>10.0.17763.0</SupportedOSPlatformVersion>
+    <PlatformTarget>x64</PlatformTarget>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\YuWangCloudSync.Core\YuWangCloudSync.Core.csproj" />
+    <PackageReference Include="Serilog" Version="4.0.1" />
+    <Compile Include="..\..\src\YuWangCloudSync\Tray\MainWindowState.cs" Link="MainWindowState.cs" />
+  </ItemGroup>
+</Project>
