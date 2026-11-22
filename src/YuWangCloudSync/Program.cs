@@ -1,4 +1,4 @@
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using System.Runtime.Versioning;
 using System.Security.Principal;
 using System.Security.Cryptography;
@@ -131,7 +131,9 @@ internal static class Program
         // Also run when reusing an existing root after an upgrade: successful
         // volatile-property submission alone does not make Explorer show progress.
         if (ProviderIdentity.OwnsRoot(_ctx.SyncRootPath))
-            SyncRootSearchIndex.Ensure(_ctx.SyncRootPath, message => Log.Information("{Msg}", message));
+            SyncRootSearchIndex.Ensure(_ctx.SyncRootPath, message => Log.Information("{Msg}", message),
+                path => PrivilegedOperations.Run("--ensure-search-index", path,
+                    log: message => Log.Information("{Msg}", message)));
         Callbacks.StartDirectoryRefresh();
         try { Callbacks.StartWriteback(); }
         catch (Exception ex) { Log.Error(ex, "无法启动新文件上传监视"); }
@@ -188,7 +190,8 @@ internal static class Program
     private static bool _accountSwitchRestart;
     private static SyncRootContext? _pendingAccountSwitch;
     private static bool _restartAfterAccountSwitch;
-    private static bool _cloudFilesConnected;
+    private static volatile bool _cloudFilesConnected;
+    private static bool _accountSwitchConnected;
     private static int _crashDialogShown;
     private static int _crashHandlersInstalled;
     private static string _startupStage = "进程入口";
@@ -350,6 +353,14 @@ internal static class Program
                     Environment.ExitCode = 1;
                     Log.Error(error, "停止同步进程失败（--stop）");
                 }
+                Log.CloseAndFlush();
+                return;
+            }
+            // Maintenance commands above retain installer privileges. Interactive UI must
+            // match Explorer even when invoked from the old HIGHEST startup task or Setup.
+            if (!_quiet && !args.Any(argument => string.Equals(argument, "--console", StringComparison.OrdinalIgnoreCase))
+                && ExplorerUserLaunch.RelaunchIfElevated())
+            {
                 Log.CloseAndFlush();
                 return;
             }
@@ -756,9 +767,13 @@ internal static class Program
                 return;
             }
             await RunAsync(args);
+            if (_accountSwitchRestart && !_accountSwitchConnected)
+                await WinUiUiHost.FinishAccountSwitchAsync("新账户未能建立同步连接，请检查网络、登录状态和同步目录权限后重新启动应用。");
         }
         catch (OperationCanceledException) when (_cts.IsCancellationRequested)
         {
+            if (_accountSwitchRestart && !_accountSwitchConnected)
+                await WinUiUiHost.FinishAccountSwitchAsync("新账户登录已取消，账户切换未完成。");
             TrayHost.Shutdown();
             _client?.Dispose();
             _cache?.Dispose();
@@ -768,6 +783,8 @@ internal static class Program
         catch (Exception error)
         {
             Environment.ExitCode = 1;
+            if (_accountSwitchRestart && !_accountSwitchConnected)
+                await WinUiUiHost.FinishAccountSwitchAsync(error.Message);
             HandleFatalException(error, "后台同步流程");
             Log.CloseAndFlush();
         }
@@ -921,6 +938,11 @@ internal static class Program
         TrayHost.Start(!_quiet, _ctx.TrayUpdateHintEnabled,
             mainWindowEnabled: _ctx.EnableMainWindow);
         TrayHost.WaitForUiReady();
+        if (_accountSwitchRestart)
+        {
+            WinUiUiHost.BeginAccountSwitch(_ctx.Username);
+            WinUiUiHost.ReportAccountSwitch("正在加载新账户配置与会话…", 60);
+        }
         if (!_quiet)
         {
             UpdateService.Start(_ctx.AutomaticUpdateCheck, _ctx.AutomaticUpdateDownload, _cts.Token);
@@ -992,6 +1014,8 @@ internal static class Program
             File.Delete(legacyCookiesPath);
         }
         Log.Information("正在登录育网云 {Server}", _ctx.Server);
+        if (_accountSwitchRestart) WinUiUiHost.ReportAccountSwitch("正在登录新账户…", 65,
+            "优先复用已保存的账户会话；如需验证码，将显示输入窗口。");
 
         var ok = false;
         var sid = Net.YuWangClient.LoadSessionFrom(cookiesPath);
@@ -1068,6 +1092,7 @@ internal static class Program
         _cts.Token.ThrowIfCancellationRequested();
         _client.SaveSessionTo(cookiesPath);
         Log.Information("登录成功");
+        if (_accountSwitchRestart) WinUiUiHost.ReportAccountSwitch("正在建立新账户的同步目录…", 80);
 
         // 5. 创建 SyncRoot 目录
         Directory.CreateDirectory(_ctx.SyncRootPath);
@@ -1308,6 +1333,11 @@ internal static class Program
             return;
         }
         _cloudFilesConnected = true;
+        if (_accountSwitchRestart)
+        {
+            _accountSwitchConnected = true;
+            WinUiUiHost.ReportAccountSwitch("正在启用新账户的同步服务…", 95);
+        }
 
         // 8b. 监视 Explorer 固定/释放意图，并启动目录时间修正线程。
         // Cloud Files 不提供独立 pin-state callback；平台通过文件属性变化表达菜单操作。
@@ -1315,6 +1345,12 @@ internal static class Program
         PlaceholderFixer.Start(msg => Log.Information("{Msg}", msg));
         TryConfigureNavigationEntry(_ctx.SyncRootPath, _ctx.ProviderName,
             _ctx.EnableExplorerNavigationEntry, "启动时", out _);
+
+        if (_accountSwitchRestart)
+        {
+            await WinUiUiHost.FinishAccountSwitchAsync();
+            if (_ctx.EnableMainWindow) WinUiUiHost.ShowMainWindow();
+        }
 
         if (_openFolder)
             OpenShortcutTarget(_forceOpenSyncFolder);
@@ -1374,11 +1410,23 @@ internal static class Program
         {
             Log.Information("账户切换：清除旧账户同步目录中的所有文件与占位");
             Callbacks.SuppressDeleteRecovery = true;
-            var failures = CleanupSyncRootContents(_ctx.SyncRootPath, deleteForeign: true);
             try
             {
-                if (failures == 0)
+                WinUiUiHost.ReportAccountSwitch("正在结束旧账户的后台任务…", 5);
+                await _preFetchGate.WaitAsync();
+                _preFetchGate.Release();
+                WinUiUiHost.ReportAccountSwitch("正在清理旧账户的同步目录…", null, "已清理 0 项");
+                var reportedAt = Stopwatch.GetTimestamp();
+                var cleanup = AccountSwitchCleanup.Run(_ctx.SyncRootPath, (deleted, failed) =>
                 {
+                    if (Stopwatch.GetElapsedTime(reportedAt).TotalMilliseconds < 100) return;
+                    reportedAt = Stopwatch.GetTimestamp();
+                    WinUiUiHost.ReportAccountSwitch("正在清理旧账户的同步目录…", null,
+                        $"已清理 {deleted:N0} 项，失败 {failed:N0} 项");
+                }, message => Log.Debug("{Message}", message));
+                if (cleanup.Failed == 0)
+                {
+                    WinUiUiHost.ReportAccountSwitch("正在保存新账户配置…", 40, $"已清理 {cleanup.Deleted:N0} 项");
                     _cache?.ClearContentCache();
                     _ctx = accountSwitch;
                     SaveConfig();
@@ -1387,13 +1435,16 @@ internal static class Program
                 }
                 else
                 {
-                    Log.Error("账户切换清理失败 {Failures} 项；没有写入新账户配置，也不会自动重启", failures);
+                    Log.Error("账户切换清理失败 {Failures} 项；没有写入新账户配置，也不会自动重启", cleanup.Failed);
+                    await WinUiUiHost.FinishAccountSwitchAsync($"有 {cleanup.Failed:N0} 项未能清理，已停止切换并保留旧账户配置。\n"
+                        + string.Join("\n", cleanup.Errors));
                 }
             }
             catch (Exception ex)
             {
                 Log.Error(ex, "账户切换清理或新账户配置保存失败；没有自动重启");
                 _restartAfterAccountSwitch = false;
+                await WinUiUiHost.FinishAccountSwitchAsync($"未能完成账户切换：{ex.Message}。请重新启动应用后重试。");
             }
         }
         else if (_ctx.PersistSyncRoot)
@@ -1409,6 +1460,8 @@ internal static class Program
         // 11c. 断开回调通道
         if (_cloudFilesConnected)
         {
+            if (_pendingAccountSwitch is not null) WinUiUiHost.ReportAccountSwitch("正在断开旧账户的同步连接…", 50);
+            _cloudFilesConnected = false;
             Log.Information("正在断开 SyncRoot...");
             try
             {
@@ -1445,6 +1498,27 @@ internal static class Program
             }
         }
 
+        // Start the replacement while the progress UI is still alive, so launch failures are visible.
+        // The replacement waits on the existing single-instance mutex until this process exits.
+        if (_restartAfterAccountSwitch)
+        {
+            WinUiUiHost.ReportAccountSwitch("正在启动新账户…", 55);
+            try
+            {
+                var executable = Environment.ProcessPath
+                    ?? throw new InvalidOperationException("无法解析应用程序路径。");
+                var restart = new ProcessStartInfo(executable) { UseShellExecute = true };
+                restart.ArgumentList.Add("--account-switch-restart");
+                using var replacement = Process.Start(restart)
+                    ?? throw new IOException("未能启动新账户进程。");
+            }
+            catch (Exception error)
+            {
+                Log.Error(error, "启动新账户进程失败");
+                await WinUiUiHost.FinishAccountSwitchAsync($"新账户配置已保存，但启动失败：{error.Message}。请手动重新启动应用。");
+            }
+        }
+
         // 11e. 退出托盘：在 UI 线程释放图标并结束 XAML 循环，再等待其线程结束，保证干净退出。
         TrayHost.Shutdown();
         TrayHost.Join(TimeSpan.FromSeconds(3));
@@ -1454,21 +1528,6 @@ internal static class Program
         _callbackTable = null;
         Log.Information("已退出（日志: {LogPath}）", _currentLogPath);
         Log.CloseAndFlush();
-        if (_restartAfterAccountSwitch)
-        {
-            try
-            {
-                var executable = Environment.ProcessPath
-                    ?? throw new InvalidOperationException("无法解析应用程序路径，无法重启新账户。");
-                var restart = new ProcessStartInfo(executable) { UseShellExecute = true };
-                restart.ArgumentList.Add("--account-switch-restart");
-                Process.Start(restart);
-            }
-            catch (Exception ex)
-            {
-                try { Log.Error(ex, "启动新账户进程失败，请手动重新启动应用"); } catch { }
-            }
-        }
         // 通知可能在等待的控制台控制处理器（关闭/注销/关机事件）清理已完成，可立即返回
         _exitDone.Set();
     }
@@ -2381,6 +2440,20 @@ internal static class Program
     /// <summary>供托盘菜单"打开同步目录"读取同步根目录路径。</summary>
     internal static string SyncRootPath => _ctx.SyncRootPath;
     internal static YuWangClient? ClientForUi => _client;
+    internal static bool IsDragBackendAvailable => _cloudFilesConnected && !_cts.IsCancellationRequested
+        && Volatile.Read(ref _settingsBusy) == 0 && _client is { IsLoggedIn: true };
+
+    internal static string? ResolveLocalItemPath(ulong diskId, ulong parentId, YuWangItem item)
+    {
+        var parent = _cache?.GetFolderLocalPath(diskId, parentId);
+        if (string.IsNullOrWhiteSpace(parent) || Path.GetFileName(item.Name) != item.Name) return null;
+        var path = Path.GetFullPath(Path.Combine(parent, item.Name));
+        var root = Path.GetFullPath(_ctx.SyncRootPath).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+        if (!path.StartsWith(root, StringComparison.OrdinalIgnoreCase)) return null;
+        return ProviderIdentity.TryReadPlaceholderIdentity(path, out var identity)
+            && identity.DiskId == diskId && identity.FileId == item.Id && identity.FolderId == parentId
+            && identity.Type == (item.IsFolder ? 0 : 1) ? path : null;
+    }
     internal static DirectoryPermission GetCachedDirectoryPermission(ulong diskId, ulong folderId)
         => _cache?.GetDirectoryPermission(CurrentUserKey(), diskId, folderId) ?? DirectoryPermission.Unknown;
 
@@ -2739,21 +2812,30 @@ internal static class Program
         if (System.Threading.Interlocked.Exchange(ref _settingsBusy, 1) == 1)
             throw new InvalidOperationException("另一个设置操作正在进行。");
 
-        var switchContext = SnapshotConfig();
-        switchContext.Username = target.Username;
-        switchContext.ActiveAccount = target.Username;
-        switchContext.Password = target.Password;
-        switchContext.Accounts = target.Accounts.Select(account => new AccountCredential
+        try
         {
-            Username = account.Username,
-            ProtectedPassword = account.ProtectedPassword,
-            DirectoryRefreshIntervalMinutes = account.DirectoryRefreshIntervalMinutes,
-        }).ToList();
-        _pendingAccountSwitch = switchContext;
-        Callbacks.SuppressDeleteRecovery = true;
-        Log.Information("收到账户切换请求：{OldAccount} → {NewAccount}；开始优雅关闭并清理同步目录",
-            _ctx.Username, target.Username);
-        RequestShutdownFromUi();
+            var switchContext = SnapshotConfig();
+            switchContext.Username = target.Username;
+            switchContext.ActiveAccount = target.Username;
+            switchContext.Password = target.Password;
+            switchContext.Accounts = target.Accounts.Select(account => new AccountCredential
+            {
+                Username = account.Username,
+                ProtectedPassword = account.ProtectedPassword,
+                DirectoryRefreshIntervalMinutes = account.DirectoryRefreshIntervalMinutes,
+            }).ToList();
+            WinUiUiHost.BeginAccountSwitch(target.Username);
+            _pendingAccountSwitch = switchContext;
+            Callbacks.SuppressDeleteRecovery = true;
+            Log.Information("收到账户切换请求：{OldAccount} → {NewAccount}；开始优雅关闭并清理同步目录",
+                _ctx.Username, target.Username);
+            RequestShutdownFromUi();
+        }
+        catch
+        {
+            Interlocked.Exchange(ref _settingsBusy, 0);
+            throw;
+        }
     }
 
     /// <summary>
@@ -2975,6 +3057,7 @@ internal static class Program
         }
 
         // 3. 断开回调通道
+        _cloudFilesConnected = false;
         try
         {
             var hr = CfDisconnectSyncRoot(_connectionKey);
@@ -3046,6 +3129,7 @@ internal static class Program
             throw new InvalidOperationException($"CfConnectSyncRoot 失败: 0x{connect.Code:X} ({connect})");
         }
         Log.Information("[SETTINGS] 新 SyncRoot 已连接: {Path}", newPath);
+        _cloudFilesConnected = true;
         StartPinStateWatcher();
 
         // 9. SQLite 里按绝对路径存的 folders.local_path 全部失效 → 清空（下次列举/预拉取按新根重写）
@@ -3080,6 +3164,7 @@ internal static class Program
     private static async Task RestoreSyncRootAsync(string? oldSnapshotPath, string oldProviderName)
     {
         if (string.IsNullOrWhiteSpace(oldSnapshotPath)) return;
+        _cloudFilesConnected = false;
         try
         {
             _ctx.SyncRootPath = oldSnapshotPath;
@@ -3099,6 +3184,7 @@ internal static class Program
                 Log.Error("[SETTINGS] 回滚失败，CfConnectSyncRoot 0x{Hr:X}；建议重启程序或运行 --unregister", hr.Code);
                 return;
             }
+            _cloudFilesConnected = true;
             StartPinStateWatcher();
             PlaceholderFixer.Start(msg => Log.Information("{Msg}", msg));
             Log.Warning("[SETTINGS] 已回滚到旧 SyncRoot: {Path}", oldSnapshotPath);

@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows10.0.19041.0</TargetFramework>
+    <SupportedOSPlatformVersion>10.0.17763.0</SupportedOSPlatformVersion>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <PlatformTarget>x64</PlatformTarget>
+    <AssemblyName>$(ProductIdentifier)Admin</AssemblyName>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>..\YuWangCloudSync\Assets\yw_tray.ico</ApplicationIcon>
+    <Description>$(ProductDisplayNameZh) 权限辅助程序</Description>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\YuWangCloudSync.Core\YuWangCloudSync.Core.csproj" />
+    <Compile Include="..\YuWangCloudSync\CloudFiles\SyncRootShellRegistry.cs" Link="SyncRootShellRegistry.cs" />
+    <Compile Include="..\YuWangCloudSync\CloudFiles\SyncRootSearchIndex.cs" Link="SyncRootSearchIndex.cs" />
+  </ItemGroup>
+</Project>

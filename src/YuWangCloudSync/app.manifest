@@ -4,8 +4,9 @@
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v2">
     <security>
       <requestedPrivileges xmlns="urn:schemas-microsoft-com:asm.v3">
-        <!-- Cloud Files API 注册 SyncRoot 需要管理员权限 -->
-        <requestedExecutionLevel level="requireAdministrator" uiAccess="false"/>
+        <!-- CFAPI uses the user's writable sync root. Keep UI and Explorer at the same
+             integrity level so ordinary Explorer OLE drag-and-drop can reach WinUI. -->
+        <requestedExecutionLevel level="asInvoker" uiAccess="false"/>
       </requestedPrivileges>
     </security>
   </trustInfo>

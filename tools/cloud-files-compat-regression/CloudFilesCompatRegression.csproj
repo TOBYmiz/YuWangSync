@@ -7,6 +7,7 @@
     <PublishAot>true</PublishAot>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="../../src/YuWangCloudSync.Core/YuWangCloudSync.Core.csproj" />
@@ -15,5 +16,9 @@
     <Compile Include="../../src/YuWangCloudSync/CloudFiles/ExplorerStateNotifier.cs" Link="ExplorerStateNotifier.cs" />
     <Compile Include="../../src/YuWangCloudSync/CloudFiles/ShellTransferProgress.cs" Link="ShellTransferProgress.cs" />
     <Compile Include="../../src/YuWangCloudSync/CloudFiles/SyncRootSearchIndex.cs" Link="SyncRootSearchIndex.cs" />
+    <Compile Include="../../src/YuWangCloudSync/CloudFiles/DragFilePreparation.cs" Link="DragFilePreparation.cs" />
+    <Compile Include="../../src/YuWangCloudSync/CloudFiles/AccountSwitchCleanup.cs" Link="AccountSwitchCleanup.cs" />
+    <Compile Include="../../src/YuWangCloudSync/Tray/NativeFileDrag.cs" Link="NativeFileDrag.cs" />
+    <Compile Include="../../src/YuWangCloudSync/Tray/NativeFileDrag.SelfTest.cs" Link="NativeFileDrag.SelfTest.cs" />
   </ItemGroup>
 </Project>

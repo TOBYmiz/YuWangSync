@@ -4,6 +4,7 @@ using Microsoft.UI.Xaml.Automation;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Input;
 using Microsoft.UI.Xaml.Media;
+using System.Diagnostics;
 using YuWangCloudSync.Net;
 
 namespace YuWangCloudSync.Tray;
@@ -36,10 +37,26 @@ internal sealed partial class MainWindow
     };
     private readonly HashSet<(ulong Disk, ulong Folder)> _unavailableFavorites = [];
     private double _preferredFavoritesHeight;
+    private readonly DispatcherTimer _favoritesAnimation = new() { Interval = TimeSpan.FromMilliseconds(16) };
+    private readonly RotateTransform _favoritesChevronRotation = new();
+    private long _favoritesAnimationStarted;
+    private double _favoritesAnimationFrom;
+    private double _favoritesAnimationTo;
+    private double _favoritesGripFrom;
+    private double _favoritesRotationFrom;
+    private double _favoritesOpacityFrom;
 
     private Grid BuildSidebarPanes()
     {
         _preferredFavoritesHeight = _savedState.FavoritesHeight;
+        _favoritesChevron.Glyph = "\uE76C";
+        _favoritesChevron.RenderTransformOrigin = new Windows.Foundation.Point(0.5, 0.5);
+        _favoritesChevron.RenderTransform = _favoritesChevronRotation;
+        _favoritesAnimation.Tick += (_, _) => TickFavoritesAnimation();
+        _favoritesBody.SizeChanged += (_, _) => _favoritesBody.Clip = new RectangleGeometry
+        {
+            Rect = new Windows.Foundation.Rect(0, 0, _favoritesBody.ActualWidth, _favoritesBody.ActualHeight),
+        };
         _sidebarPanes.RowDefinitions.Add(new RowDefinition
         {
             Height = new GridLength(1, GridUnitType.Star), MinHeight = MinimumNavigationTreeHeight,
@@ -64,6 +81,7 @@ internal sealed partial class MainWindow
             if (!_savedState.FavoritesExpanded || !point.Properties.IsLeftButtonPressed
                 || !_favoritesGrip.CapturePointer(args.Pointer)) return;
             dragging = true;
+            _favoritesAnimation.Stop();
             startY = point.Position.Y;
             startHeight = _favoritesRow.ActualHeight;
             args.Handled = true;
@@ -115,7 +133,7 @@ internal sealed partial class MainWindow
         _favoritesToggle.Click += (_, _) =>
         {
             _savedState.FavoritesExpanded = !_savedState.FavoritesExpanded;
-            ConstrainFavoritesHeight();
+            ConstrainFavoritesHeight(animate: true);
             SaveBrowserState();
         };
         header.Children.Add(_favoritesToggle);
@@ -150,16 +168,51 @@ internal sealed partial class MainWindow
     private double ClampFavoritesHeight(double height) => Math.Clamp(height, MinimumFavoritesHeight,
         Math.Max(MinimumFavoritesHeight, _sidebarPanes.ActualHeight - MinimumNavigationTreeHeight - FavoritesGripHeight));
 
-    private void ConstrainFavoritesHeight()
+    private void ConstrainFavoritesHeight(bool animate = false)
     {
         var expanded = _savedState.FavoritesExpanded;
-        _favoritesRow.Height = new GridLength(expanded
-            ? ClampFavoritesHeight(_preferredFavoritesHeight) : CollapsedFavoritesHeight);
-        _sidebarPanes.RowDefinitions[1].Height = new GridLength(expanded ? FavoritesGripHeight : 1);
+        var target = expanded ? ClampFavoritesHeight(_preferredFavoritesHeight) : CollapsedFavoritesHeight;
         _favoritesGrip.IsHitTestVisible = expanded;
-        _favoritesBody.Visibility = expanded ? Visibility.Visible : Visibility.Collapsed;
-        _favoritesChevron.Glyph = expanded ? "\uE70D" : "\uE76C";
         AutomationProperties.SetName(_favoritesToggle, expanded ? "收起收藏" : "展开收藏");
+        if (!animate && _favoritesAnimation.IsEnabled) return;
+        _favoritesAnimation.Stop();
+        if (animate && _sidebarPanes.ActualHeight > 0
+            && new Windows.UI.ViewManagement.UISettings().AnimationsEnabled)
+        {
+            _favoritesAnimationFrom = _favoritesRow.ActualHeight;
+            _favoritesAnimationTo = target;
+            _favoritesGripFrom = _sidebarPanes.RowDefinitions[1].ActualHeight;
+            _favoritesRotationFrom = _favoritesChevronRotation.Angle;
+            _favoritesOpacityFrom = _favoritesBody.Opacity;
+            _favoritesBody.Visibility = Visibility.Visible;
+            _favoritesAnimationStarted = Stopwatch.GetTimestamp();
+            _favoritesAnimation.Start();
+            return;
+        }
+        ApplyFavoritesAnimation(target, expanded ? FavoritesGripHeight : 1, expanded ? 90 : 0, expanded ? 1 : 0);
+        _favoritesBody.Visibility = expanded ? Visibility.Visible : Visibility.Collapsed;
+    }
+
+    private void TickFavoritesAnimation()
+    {
+        var progress = Math.Clamp(Stopwatch.GetElapsedTime(_favoritesAnimationStarted).TotalMilliseconds / 200, 0, 1);
+        var eased = 1 - Math.Pow(1 - progress, 3);
+        var expanded = _savedState.FavoritesExpanded;
+        ApplyFavoritesAnimation(_favoritesAnimationFrom + (_favoritesAnimationTo - _favoritesAnimationFrom) * eased,
+            _favoritesGripFrom + ((expanded ? FavoritesGripHeight : 1) - _favoritesGripFrom) * eased,
+            _favoritesRotationFrom + ((expanded ? 90 : 0) - _favoritesRotationFrom) * eased,
+            _favoritesOpacityFrom + ((expanded ? 1 : 0) - _favoritesOpacityFrom) * eased);
+        if (progress < 1) return;
+        _favoritesAnimation.Stop();
+        ConstrainFavoritesHeight();
+    }
+
+    private void ApplyFavoritesAnimation(double height, double gripHeight, double angle, double opacity)
+    {
+        _favoritesRow.Height = new GridLength(height);
+        _sidebarPanes.RowDefinitions[1].Height = new GridLength(gripHeight);
+        _favoritesChevronRotation.Angle = angle;
+        _favoritesBody.Opacity = opacity;
     }
 
     private bool IsFavorite(NavigationFolderState folder) => _savedState.Favorites
@@ -188,7 +241,7 @@ internal sealed partial class MainWindow
         }
         _unavailableFavorites.Remove((folder.Disk.Id, folder.Id));
         RenderFavorites();
-        ConstrainFavoritesHeight();
+        ConstrainFavoritesHeight(animate: true);
         SaveBrowserState();
         UpdateItemMenuStates();
     }

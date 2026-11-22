@@ -6,6 +6,7 @@ using System.Runtime.InteropServices;
 using YuWangCloudSync.CloudFiles;
 using YuWangCloudSync.Core;
 using YuWangCloudSync.Models;
+using YuWangCloudSync.Tray;
 using Vanara.PInvoke;
 using static Vanara.PInvoke.CldApi;
 
@@ -187,6 +188,10 @@ try
     var errors = new ConcurrentQueue<Exception>();
     var messages = new ConcurrentQueue<string>();
     var requestCount = 0;
+    var rejectHydration = false;
+    var hydrationDelayMilliseconds = 0;
+    using var hydrationStarted = new ManualResetEventSlim(false);
+    using var hydrationFinished = new ManualResetEventSlim(false);
     var registered = false;
     var connected = false;
     CF_CONNECTION_KEY connection = default;
@@ -199,6 +204,8 @@ try
             if (!CloudFilesInterop.TryReadFetchData(args, out var request))
                 throw new InvalidDataException("native fetch parameters");
             Interlocked.Increment(ref requestCount);
+            hydrationStarted.Set();
+            if (hydrationDelayMilliseconds > 0) Thread.Sleep(hydrationDelayMilliseconds);
             var offset = checked((int)request.RequiredFileOffset);
             var length = checked((int)Math.Min(request.RequiredLength, payload.Length - offset));
             buffer = Marshal.AllocHGlobal(length);
@@ -206,12 +213,17 @@ try
             var operation = CloudFilesInterop.CreateOperationInfo(info, CF_OPERATION_TYPE.CF_OPERATION_TYPE_TRANSFER_DATA);
             var transfer = CloudFilesInterop.CreateOperationParameters(new CF_OPERATION_PARAMETERS.TRANSFERDATA
             {
-                Buffer = buffer, Offset = offset, Length = length, CompletionStatus = NTStatus.STATUS_SUCCESS
+                Buffer = buffer, Offset = offset, Length = length,
+                CompletionStatus = rejectHydration ? NTStatus.STATUS_ACCESS_DENIED : NTStatus.STATUS_SUCCESS
             });
             RequireSuccess(CfExecute(operation, ref transfer), "native hydration receipt");
         }
         catch (Exception error) { errors.Enqueue(error); }
-        finally { if (buffer != IntPtr.Zero) Marshal.FreeHGlobal(buffer); }
+        finally
+        {
+            if (buffer != IntPtr.Zero) Marshal.FreeHGlobal(buffer);
+            hydrationFinished.Set();
+        }
     };
     CF_CALLBACK_REGISTRATION[] callbacks =
     [
@@ -261,6 +273,104 @@ try
         ];
         RequireSuccess(CfCreatePlaceholders(root, placeholders, CF_CREATE_FLAGS.CF_CREATE_FLAG_NONE, out var processed), "create placeholder");
         Check(processed == 1 && placeholders[0].Result.Succeeded && ProviderIdentity.OwnsPlaceholder(path), "created owned placeholder");
+        if (args.Contains("--drag-preparation"))
+        {
+            var blocked = false;
+            try { using var prepared = DragFilePreparation.CreateAsync([path], () => false, _ => { }, CancellationToken.None).GetAwaiter().GetResult(); }
+            catch (IOException) { blocked = true; }
+            Check(blocked && requestCount == 0, "unavailable backend is rejected before hydration");
+            using (var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15)))
+            using (var prepared = DragFilePreparation.CreateAsync([path], () => true, Console.WriteLine, timeout.Token).GetAwaiter().GetResult())
+            {
+                prepared.ValidateReady();
+                Check(File.ReadAllBytes(path).AsSpan().SequenceEqual(payload) && requestCount > 0,
+                    "asynchronous whole-file hydration completes before paths are supplied");
+                bool nativePassed = false;
+                Exception? nativeFailure = null;
+                var thread = new Thread(() =>
+                {
+                    try { nativePassed = NativeFileDrag.CheckNativeResourceCleanup(path); }
+                    catch (Exception error) { nativeFailure = error; }
+                });
+                thread.SetApartmentState(ApartmentState.STA);
+                thread.Start();
+                thread.Join();
+                if (nativeFailure is not null) throw nativeFailure;
+                Check(nativePassed, "native Shell CF_HDROP / IDropSource ABI, image transition and GDI/USER resource cleanup");
+            }
+            var requestsBeforeReuse = requestCount;
+            using (var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15)))
+            using (var reused = DragFilePreparation.CreateAsync([path], () => true, _ => { }, timeout.Token).GetAwaiter().GetResult())
+            {
+                reused.ValidateReady();
+                Check(requestCount == requestsBeforeReuse && File.ReadAllBytes(path).AsSpan().SequenceEqual(payload),
+                    "reusing an opened or previously dragged hydrated file does not fetch data again");
+            }
+            using (var cancelled = new CancellationTokenSource())
+            {
+                cancelled.Cancel();
+                var stopped = false;
+                try { using var prepared = DragFilePreparation.CreateAsync([path], () => true, _ => { }, cancelled.Token).GetAwaiter().GetResult(); }
+                catch (OperationCanceledException) { stopped = true; }
+                Check(stopped, "cancelled drag preparation returns without offering paths");
+            }
+            var handle = Native.Open(path, 0x00040080, 7, IntPtr.Zero, 3, 0x02200000, IntPtr.Zero);
+            if (handle == new IntPtr(-1)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+            try { RequireSuccess(CfDehydratePlaceholder(new HFILE(handle), 0, -1, CF_DEHYDRATE_FLAGS.CF_DEHYDRATE_FLAG_NONE, IntPtr.Zero), "dehydrate drag fixture"); }
+            finally { Native.CloseHandle(handle); }
+            rejectHydration = true;
+            var failed = false;
+            using (var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15)))
+            {
+                try { using var prepared = DragFilePreparation.CreateAsync([path], () => true, _ => { }, timeout.Token).GetAwaiter().GetResult(); }
+                catch (IOException error) { Console.WriteLine(error.Message); failed = true; }
+            }
+            Check(failed, "native hydration failure is surfaced and cannot enter copy");
+            rejectHydration = false;
+            hydrationDelayMilliseconds = 500;
+            hydrationStarted.Reset();
+            hydrationFinished.Reset();
+            using (var cancelPending = new CancellationTokenSource())
+            {
+                var pending = DragFilePreparation.CreateAsync([path], () => true, _ => { }, cancelPending.Token);
+                Check(hydrationStarted.Wait(TimeSpan.FromSeconds(5)), "pending hydration has reached the provider callback");
+                var cancellationTime = Stopwatch.StartNew();
+                cancelPending.Cancel();
+                var cancelledPending = false;
+                try { using var prepared = pending.GetAwaiter().GetResult(); }
+                catch (OperationCanceledException) { cancelledPending = true; }
+                Check(cancelledPending && cancellationTime.Elapsed < TimeSpan.FromSeconds(1),
+                    "in-flight native hydration cancels promptly without blocking the caller");
+                Check(hydrationFinished.Wait(TimeSpan.FromSeconds(5)), "provider completes after cancellation without a resource crash");
+            }
+            // Wait for the independent worker to finish its native cancellation drain before cleanup.
+            Thread.Sleep(100);
+            var cleanup = AccountSwitchCleanup.Run(root, (deleted, failed) => { }, Console.WriteLine);
+            Check(cleanup.Failed == 0 && cleanup.Deleted == 1 && !Directory.EnumerateFileSystemEntries(root).Any(),
+                "account-switch cleanup deletes the fixture without hydrating it");
+            var requestCountBeforeCleanup = requestCount;
+            var nested = Path.Combine(root, "子目录");
+            Directory.CreateDirectory(nested);
+            var readOnly = Path.Combine(nested, "只读.txt");
+            File.WriteAllText(readOnly, "read only cleanup fixture");
+            File.SetAttributes(readOnly, FileAttributes.ReadOnly);
+            var lockedPath = Path.Combine(root, "locked.txt");
+            using (var locked = new FileStream(lockedPath, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.Read))
+            {
+                var partial = AccountSwitchCleanup.Run(root, (_, _) => { }, Console.WriteLine);
+                Check(partial.Failed == 1 && partial.Errors.Length == 1 && File.Exists(lockedPath) && !Directory.Exists(nested),
+                    "account cleanup reports a locked file and still removes read-only nested content");
+            }
+            var retry = AccountSwitchCleanup.Run(root, (_, _) => { }, Console.WriteLine);
+            Check(retry.Failed == 0 && retry.Deleted == 1 && requestCount == requestCountBeforeCleanup,
+                "account cleanup retry completes without downloading file data");
+            var refusedRoot = false;
+            try { AccountSwitchCleanup.Run(Path.GetPathRoot(root)!, (_, _) => { }, _ => { }); }
+            catch (IOException) { refusedRoot = true; }
+            Check(refusedRoot, "account cleanup refuses a drive root before enumeration/deletion");
+            Console.WriteLine("PASS: outbound drag preparation and account cleanup.");
+            return;
+        }
         watcher.Start();
         SetPin(CF_PIN_STATE.CF_PIN_STATE_PINNED);
         WaitFor(() => PlaceholderUpdater.TryGetPlaceholderDataState(path, out var state)

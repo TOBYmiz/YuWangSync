@@ -23,7 +23,8 @@ internal static class SyncRootSearchIndex
     private static string MarkerName(string url) =>
         Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(url.ToUpperInvariant())));
 
-    public static bool Ensure(string path, Action<string>? log)
+    public static bool Ensure(string path, Action<string>? log,
+        Func<string, bool>? privilegedFallback = null, RegistryKey? markerRoot = null)
     {
         try
         {
@@ -44,7 +45,7 @@ internal static class SyncRootSearchIndex
             }
             // Persist ownership before the COM mutation, including a failed SaveAll
             // or a crash. Never remove a pre-existing or inherited inclusion rule.
-            using var marker = Registry.CurrentUser.CreateSubKey(MarkerKey);
+            using var marker = (markerRoot ?? Registry.CurrentUser).CreateSubKey(MarkerKey);
             marker.SetValue(MarkerName(url), url);
             marker.Flush();
             scope.Add(url);
@@ -55,16 +56,19 @@ internal static class SyncRootSearchIndex
         catch (Exception error)
         {
             log?.Invoke($"[UPLOAD] 同步根搜索索引不可用，Explorer 进度可能不可见 hr=0x{error.HResult:X8} path={path}");
+            if (error.HResult == unchecked((int)0x80070005) && privilegedFallback is not null)
+                return privilegedFallback(path);
             return false;
         }
     }
 
-    public static bool Remove(string path, Action<string>? log)
+    public static bool Remove(string path, Action<string>? log,
+        Func<string, bool>? privilegedFallback = null, RegistryKey? markerRoot = null)
     {
         try
         {
             var url = FolderUrl(path);
-            using var marker = Registry.CurrentUser.OpenSubKey(MarkerKey, writable: true);
+            using var marker = (markerRoot ?? Registry.CurrentUser).OpenSubKey(MarkerKey, writable: true);
             var name = MarkerName(url);
             if (!string.Equals(marker?.GetValue(name) as string, url, StringComparison.OrdinalIgnoreCase)) return true;
             using var scope = new SearchScope();
@@ -76,6 +80,8 @@ internal static class SyncRootSearchIndex
         catch (Exception error)
         {
             log?.Invoke($"[UPLOAD] 移除同步根搜索索引规则失败，保留记录供重试 hr=0x{error.HResult:X8} path={path}");
+            if (error.HResult == unchecked((int)0x80070005) && privilegedFallback is not null)
+                return privilegedFallback(path);
             return false;
         }
     }

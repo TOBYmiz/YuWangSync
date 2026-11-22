@@ -1,4 +1,4 @@
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using System.Security.Cryptography;
 using Microsoft.UI.Input;
 using Microsoft.UI.Text;
@@ -297,7 +297,9 @@ internal sealed partial class MainWindow : Window
     private readonly Dictionary<(ulong Disk, ulong Folder), NavigationFolderState> _folderNodesByKey = [];
     private readonly Dictionary<TreeViewNode, DiskTreeEntry> _diskTreeNodes = [];
     private readonly Dictionary<TreeViewNode, NavigationNodeKind> _nodeKinds = [];
-    private readonly Dictionary<(ulong Disk, ulong Item), IStorageItem> _downloadedItems = [];
+    private readonly Dictionary<(ulong Disk, ulong Item), string> _downloadedPaths = [];
+    private ListViewItem? _dragSourceRow;
+    private const string BrowserDragSource = "YuWangCloudSync.CloudBrowser";
     private readonly Dictionary<string, Task<BitmapImage?>> _systemFileIconTasks = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, string> _systemFileTypes = new(StringComparer.OrdinalIgnoreCase);
     private string _systemFolderType = "文件夹";
@@ -335,7 +337,7 @@ internal sealed partial class MainWindow : Window
 
     private YuWangClient? Client => Program.ClientForUi;
 
-    internal MainWindow(SyncRootContext config)
+    internal MainWindow(SyncRootContext config, bool loadDiskTree = true)
     {
         TraceUiStage("开始构造主界面");
         _config = config;
@@ -376,11 +378,14 @@ internal sealed partial class MainWindow : Window
         WinUiWindowChrome.Attach(this, _root, Title, RootGlyph);
         WinUiUiHost.ConfigureWindow(this, 1180, 760, resizable: true,
             minimumWidthDip: 900, minimumHeightDip: 560);
-        _root.Loaded += (_, _) => RunUi(() => LoadDiskTreeAsync());
+        if (loadDiskTree) _root.Loaded += (_, _) => RunUi(() => LoadDiskTreeAsync());
         _root.SizeChanged += (_, _) => ConstrainSidebarWidth();
         Closed += (_, _) =>
         {
             _isClosed = true;
+            _favoritesAnimation.Stop();
+            _dragIntentTimer.Stop();
+            _dragCancellation?.Cancel();
             try { SaveBrowserState(); }
             catch (Exception error) { Serilog.Log.Warning(error, "关闭主界面时保存浏览状态失败"); }
         };
@@ -479,6 +484,9 @@ internal sealed partial class MainWindow : Window
         _navigationTree.Expanding += (_, args) => RunUi(() => OnNavigationExpandingAsync(args.Node));
         _navigationTree.Collapsed += (_, args) => OnNavigationCollapsed(args.Node);
         _navigationTree.ContextRequested += OnNavigationContextRequested;
+        // TreeViewItem can consume the routed right-tap before ContextRequested reaches TreeView.
+        _navigationTree.AddHandler(UIElement.RightTappedEvent,
+            new RightTappedEventHandler(OnNavigationRightTapped), handledEventsToo: true);
         var panes = BuildSidebarPanes();
         Grid.SetRow(panes, 1);
         sidebar.Children.Add(panes);
@@ -566,8 +574,12 @@ internal sealed partial class MainWindow : Window
         _items.SelectionChanged += (_, _) => UpdateCommandStates();
         _items.DoubleTapped += (_, _) => RunUi(() => OpenSelectedAsync());
         _items.KeyDown += OnListKeyDown;
-        _items.CanDragItems = true;
-        _items.DragItemsStarting += OnDragItemsStarting;
+        _items.CanDragItems = false;
+        _dragIntentTimer.Tick += (_, _) => CheckDragIntent();
+        _items.AddHandler(UIElement.PointerMovedEvent,
+            new PointerEventHandler((_, _) => CheckDragIntent()), handledEventsToo: true);
+        _items.AddHandler(UIElement.PointerPressedEvent,
+            new PointerEventHandler(OnFileListPointerPressed), handledEventsToo: true);
         _items.AllowDrop = true;
         _items.DragEnter += OnDragOver;
         _items.DragOver += OnDragOver;
@@ -2173,38 +2185,72 @@ internal sealed partial class MainWindow : Window
         RunContextMenu(() =>
         {
             if (_busyNow || _isClosed) return;
-            TreeViewNode? node = null;
-            FrameworkElement anchor = _navigationTree;
-            for (var source = args.OriginalSource as DependencyObject;
-                 source is not null && !ReferenceEquals(source, _navigationTree);
-                 source = VisualTreeHelper.GetParent(source))
-            {
-                if (source is not TreeViewItem container) continue;
-                node = _navigationTree.NodeFromContainer(container);
-                anchor = container;
-                break;
-            }
-            // A keyboard context request may originate from TreeView itself. A pointer
-            // request in empty space must not borrow the previously selected folder.
-            if (node is null && !args.TryGetPosition(_navigationTree, out _))
-                node = _navigationTree.SelectedNode;
-            if (node is not null && _folderNodes.TryGetValue(node, out var disk) && disk.Id == 0)
-            {
-                ShowFolderFavoriteMenu(disk, anchor, args);
-                return;
-            }
-            if (node is null || !_nodeKinds.TryGetValue(node, out var kind)
-                || kind != NavigationNodeKind.Folder
-                || !_folderNodes.TryGetValue(node, out var folder)
-                || node.Parent is not { } parentNode
-                || !_folderNodes.TryGetValue(parentNode, out var parent)) return;
-
-            _itemMenu.Hide();
-            var item = new YuWangItem { Type = 'D', Id = folder.Id, Name = folder.Name };
-            _itemMenuTarget = new ItemActionTarget(parent.ToRemoteFolder(), [item]);
-            UpdateItemMenuStates();
-            ShowContextMenu(_itemMenu, anchor, args);
+            var hasPosition = args.TryGetPosition(_navigationTree, out var point);
+            var container = hasPosition ? FindContainerAt<TreeViewItem>(_navigationTree, point)
+                : _navigationTree.SelectedNode is { } selected
+                    ? Project<TreeViewItem>(_navigationTree.ContainerFromNode(selected)) : null;
+            var node = container is not null ? _navigationTree.NodeFromContainer(container)
+                : hasPosition ? null : _navigationTree.SelectedNode;
+            ShowNavigationMenu(node, hasPosition ? point : null);
         });
+    }
+
+    private void OnNavigationRightTapped(object sender, RightTappedRoutedEventArgs args)
+    {
+        args.Handled = true;
+        var point = args.GetPosition(_navigationTree);
+        RunContextMenu(() =>
+        {
+            var container = FindContainerAt<TreeViewItem>(_navigationTree, point);
+            ShowNavigationMenu(container is null ? null : _navigationTree.NodeFromContainer(container), point);
+        });
+    }
+
+    private void ShowNavigationMenu(TreeViewNode? node, Windows.Foundation.Point? point)
+    {
+        if (_busyNow || _isClosed || node is null || !_folderNodes.TryGetValue(node, out var folder)) return;
+        if (folder.Id == 0)
+        {
+            // Disk roots have no parent item to rename/delete, but can be bookmarked.
+            var menu = new MenuFlyout();
+            var favorite = folder;
+            var command = new MenuFlyoutItem { Text = IsFavorite(favorite) ? "取消收藏" : "添加到收藏" };
+            command.Click += (_, _) => ToggleFavorite(favorite);
+            menu.Items.Add(command);
+            ShowNavigationMenuAt(menu, point);
+            return;
+        }
+        if (node.Parent is not { } parentNode || !_folderNodes.TryGetValue(parentNode, out var parent)) return;
+        _itemMenu.Hide();
+        var item = new YuWangItem { Type = 'D', Id = folder.Id, Name = folder.Name };
+        _itemMenuTarget = new ItemActionTarget(parent.ToRemoteFolder(), [item]);
+        UpdateItemMenuStates();
+        ShowNavigationMenuAt(_itemMenu, point);
+    }
+
+    private void ShowNavigationMenuAt(MenuFlyout menu, Windows.Foundation.Point? point)
+    {
+        if (point is { } position) menu.ShowAt(_navigationTree, new FlyoutShowOptions { Position = position });
+        else menu.ShowAt(_navigationTree);
+    }
+
+    // NativeAOT may initially project a native control as its base DependencyObject.
+    private static T? Project<T>(object? value) where T : class
+    {
+        if (value is T typed) return typed;
+        if (value is null) return null;
+        try { return WinRT.CastExtensions.As<T>(value); }
+        catch (InvalidCastException) { return null; }
+    }
+
+    private static T? FindContainerAt<T>(UIElement surface, Windows.Foundation.Point point) where T : class
+    {
+        var hostPoint = surface.TransformToVisual(null).TransformPoint(point);
+        foreach (var hit in VisualTreeHelper.FindElementsInHostCoordinates(hostPoint, surface))
+            for (DependencyObject? current = hit; current is not null && !ReferenceEquals(current, surface);
+                 current = VisualTreeHelper.GetParent(current))
+                if (Project<T>(current) is { } container) return container;
+        return null;
     }
 
     private void OnListBackgroundContextRequested(UIElement sender, ContextRequestedEventArgs args)
@@ -2289,11 +2335,12 @@ internal sealed partial class MainWindow : Window
 
         await RunBusyAsync($"正在打开“{item.Name}”…", async () =>
         {
+            // Open the actual sync-root file so local edits are preserved and Cloud Files
+            // fetches only missing data when the associated application reads it.
             var openRoot = Path.Combine(Path.GetTempPath(), ProductIdentity.Identifier, "opened-files");
-            Directory.CreateDirectory(openRoot);
-            var path = await DownloadFileAsync(parent.Disk.Id, item, openRoot);
+            var path = await PrepareLocalItemPathAsync(parent, item, openRoot, Program.ApplicationCancellationToken);
             Process.Start(new ProcessStartInfo(path) { UseShellExecute = true });
-            SetStatus($"已下载并打开“{item.Name}”");
+            SetStatus($"已打开“{item.Name}”");
         });
     }
 
@@ -2352,7 +2399,8 @@ internal sealed partial class MainWindow : Window
 
     private void OnDragOver(object sender, DragEventArgs args)
     {
-        var canDrop = CanWrite && args.DataView.Contains(StandardDataFormats.StorageItems);
+        var canDrop = !_outboundDragActive && CanWrite && !args.DataView.Properties.ContainsKey(BrowserDragSource)
+            && args.DataView.Contains(StandardDataFormats.StorageItems);
         args.AcceptedOperation = canDrop ? DataPackageOperation.Copy : DataPackageOperation.None;
         if (!canDrop)
         {
@@ -2365,40 +2413,33 @@ internal sealed partial class MainWindow : Window
         _dropOverlay.Visibility = Visibility.Visible;
     }
 
-    private void OnDragItemsStarting(object sender, DragItemsStartingEventArgs args)
+    private void OnFileListPointerPressed(object sender, PointerRoutedEventArgs args)
     {
-        var selected = SelectedEntries();
-        var folder = _currentFolder;
-        if (folder is null || selected.Count == 0)
-        {
-            args.Cancel = true;
-            return;
-        }
+        _dragIntentTimer.Stop();
+        _dragSourceRow = null;
+        if (_busyNow || _outboundDragActive || _isClosed) return;
+        var point = args.GetCurrentPoint(_items);
+        if (!point.Properties.IsLeftButtonPressed) return;
+        var row = FindContainerAt<ListViewItem>(_items, point.Position);
+        if (row?.Tag is not YuWangItem) return;
+        _dragSourceRow = row;
+        _dragPressPosition = NativeFileDrag.CursorPosition;
+        _dragIntentTimer.Start();
+        // Preserve Ctrl/Shift click selection; starting a drag resolves its source separately.
+        var modifiers = InputKeyboardSource.GetKeyStateForCurrentThread(VirtualKey.Control)
+            | InputKeyboardSource.GetKeyStateForCurrentThread(VirtualKey.Shift);
+        if (modifiers.HasFlag(Windows.UI.Core.CoreVirtualKeyStates.Down)) return;
+        SelectDragSource(row);
+    }
 
-        var storageItems = new List<IStorageItem>();
-        try
+    private void SelectDragSource(ListViewItem row)
+    {
+        if (row.IsSelected) return;
+        if (_items.SelectionMode == ListViewSelectionMode.Single) _items.SelectedItem = row;
+        else
         {
-            foreach (var item in selected)
-            {
-                if (!_downloadedItems.TryGetValue((folder.Disk.Id, item.Id), out var storageItem)
-                    || (!File.Exists(storageItem.Path) && !Directory.Exists(storageItem.Path)))
-                {
-                    args.Cancel = true;
-                    ShowInfo(InfoBarSeverity.Informational, "请先下载",
-                        $"先下载“{item.Name}”，再将其拖到资源管理器。");
-                    return;
-                }
-                storageItems.Add(storageItem);
-            }
-
-            args.Data.RequestedOperation = DataPackageOperation.Copy;
-            args.Data.SetStorageItems(storageItems, readOnly: false);
-            SetStatus("正在向资源管理器传递已下载项目");
-        }
-        catch (Exception error)
-        {
-            args.Cancel = true;
-            ShowInfo(InfoBarSeverity.Error, "无法开始拖放", error.Message);
+            _items.SelectedItems.Clear();
+            _items.SelectedItems.Add(row);
         }
     }
 
@@ -2406,13 +2447,16 @@ internal sealed partial class MainWindow : Window
     {
         args.Handled = true;
         _dropOverlay.Visibility = Visibility.Collapsed;
-        if (!CanWrite || !args.DataView.Contains(StandardDataFormats.StorageItems)) return;
+        if (_outboundDragActive || !CanWrite || args.DataView.Properties.ContainsKey(BrowserDragSource)
+            || !args.DataView.Contains(StandardDataFormats.StorageItems)) return;
+        var deferral = args.GetDeferral();
         try
         {
             var storageItems = await args.DataView.GetStorageItemsAsync();
             await UploadStorageItemsAsync(storageItems);
         }
         catch (Exception error) { ShowInfo(InfoBarSeverity.Error, "拖放上传失败", error.Message); }
+        finally { deferral.Complete(); }
     }
 
     private async Task UploadStorageItemsAsync(IReadOnlyList<IStorageItem> items)
@@ -2625,6 +2669,21 @@ internal sealed partial class MainWindow : Window
 
     #region Download
 
+    // Opening and dragging resolve the same file. Hydration belongs to the caller:
+    // opening lets the application read on demand; dragging fully prepares it before OLE.
+    private async Task<string> PrepareLocalItemPathAsync(RemoteFolder folder, YuWangItem item,
+        string fallbackDirectory, CancellationToken token)
+    {
+        token.ThrowIfCancellationRequested();
+        var path = await Task.Run(() => Program.ResolveLocalItemPath(folder.Disk.Id, folder.Id, item), token);
+        token.ThrowIfCancellationRequested();
+        if (path is not null) return path;
+        if (_downloadedPaths.TryGetValue((folder.Disk.Id, item.Id), out var downloaded)
+            && (item.IsFolder ? Directory.Exists(downloaded) : File.Exists(downloaded)))
+            return downloaded;
+        return await DownloadEntryAsync(folder.Disk.Id, item, fallbackDirectory, token);
+    }
+
     private Task DownloadSelectionAsync() => DownloadItemsAsync(GetSelectionTarget());
 
     private async Task DownloadItemsAsync(ItemActionTarget? target)
@@ -2648,27 +2707,30 @@ internal sealed partial class MainWindow : Window
         });
     }
 
-    private async Task DownloadEntryAsync(ulong diskId, YuWangItem item, string destination)
+    private async Task<string> DownloadEntryAsync(ulong diskId, YuWangItem item, string destination,
+        CancellationToken cancellationToken = default)
     {
-        Program.ApplicationCancellationToken.ThrowIfCancellationRequested();
+        if (!cancellationToken.CanBeCanceled) cancellationToken = Program.ApplicationCancellationToken;
+        cancellationToken.ThrowIfCancellationRequested();
         if (!item.IsFolder)
-        {
-            await DownloadFileAsync(diskId, item, destination);
-            return;
-        }
+            return await DownloadFileAsync(diskId, item, destination, cancellationToken);
         var folderPath = GetAvailablePath(destination, SafeFileName(item.Name), directory: true);
         Directory.CreateDirectory(folderPath);
-        try { _downloadedItems[(diskId, item.Id)] = await StorageFolder.GetFolderFromPathAsync(folderPath); }
-        catch (Exception error) { Serilog.Log.Debug(error, "无法为已下载文件夹准备 Explorer 拖放对象：{Path}", folderPath); }
-        var children = await Client!.ListFolderAsync(diskId, item.Id);
+        var children = await Client!.ListFolderAsync(diskId, item.Id).WaitAsync(cancellationToken);
         foreach (var child in children)
-            await DownloadEntryAsync(diskId, child, folderPath);
+            await DownloadEntryAsync(diskId, child, folderPath, cancellationToken);
+        // A partially downloaded directory must never be advertised as ready for the next drag.
+        cancellationToken.ThrowIfCancellationRequested();
+        _downloadedPaths[(diskId, item.Id)] = folderPath;
+        return folderPath;
     }
 
-    private async Task<string> DownloadFileAsync(ulong diskId, YuWangItem item, string destination)
+    private async Task<string> DownloadFileAsync(ulong diskId, YuWangItem item, string destination,
+        CancellationToken cancellationToken = default)
     {
+        if (!cancellationToken.CanBeCanceled) cancellationToken = Program.ApplicationCancellationToken;
         var client = Client ?? throw new InvalidOperationException("育网云客户端尚未就绪。");
-        var probe = await client.ProbeRealSizeAsync(item.Id, item.Name, item.Size)
+        var probe = await client.ProbeRealSizeAsync(item.Id, item.Name, item.Size).WaitAsync(cancellationToken)
             ?? throw new IOException($"无法获取“{item.Name}”的下载地址或文件大小。");
         var folder = Path.GetFullPath(destination);
         Directory.CreateDirectory(folder);
@@ -2682,22 +2744,22 @@ internal sealed partial class MainWindow : Window
             SetTransferProgress($"正在下载“{item.Name}”…", 0);
             while (offset < probe.Size)
             {
-                Program.ApplicationCancellationToken.ThrowIfCancellationRequested();
+                cancellationToken.ThrowIfCancellationRequested();
                 var requested = Math.Min(4 * 1024 * 1024, probe.Size - offset);
-                var range = await client.DownloadRangeDirectAsync(probe.DirectUrl, offset, requested);
+                var range = await client.DownloadRangeDirectAsync(probe.DirectUrl, offset, requested)
+                    .WaitAsync(cancellationToken);
                 if (range is null || range.Value.Data.Length == 0)
                     throw new EndOfStreamException($"“{item.Name}”下载提前结束。");
-                await output.WriteAsync(range.Value.Data, Program.ApplicationCancellationToken);
+                await output.WriteAsync(range.Value.Data, cancellationToken);
                 offset += range.Value.Data.Length;
                 SetTransferProgress($"正在下载“{item.Name}”… {FormatSize(offset)} / {FormatSize(probe.Size)}",
                     probe.Size <= 0 ? 100 : offset * 100d / probe.Size);
             }
-            await output.FlushAsync(Program.ApplicationCancellationToken);
+            await output.FlushAsync(cancellationToken);
             output.Close();
             File.Move(temporaryPath, finalPath);
-            try { _downloadedItems[(diskId, item.Id)] = await StorageFile.GetFileFromPathAsync(finalPath); }
-            catch (Exception error) { Serilog.Log.Debug(error, "无法为已下载文件准备 Explorer 拖放对象：{Path}", finalPath); }
             if (item.UploadTime is { } modified) File.SetLastWriteTimeUtc(finalPath, modified.ToUniversalTime());
+            _downloadedPaths[(diskId, item.Id)] = finalPath;
             return finalPath;
         }
         catch

@@ -59,6 +59,7 @@ internal static class WinUiUiHost
     private static CacheCleanupConfirmationWindow? _cacheCleanupConfirmation;
     private static KeptDirectoriesWindow? _keptDirectories;
     private static MainWindow? _mainWindow;
+    private static AccountSwitchProgressWindow? _accountSwitchProgress;
     private static int _uiThreadId;
 
     internal static bool IsReady => Ready.IsSet && _dispatcher is not null;
@@ -168,6 +169,49 @@ internal static class WinUiUiHost
     internal static void UpdateFileCacheCleanupHistory(FileCacheCleanupRecord record)
         => Post(() => _settings?.UpdateFileCacheCleanupHistory(record));
 
+    internal static void BeginAccountSwitch(string account)
+    {
+        void Show()
+        {
+            CloseMainWindow();
+            var window = new AccountSwitchProgressWindow(account);
+            _accountSwitchProgress = window;
+            window.Closed += (_, _) =>
+            {
+                if (ReferenceEquals(_accountSwitchProgress, window)) _accountSwitchProgress = null;
+            };
+            window.Activate();
+        }
+        if (_dispatcher?.HasThreadAccess == true) Show();
+        else if (!Post(Show)) throw new InvalidOperationException("界面线程不可用，无法显示账户切换进度。");
+    }
+
+    internal static void ReportAccountSwitch(string stage, double? percent = null, string detail = "")
+        => Post(() => _accountSwitchProgress?.Update(stage, percent, detail));
+
+    internal static Task FinishAccountSwitchAsync(string? error = null)
+    {
+        var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        if (!Post(async () =>
+            {
+                try
+                {
+                    if (_accountSwitchProgress is { } window)
+                    {
+                        if (error is null) window.Finish();
+                        else
+                        {
+                            window.Fail(error);
+                            await window.Dismissed;
+                        }
+                    }
+                    completion.TrySetResult();
+                }
+                catch (Exception failure) { completion.TrySetException(failure); }
+            })) completion.TrySetResult();
+        return completion.Task;
+    }
+
     internal static void ShowMainWindow()
     {
         if (!Program.SnapshotConfig().EnableMainWindow) return;
@@ -177,16 +221,19 @@ internal static class WinUiUiHost
 
     internal static void CloseMainWindow()
     {
-        if (!Post(() =>
-            {
-                try { _mainWindow?.Close(); } catch { }
-                _mainWindow = null;
-            }))
+        void Close()
+        {
+            _mainWindow?.Close();
+            _mainWindow = null;
+        }
+        if (_dispatcher?.HasThreadAccess == true) Close();
+        else if (!Post(Close))
             Serilog.Log.Debug("WinUI UI 线程不可用，无法关闭主界面");
     }
 
     private static void ShowMainWindowOnUi()
     {
+        if (_accountSwitchProgress is not null) return;
         if (!Program.SnapshotConfig().EnableMainWindow) return;
         if (_mainWindow is not null)
         {
@@ -402,6 +449,8 @@ internal static class WinUiUiHost
 
     internal static void CloseAllOnUiThread()
     {
+        try { _accountSwitchProgress?.Finish(); } catch { }
+        _accountSwitchProgress = null;
         try { _accountManager?.Close(); } catch { }
         try { _keptDirectories?.Close(); } catch { }
         try { _settings?.Close(); } catch { }
@@ -603,6 +652,23 @@ internal static class WinUiUiHost
         var canceledCode = await canceledCompletion.Task.WaitAsync(TimeSpan.FromSeconds(5));
         Check("Captcha cancel result", canceledCode.Length == 0, "Cancel/close returns an empty string.");
 
+        checks.AddRange(await MainWindow.CheckBrowserInteractionsAsync(fakeConfig, testRoot, saveShots));
+
+        var switchProgress = new AccountSwitchProgressWindow("测试账户");
+        try
+        {
+            switchProgress.Activate();
+            switchProgress.Update("正在清理旧账户的同步目录…", null, "已清理 1,234 项，失败 0 项");
+            await Task.Delay(100);
+            if (saveShots) await SaveWindowPngAsync((FrameworkElement)switchProgress.Content, "account-switch-progress", testRoot);
+            switchProgress.Fail("有 1 项未能清理，已停止切换并保留旧账户配置。\n测试文件.txt：文件正被其他程序占用，请关闭文件后重试。");
+            await Task.Delay(100);
+            if (saveShots) await SaveWindowPngAsync((FrameworkElement)switchProgress.Content, "account-switch-error", testRoot);
+            Check("Account switch progress and failure dialog", switchProgress.Content is FrameworkElement { ActualWidth: > 0 },
+                "The progress window renders cleanup counts and a dismissible detailed failure.");
+        }
+        finally { switchProgress.Finish(); }
+
         TrayHost.Shutdown();
         await Task.Run(() => TrayHost.Join(TimeSpan.FromSeconds(3)));
         return checks;
@@ -755,7 +821,7 @@ internal static class WinUiUiHost
         return new(name, false, "The deleted icon was not restored within the recovery interval.");
     }
 
-    private static async Task SaveWindowPngAsync(FrameworkElement element, string name, string testRoot)
+    internal static async Task SaveWindowPngAsync(FrameworkElement element, string name, string testRoot)
     {
         var renderer = new RenderTargetBitmap();
         await renderer.RenderAsync(element);

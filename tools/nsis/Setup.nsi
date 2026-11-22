@@ -71,6 +71,7 @@ VIAddVersionKey "OriginalFilename" "@@SETUP_FILE_NAME@@"
 
 ; Variables used by the MUI finish-page reboot prompt must be declared before the page macros.
 Var ExplorerRestartDeferred
+Var ExplorerInteractiveUser
 Var FinishRebootText
 Var FinishRebootNowText
 
@@ -1346,46 +1347,83 @@ Function un.FinishPageLeave
 FunctionEnd
 
 !macro DEFINE_EXPLORER_RESTART_FUNCTIONS UN
-; Restart the current session's Explorer shell. Terminating it lets Winlogon (AutoRestartShell)
-; relaunch it with the user's normal token; only fall back to starting it from Setup if that does not happen.
-Function ${UN}RestartExplorerNow
+; Resolve the console user instead of inheriting an elevated administrator/SYSTEM identity.
+Function ${UN}GetExplorerInteractiveUser
   Push $0
   Push $1
   Push $2
   Push $3
-  FindWindow $0 "Shell_TrayWnd"
-  ${If} $0 == 0
-    Goto ${UN}restart_explorer_done
+  Push $4
+  ReadEnvStr $ExplorerInteractiveUser "USERNAME"
+  System::Call 'kernel32::WTSGetActiveConsoleSessionId() i .r0'
+  ${If} $0 != -1
+    StrCpy $1 0
+    System::Call 'wtsapi32::WTSQuerySessionInformationW(p 0, i r0, i 5, *p .r1, *i .r2) i .r4'
+    ${If} $4 != 0
+      System::Call 'kernel32::lstrcpynW(w .r3, p r1, i ${NSIS_MAX_STRLEN}) p'
+      ${If} $3 != ""
+        StrCpy $ExplorerInteractiveUser $3
+      ${EndIf}
+    ${EndIf}
+    ${If} $1 != 0
+      System::Call 'wtsapi32::WTSFreeMemory(p r1)'
+    ${EndIf}
+    ; Qualify local/domain accounts, avoiding ambiguous short names.
+    ${If} $4 != 0
+    ${AndIf} $3 != ""
+      StrCpy $1 0
+      System::Call 'wtsapi32::WTSQuerySessionInformationW(p 0, i r0, i 7, *p .r1, *i .r2) i .r4'
+      ${If} $4 != 0
+        System::Call 'kernel32::lstrcpynW(w .r3, p r1, i ${NSIS_MAX_STRLEN}) p'
+        ${If} $3 != ""
+          StrCpy $ExplorerInteractiveUser "$3\$ExplorerInteractiveUser"
+        ${EndIf}
+      ${EndIf}
+      ${If} $1 != 0
+        System::Call 'wtsapi32::WTSFreeMemory(p r1)'
+      ${EndIf}
+    ${EndIf}
   ${EndIf}
-  DetailPrint "正在重启资源管理器…"
-  StrCpy $1 0
-  System::Call 'user32::GetWindowThreadProcessId(p r0, *i .r1) i'
-  ${If} $1 == 0
-    Goto ${UN}restart_explorer_done
-  ${EndIf}
-  ; SYNCHRONIZE | PROCESS_TERMINATE
-  System::Call 'kernel32::OpenProcess(i 0x00100001, i 0, i r1) p .r2'
-  ${If} $2 == 0
-    DetailPrint "无法重启资源管理器。"
-    Goto ${UN}restart_explorer_done
-  ${EndIf}
-  System::Call 'kernel32::TerminateProcess(p r2, i 1) i'
-  System::Call 'kernel32::WaitForSingleObject(p r2, i 5000) i'
-  System::Call 'kernel32::CloseHandle(p r2) i'
-  StrCpy $3 0
-${UN}restart_explorer_wait:
-  Sleep 250
-  FindWindow $0 "Shell_TrayWnd"
-  ${If} $0 != 0
-    Goto ${UN}restart_explorer_done
-  ${EndIf}
-  IntOp $3 $3 + 1
-  IntCmp $3 40 0 ${UN}restart_explorer_wait
-  Exec '"$WINDIR\explorer.exe"'
-${UN}restart_explorer_done:
+  DetailPrint "Explorer 重启交互用户：$ExplorerInteractiveUser（查询失败时使用 USERNAME）"
+  Pop $4
   Pop $3
   Pop $2
   Pop $1
+  Pop $0
+FunctionEnd
+
+; UAC on / Admin Approval Mode: the scheduler's default interactive user context uses
+; the user's standard token, matching native Explorer. With UAC off, follow the system
+; user context. Do not request HIGHEST/LIMITED, force token changes, or launch Explorer
+; from the elevated installer. cmd /c is required: Task Scheduler does not parse '&'.
+Function ${UN}RestartExplorerNow
+  Push $0
+  Call ${UN}GetExplorerInteractiveUser
+  ${If} $ExplorerInteractiveUser == ""
+    DetailPrint "无法确定 Explorer 交互用户，跳过重启。"
+  ${Else}
+    DetailPrint "正在创建 Explorer 重启计划任务…"
+    nsExec::ExecToLog '"$SYSDIR\schtasks.exe" /create /tn "TempRestartExplorer" /tr "\"$SYSDIR\cmd.exe\" /d /c \"taskkill /f /im explorer.exe & start explorer.exe\"" /sc once /st 00:00 /ru "$ExplorerInteractiveUser" /it /f'
+    Pop $0
+    DetailPrint "Explorer 重启任务 /create 返回码：$0"
+    ${If} $0 == "0"
+      nsExec::ExecToLog '"$SYSDIR\schtasks.exe" /run /tn "TempRestartExplorer"'
+      Pop $0
+      DetailPrint "Explorer 重启任务 /run 返回码：$0"
+      ${If} $0 != "0"
+        DetailPrint "Explorer 重启任务启动失败。"
+      ${EndIf}
+    ${Else}
+      DetailPrint "Explorer 重启任务创建失败，跳过 /run。"
+    ${EndIf}
+    ; Always clean up, including create/run failures. Do not wait for Explorer readiness.
+    nsExec::ExecToLog '"$SYSDIR\schtasks.exe" /delete /tn "TempRestartExplorer" /f'
+    Pop $0
+    DetailPrint "Explorer 重启任务 /delete 返回码：$0"
+    ${If} $0 != "0"
+      DetailPrint "Explorer 重启任务清理失败，请检查计划任务 TempRestartExplorer。"
+    ${EndIf}
+  ${EndIf}
   Pop $0
 FunctionEnd
 
@@ -2280,7 +2318,7 @@ install_shell_file_done:
   ${EndIf}
 
   ${If} $IsInstalled != "1"
-    nsExec::ExecToStack /TIMEOUT=30000 '"$SYSDIR\schtasks.exe" /Create /TN "${PRODUCT_IDENTIFIER}-$UserSid" /SC ONLOGON /TR "\"$INSTDIR\${PRODUCT_IDENTIFIER}.exe\"" /RL HIGHEST /F'
+    nsExec::ExecToStack /TIMEOUT=30000 '"$SYSDIR\schtasks.exe" /Create /TN "${PRODUCT_IDENTIFIER}-$UserSid" /SC ONLOGON /TR "\"$INSTDIR\${PRODUCT_IDENTIFIER}.exe\"" /F'
     Pop $R9
     Pop $R8
     ${If} $R9 != "0"

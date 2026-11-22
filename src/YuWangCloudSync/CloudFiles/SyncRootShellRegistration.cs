@@ -86,7 +86,8 @@ internal static class SyncRootShellRegistration
     public static void Remove(string registrationId, string syncRootPath)
     {
         RemoveNavigationRegistration(registrationId, syncRootPath);
-        SyncRootSearchIndex.Remove(syncRootPath, Callbacks.Log);
+        SyncRootSearchIndex.Remove(syncRootPath, Callbacks.Log,
+            path => PrivilegedOperations.Run("--remove-search-index", path, log: Callbacks.Log));
         ExplorerStateNotifier.NotifyRegistrationChange();
     }
 
@@ -214,8 +215,21 @@ internal static class SyncRootShellRegistration
         foreach (var view in new[] { RegistryView.Registry64, RegistryView.Registry32 })
         {
             using var baseKey = RegistryKey.OpenBaseKey(hive, view);
-            SyncRootShellRegistry.Remove(baseKey, sid, registrationId, syncRootPath,
-                includeNamespaces: hive == RegistryHive.CurrentUser);
+            if (hive == RegistryHive.LocalMachine)
+            {
+                // Read first: ordinary navigation/cleanup must not show UAC when there is
+                // no matching registration. Delegate only writes the token cannot perform.
+                using var roots = baseKey.OpenSubKey(SyncRootShellRegistry.ManagerPath + "\\" + registrationId + @"\UserSyncRoots");
+                if (roots?.GetValue(sid) is not string path || !PathsEqual(path, syncRootPath)) continue;
+                try { SyncRootShellRegistry.Remove(baseKey, sid, registrationId, syncRootPath, includeNamespaces: false); }
+                catch (Exception error) when (error is UnauthorizedAccessException or System.Security.SecurityException)
+                {
+                    if (!PrivilegedOperations.Run("--remove-machine-shell-registration", syncRootPath,
+                            registrationId, Callbacks.Log))
+                        throw new IOException("权限辅助程序未能移除 Explorer 注册项。", error);
+                }
+            }
+            else SyncRootShellRegistry.Remove(baseKey, sid, registrationId, syncRootPath, includeNamespaces: true);
         }
     }
 }

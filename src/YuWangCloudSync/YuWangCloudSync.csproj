@@ -53,8 +53,16 @@
 
   <ItemGroup>
     <ProjectReference Include="..\YuWangCloudSync.Core\YuWangCloudSync.Core.csproj" />
+    <ProjectReference Include="..\YuWangCloudSync.Admin\YuWangCloudSync.Admin.csproj" ReferenceOutputAssembly="false" />
     <Compile Remove="CloudFiles\SyncRootProbe.cs;Models\FileIdentity.cs" />
   </ItemGroup>
+
+  <Target Name="CopyPrivilegeHelperForBuild" AfterTargets="Build">
+    <ItemGroup>
+      <_PrivilegeHelperBuildFiles Include="..\YuWangCloudSync.Admin\bin\$(Configuration)\$(TargetFramework)\win-x64\$(ProductIdentifier)Admin.*" />
+    </ItemGroup>
+    <Copy SourceFiles="@(_PrivilegeHelperBuildFiles)" DestinationFolder="$(TargetDir)" SkipUnchangedFiles="true" />
+  </Target>
 
   <ItemGroup>
     <PackageReference Include="Microsoft.WindowsAppSDK" Version="2.5.1" />

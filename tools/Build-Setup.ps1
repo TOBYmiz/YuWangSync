@@ -96,6 +96,7 @@ try {
     # necessarily created it, so prepare the shared custom output directory first.
     [System.IO.Directory]::CreateDirectory($mainBuildOutput) | Out-Null
     Invoke-Checked 'dotnet' @('publish', (Join-Path $repository 'src\YuWangCloudSync\YuWangCloudSync.csproj'), '-c', 'Release', '-r', 'win-x64', '--self-contained', 'true', '-p:PublishAot=true', '-p:PublishTrimmed=true', ('-p:ProductVersion=' + $version), '-p:WindowsAppSDKSelfContained=true', '-p:DebugType=None', '-p:DebugSymbols=false', ('-p:OutDir=' + $mainBuildOutput + '\'), '-o', $publish)
+    & (Join-Path $PSScriptRoot 'Publish-AdminHelper.ps1') -PayloadDirectory $publish
     & (Join-Path $PSScriptRoot 'Copy-DotNetRuntimeNotices.ps1') `
         -ProjectAssetsFile (Join-Path $appProject 'obj\project.assets.json') `
         -PublishDirectory $publish
