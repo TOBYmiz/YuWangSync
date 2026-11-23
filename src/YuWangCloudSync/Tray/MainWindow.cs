@@ -267,6 +267,13 @@ internal sealed partial class MainWindow : Window
         Visibility = Visibility.Collapsed,
         VerticalAlignment = VerticalAlignment.Center,
     };
+    private readonly Button _cancelDragPreparation = new()
+    {
+        Content = "取消",
+        Visibility = Visibility.Collapsed,
+        VerticalAlignment = VerticalAlignment.Center,
+        Padding = new Thickness(10, 2, 10, 2),
+    };
     private readonly Border _permissionBadge = new()
     {
         CornerRadius = new CornerRadius(10),
@@ -386,6 +393,7 @@ internal sealed partial class MainWindow : Window
             _favoritesAnimation.Stop();
             _dragIntentTimer.Stop();
             _dragCancellation?.Cancel();
+            CancelDragWarmup();
             try { SaveBrowserState(); }
             catch (Exception error) { Serilog.Log.Warning(error, "关闭主界面时保存浏览状态失败"); }
         };
@@ -571,13 +579,22 @@ internal sealed partial class MainWindow : Window
         _fileSurface.Children.Add(_columnsHeader);
 
         _items.Name = "CloudFileListView";
-        _items.SelectionChanged += (_, _) => UpdateCommandStates();
+        _items.SelectionChanged += (_, _) =>
+        {
+            UpdateCommandStates();
+            QueueDragPreparation();
+        };
         _items.DoubleTapped += (_, _) => RunUi(() => OpenSelectedAsync());
         _items.KeyDown += OnListKeyDown;
         _items.CanDragItems = false;
         _dragIntentTimer.Tick += (_, _) => CheckDragIntent();
+        _dragProgressTimer.Tick += (_, _) => UpdateDragPreparationProgress();
         _items.AddHandler(UIElement.PointerMovedEvent,
-            new PointerEventHandler((_, _) => CheckDragIntent()), handledEventsToo: true);
+            new PointerEventHandler((_, args) =>
+            {
+                if (_dragSourceRow is not null) _dragPointer = args.GetCurrentPoint(_items);
+                CheckDragIntent();
+            }), handledEventsToo: true);
         _items.AddHandler(UIElement.PointerPressedEvent,
             new PointerEventHandler(OnFileListPointerPressed), handledEventsToo: true);
         _items.AllowDrop = true;
@@ -878,6 +895,12 @@ internal sealed partial class MainWindow : Window
         Grid.SetColumn(_status, 1);
         bar.Children.Add(_status);
 
+        bar.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        _cancelDragPreparation.Click += (_, _) => CancelActiveDragPreparation();
+        ToolTipService.SetToolTip(_cancelDragPreparation, "取消本次文件准备与提取");
+        Grid.SetColumn(_cancelDragPreparation, 3);
+        bar.Children.Add(_cancelDragPreparation);
+
         Grid.SetColumn(_transferProgress, 2);
         bar.Children.Add(_transferProgress);
 
@@ -888,7 +911,7 @@ internal sealed partial class MainWindow : Window
             Spacing = 6,
             Children = { _permissionGlyph, _permissionText },
         };
-        Grid.SetColumn(_permissionBadge, 3);
+        Grid.SetColumn(_permissionBadge, 4);
         bar.Children.Add(_permissionBadge);
         return bar;
     }
@@ -1724,6 +1747,7 @@ internal sealed partial class MainWindow : Window
     private void RenderItems()
     {
         if (_isClosed) return;
+        CancelDragWarmup();
         TraceUiStage($"开始更新文件列表：Items={_currentItems.Count}");
         _items.Items.Clear();
         _fileRows.Clear();
@@ -2423,6 +2447,7 @@ internal sealed partial class MainWindow : Window
         var row = FindContainerAt<ListViewItem>(_items, point.Position);
         if (row?.Tag is not YuWangItem) return;
         _dragSourceRow = row;
+        _dragPointer = point;
         _dragPressPosition = NativeFileDrag.CursorPosition;
         _dragIntentTimer.Start();
         // Preserve Ctrl/Shift click selection; starting a drag resolves its source separately.
@@ -2430,6 +2455,7 @@ internal sealed partial class MainWindow : Window
             | InputKeyboardSource.GetKeyStateForCurrentThread(VirtualKey.Shift);
         if (modifiers.HasFlag(Windows.UI.Core.CoreVirtualKeyStates.Down)) return;
         SelectDragSource(row);
+        QueueDragPreparation();
     }
 
     private void SelectDragSource(ListViewItem row)
@@ -2670,18 +2696,27 @@ internal sealed partial class MainWindow : Window
     #region Download
 
     // Opening and dragging resolve the same file. Hydration belongs to the caller:
-    // opening lets the application read on demand; dragging fully prepares it before OLE.
+    // opening lets the application read on demand; virtual dragging prepares content when its stream is read.
     private async Task<string> PrepareLocalItemPathAsync(RemoteFolder folder, YuWangItem item,
-        string fallbackDirectory, CancellationToken token)
+        string fallbackDirectory, CancellationToken token, bool reportProgress = true,
+        Action<string, long, long>? preparationProgress = null)
     {
         token.ThrowIfCancellationRequested();
-        var path = await Task.Run(() => Program.ResolveLocalItemPath(folder.Disk.Id, folder.Id, item), token);
+        _downloadedPaths.TryGetValue((folder.Disk.Id, item.Id), out var downloaded);
+        var path = await Task.Run(() =>
+        {
+            var local = Program.ResolveLocalItemPath(folder.Disk.Id, folder.Id, item);
+            var hasDownload = downloaded is not null
+                && (item.IsFolder ? Directory.Exists(downloaded) : File.Exists(downloaded));
+            // Reuse a completed download rather than hydrating the same remote data again.
+            // A complete sync-root file still wins so opening/dragging preserves local edits.
+            if (hasDownload && (local is null || (!item.IsFolder
+                    && ((uint)File.GetAttributes(local) & 0x00441000) != 0))) return downloaded;
+            return local;
+        }, token);
         token.ThrowIfCancellationRequested();
         if (path is not null) return path;
-        if (_downloadedPaths.TryGetValue((folder.Disk.Id, item.Id), out var downloaded)
-            && (item.IsFolder ? Directory.Exists(downloaded) : File.Exists(downloaded)))
-            return downloaded;
-        return await DownloadEntryAsync(folder.Disk.Id, item, fallbackDirectory, token);
+        return await DownloadEntryAsync(folder.Disk.Id, item, fallbackDirectory, token, reportProgress, preparationProgress);
     }
 
     private Task DownloadSelectionAsync() => DownloadItemsAsync(GetSelectionTarget());
@@ -2708,17 +2743,18 @@ internal sealed partial class MainWindow : Window
     }
 
     private async Task<string> DownloadEntryAsync(ulong diskId, YuWangItem item, string destination,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default, bool reportProgress = true,
+        Action<string, long, long>? preparationProgress = null)
     {
         if (!cancellationToken.CanBeCanceled) cancellationToken = Program.ApplicationCancellationToken;
         cancellationToken.ThrowIfCancellationRequested();
         if (!item.IsFolder)
-            return await DownloadFileAsync(diskId, item, destination, cancellationToken);
+            return await DownloadFileAsync(diskId, item, destination, cancellationToken, reportProgress, preparationProgress);
         var folderPath = GetAvailablePath(destination, SafeFileName(item.Name), directory: true);
         Directory.CreateDirectory(folderPath);
         var children = await Client!.ListFolderAsync(diskId, item.Id).WaitAsync(cancellationToken);
         foreach (var child in children)
-            await DownloadEntryAsync(diskId, child, folderPath, cancellationToken);
+            await DownloadEntryAsync(diskId, child, folderPath, cancellationToken, reportProgress, preparationProgress);
         // A partially downloaded directory must never be advertised as ready for the next drag.
         cancellationToken.ThrowIfCancellationRequested();
         _downloadedPaths[(diskId, item.Id)] = folderPath;
@@ -2726,7 +2762,8 @@ internal sealed partial class MainWindow : Window
     }
 
     private async Task<string> DownloadFileAsync(ulong diskId, YuWangItem item, string destination,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default, bool reportProgress = true,
+        Action<string, long, long>? preparationProgress = null)
     {
         if (!cancellationToken.CanBeCanceled) cancellationToken = Program.ApplicationCancellationToken;
         var client = Client ?? throw new InvalidOperationException("育网云客户端尚未就绪。");
@@ -2741,7 +2778,8 @@ internal sealed partial class MainWindow : Window
             await using var output = new FileStream(temporaryPath, FileMode.CreateNew, FileAccess.Write, FileShare.None,
                 128 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan);
             long offset = 0;
-            SetTransferProgress($"正在下载“{item.Name}”…", 0);
+            if (reportProgress) SetTransferProgress($"正在下载“{item.Name}”…", 0);
+            preparationProgress?.Invoke(item.Name, 0, probe.Size);
             while (offset < probe.Size)
             {
                 cancellationToken.ThrowIfCancellationRequested();
@@ -2752,7 +2790,8 @@ internal sealed partial class MainWindow : Window
                     throw new EndOfStreamException($"“{item.Name}”下载提前结束。");
                 await output.WriteAsync(range.Value.Data, cancellationToken);
                 offset += range.Value.Data.Length;
-                SetTransferProgress($"正在下载“{item.Name}”… {FormatSize(offset)} / {FormatSize(probe.Size)}",
+                preparationProgress?.Invoke(item.Name, offset, probe.Size);
+                if (reportProgress) SetTransferProgress($"正在下载“{item.Name}”… {FormatSize(offset)} / {FormatSize(probe.Size)}",
                     probe.Size <= 0 ? 100 : offset * 100d / probe.Size);
             }
             await output.FlushAsync(cancellationToken);
@@ -2802,6 +2841,7 @@ internal sealed partial class MainWindow : Window
     private async Task RunBusyAsync(string initialStatus, Func<Task> action)
     {
         if (_busyNow || _isClosed) return;
+        CancelDragWarmup();
         _busyNow = true;
         if (_infoBar.Severity is InfoBarSeverity.Error or InfoBarSeverity.Warning) _infoBar.IsOpen = false;
         _loading.Visibility = Visibility.Visible;
@@ -2826,6 +2866,7 @@ internal sealed partial class MainWindow : Window
                 _transferProgress.Visibility = Visibility.Collapsed;
                 UpdateCommandStates();
                 UpdateEmptyState(_search.Text?.Trim() ?? "");
+                QueueDragPreparation();
                 if (_pendingCollapsedNode is not null || _pendingSelection is not null) QueueNavigationChange();
             }
         }

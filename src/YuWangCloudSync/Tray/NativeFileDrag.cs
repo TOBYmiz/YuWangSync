@@ -20,17 +20,18 @@ internal sealed partial class FileDropSource(Func<bool> canContinue) : IFileDrop
     public int GiveFeedback(uint effect) => 0x40102;
 }
 
-/// <summary>One UI-thread OLE drag. Its data object contains no paths until preparation succeeds.</summary>
+/// <summary>OLE image/preview resources for one apartment; legacy ready-path helpers also serve regression checks.</summary>
 internal sealed unsafe partial class NativeFileDrag : IDisposable
 {
     private nint _data;
     private nint _helper;
     private nint _preview;
+    private int _previewOffsetX = 16, _previewOffsetY = 20;
     private bool _oleInitialized;
     private const int Width = 300;
     private const int Height = 64;
 
-    internal NativeFileDrag()
+    internal NativeFileDrag(bool preparing = true)
     {
         try
         {
@@ -41,7 +42,7 @@ internal sealed unsafe partial class NativeFileDrag : IDisposable
             var helperClass = new Guid("4657278A-411B-11D2-839A-00C04FD918D0");
             var helperId = new Guid("DE5BF786-477A-11D2-839D-00C04FD918D0");
             Marshal.ThrowExceptionForHR(CoCreateInstance(ref helperClass, 0, 1, ref helperId, out _helper));
-            SetImage(preparing: true);
+            if (preparing) SetImage(preparing: true);
         }
         catch { Dispose(); throw; }
     }
@@ -106,7 +107,7 @@ internal sealed unsafe partial class NativeFileDrag : IDisposable
     {
         if (_preview == 0) return;
         var point = CursorPosition;
-        SetWindowPos(_preview, -1, point.X + 16, point.Y + 20, 0, 0, 0x0011);
+        SetWindowPos(_preview, -1, point.X + _previewOffsetX, point.Y + _previewOffsetY, 0, 0, 0x0011);
     }
 
     internal void HidePreparationImage()

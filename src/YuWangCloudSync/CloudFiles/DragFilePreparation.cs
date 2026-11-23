@@ -6,15 +6,32 @@ using static Vanara.PInvoke.CldApi;
 
 namespace YuWangCloudSync.CloudFiles;
 
+internal sealed record DragPreparationProgress(string Stage, string? FileName = null,
+    long? CompletedBytes = null, long? TotalBytes = null, int CompletedFiles = 0, int TotalFiles = 0,
+    bool IsComplete = false)
+{
+    internal double? Percent => CompletedBytes is { } completed && TotalBytes is { } total
+        ? total > 0 ? Math.Clamp(completed * 100d / total, 0, 100)
+            : TotalFiles > 0 ? CompletedFiles * 100d / TotalFiles : IsComplete ? 100 : 0
+        : null;
+}
+
 /// <summary>Owns the read handles until OLE returns. No work here runs inside DoDragDrop.</summary>
 internal sealed class DragFilePreparation : IDisposable
 {
-    private readonly List<SafeFileHandle> _handles = [];
-    private readonly List<string> _files = [];
+    private sealed class Entry(string path, SafeFileHandle handle, long size)
+    {
+        internal string Path { get; } = path;
+        internal SafeFileHandle Handle { get; } = handle;
+        internal long Size { get; } = size;
+        internal long? ReadyBytes { get; set; }
+    }
+    private readonly List<Entry> _entries = [];
     private const uint IncompleteAttributes = 0x00441000; // OFFLINE / RECALL_ON_OPEN / RECALL_ON_DATA_ACCESS
 
     internal static async Task<DragFilePreparation> CreateAsync(IReadOnlyList<string> paths,
-        Func<bool> backendAvailable, Action<string> progress, CancellationToken cancellationToken)
+        Func<bool> backendAvailable, Action<string> progress, CancellationToken cancellationToken,
+        Action<DragPreparationProgress>? detailedProgress = null)
     {
         // The worker owns all native resources even if cancellation lets the UI return first.
         var worker = Task.Run(() =>
@@ -22,9 +39,13 @@ internal sealed class DragFilePreparation : IDisposable
             var preparation = new DragFilePreparation();
             try
             {
-                foreach (var path in paths) preparation.PrepareEntry(path, backendAvailable, progress, cancellationToken);
+                foreach (var path in paths) preparation.CollectEntry(path, backendAvailable, progress, detailedProgress, cancellationToken);
+                preparation.HydrateEntries(backendAvailable, progress, detailedProgress, cancellationToken);
                 preparation.ValidateReady();
                 cancellationToken.ThrowIfCancellationRequested();
+                detailedProgress?.Invoke(new("文件内容已就绪", CompletedBytes: preparation._entries.Sum(entry => entry.Size),
+                    TotalBytes: preparation._entries.Sum(entry => entry.Size), CompletedFiles: preparation._entries.Count,
+                    TotalFiles: preparation._entries.Count, IsComplete: true));
                 return preparation;
             }
             catch { preparation.Dispose(); throw; }
@@ -42,10 +63,12 @@ internal sealed class DragFilePreparation : IDisposable
         }
     }
 
-    private void PrepareEntry(string path, Func<bool> backendAvailable, Action<string> progress, CancellationToken token)
+    private void CollectEntry(string path, Func<bool> backendAvailable, Action<string> progress,
+        Action<DragPreparationProgress>? detailedProgress, CancellationToken token)
     {
         token.ThrowIfCancellationRequested();
         if (!backendAvailable()) throw new IOException("同步引擎未运行或正在停止，请等待同步连接恢复后再拖放。");
+        detailedProgress?.Invoke(new("正在统计文件", Path.GetFileName(path), TotalFiles: _entries.Count));
         var attributes = File.GetAttributes(path);
         if ((attributes & FileAttributes.Directory) != 0)
         {
@@ -54,11 +77,10 @@ internal sealed class DragFilePreparation : IDisposable
             progress($"正在准备文件夹“{Path.GetFileName(path)}”…");
             // Enumerating an on-demand directory runs on this worker, never on the UI/OLE thread.
             foreach (var child in Directory.EnumerateFileSystemEntries(path))
-                PrepareEntry(child, backendAvailable, progress, token);
+                CollectEntry(child, backendAvailable, progress, detailedProgress, token);
             return;
         }
 
-        progress($"正在准备文件“{Path.GetFileName(path)}”…");
         var handle = CreateFileW(path, 0x80000000, 7, 0, 3, 0x40200000, 0); // READ, OVERLAPPED, OPEN_REPARSE_POINT
         if (handle.IsInvalid)
         {
@@ -68,16 +90,61 @@ internal sealed class DragFilePreparation : IDisposable
         }
         try
         {
-            if (NeedsHydration(handle)) Hydrate(handle, path, token);
-            token.ThrowIfCancellationRequested();
-            if (NeedsHydration(handle)) throw new IOException($"文件“{Path.GetFileName(path)}”仍未完整水化，已取消拖放。");
-            _handles.Add(handle);
-            _files.Add(path);
+            if (!GetFileSizeEx(handle, out var size)) throw new Win32Exception(Marshal.GetLastWin32Error());
+            _entries.Add(new(path, handle, size));
         }
         catch { handle.Dispose(); throw; }
     }
 
-    private static unsafe void Hydrate(SafeFileHandle handle, string path, CancellationToken token)
+    private void HydrateEntries(Func<bool> backendAvailable, Action<string> progress,
+        Action<DragPreparationProgress>? detailedProgress, CancellationToken token)
+    {
+        var totalBytes = _entries.Sum(entry => entry.Size);
+        foreach (var entry in _entries)
+        {
+            token.ThrowIfCancellationRequested();
+            entry.ReadyBytes = NeedsHydration(entry.Handle) ? ReadHydratedBytes(entry) : entry.Size;
+        }
+        var completedFiles = 0;
+        void Report(Entry entry)
+        {
+            // Include already cached bytes, including files that will be processed later.
+            // An unavailable native counter produces indeterminate UI, never a guessed value.
+            long? ready = 0;
+            foreach (var file in _entries) ready += file.ReadyBytes;
+            detailedProgress?.Invoke(new("正在水化文件", Path.GetFileName(entry.Path), ready, totalBytes,
+                completedFiles, _entries.Count));
+        }
+        foreach (var entry in _entries)
+        {
+            token.ThrowIfCancellationRequested();
+            if (!backendAvailable()) throw new IOException("同步引擎已停止，无法继续准备文件。");
+            progress($"正在准备文件“{Path.GetFileName(entry.Path)}”…");
+            Report(entry);
+            if (NeedsHydration(entry.Handle))
+                Hydrate(entry.Handle, entry.Path, token, () =>
+                {
+                    entry.ReadyBytes = ReadHydratedBytes(entry);
+                    Report(entry);
+                });
+            token.ThrowIfCancellationRequested();
+            if (NeedsHydration(entry.Handle)) throw new IOException($"文件“{Path.GetFileName(entry.Path)}”仍未完整水化，已取消拖放。");
+            entry.ReadyBytes = entry.Size;
+            completedFiles++;
+            Report(entry);
+        }
+    }
+
+    private static unsafe long? ReadHydratedBytes(Entry entry)
+    {
+        // CF_PLACEHOLDER_STANDARD_INFO begins with OnDiskDataSize. Allow the full
+        // identity tail (up to 4 KiB); querying metadata never reads/hydrates file data.
+        var buffer = stackalloc byte[8192];
+        var result = GetPlaceholderInfo(entry.Handle, 1 /* STANDARD */, (nint)buffer, 8192, out var returned);
+        return result >= 0 && returned >= sizeof(long) ? Math.Clamp(*(long*)buffer, 0, entry.Size) : null;
+    }
+
+    private static unsafe void Hydrate(SafeFileHandle handle, string path, CancellationToken token, Action reportProgress)
     {
         using var completed = new EventWaitHandle(false, EventResetMode.ManualReset);
         var overlapped = (NativeOverlapped*)NativeMemory.AllocZeroed((nuint)sizeof(NativeOverlapped));
@@ -91,13 +158,31 @@ internal sealed class DragFilePreparation : IDisposable
             {
                 var pointer = (nint)overlapped;
                 using var registration = token.Register(() => CancelIoEx(handle, pointer));
-                // Only this independent worker waits. Cancellation requests native cancellation,
-                // then drains completion before releasing any memory referenced by the kernel.
-                if (!GetOverlappedResult(handle, pointer, out _, true))
+                var drained = false;
+                try
                 {
+                    // Sample persisted bytes while the independent hydration request runs.
+                    // The UI thread and the OLE loop never wait for this operation.
+                    while (!completed.WaitOne(100))
+                    {
+                        token.ThrowIfCancellationRequested();
+                        reportProgress();
+                    }
+                    var success = GetOverlappedResult(handle, pointer, out _, true);
                     var error = Marshal.GetLastWin32Error();
+                    drained = true;
                     token.ThrowIfCancellationRequested();
-                    throw NativeError(path, error);
+                    if (!success) throw NativeError(path, error);
+                }
+                finally
+                {
+                    // A progress callback failure must also drain pending IO before freeing
+                    // OVERLAPPED, its event or the file handle.
+                    if (!drained)
+                    {
+                        CancelIoEx(handle, pointer);
+                        GetOverlappedResult(handle, pointer, out _, true);
+                    }
                 }
             }
             else if (hr.Failed) throw NativeError(path, (int)hr.Code & 0xffff);
@@ -109,9 +194,19 @@ internal sealed class DragFilePreparation : IDisposable
 
     internal void ValidateReady()
     {
-        for (var index = 0; index < _handles.Count; index++)
-            if (NeedsHydration(_handles[index]))
-                throw new IOException($"文件“{Path.GetFileName(_files[index])}”内容尚未就绪，已取消拖放。");
+        foreach (var entry in _entries)
+            if (NeedsHydration(entry.Handle))
+                throw new IOException($"文件“{Path.GetFileName(entry.Path)}”内容尚未就绪，已取消拖放。");
+    }
+
+    // Inspect attributes/tag/size without opening the content or triggering hydration.
+    internal static (long Size, long? ReadyBytes, bool IsReady) ReadMetadata(string path)
+    {
+        using var handle = CreateFileW(path, 0x80 /* FILE_READ_ATTRIBUTES */, 7, 0, 3, 0x00200000, 0);
+        if (handle.IsInvalid) throw NativeError(path, Marshal.GetLastWin32Error());
+        var partial = NeedsHydration(handle);
+        if (!GetFileSizeEx(handle, out var size)) throw new Win32Exception(Marshal.GetLastWin32Error());
+        return (size, partial ? ReadHydratedBytes(new Entry(path, handle, size)) : size, !partial);
     }
 
     private static bool NeedsHydration(SafeFileHandle handle)
@@ -145,9 +240,8 @@ internal sealed class DragFilePreparation : IDisposable
 
     public void Dispose()
     {
-        foreach (var handle in _handles) handle.Dispose();
-        _handles.Clear();
-        _files.Clear();
+        foreach (var entry in _entries) entry.Handle.Dispose();
+        _entries.Clear();
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -156,6 +250,11 @@ internal sealed class DragFilePreparation : IDisposable
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern SafeFileHandle CreateFileW(string path, uint access, uint share, nint security,
         uint disposition, uint flags, nint template);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetFileSizeEx(SafeFileHandle handle, out long size);
+    [DllImport("cldapi.dll", EntryPoint = "CfGetPlaceholderInfo", ExactSpelling = true)]
+    private static extern int GetPlaceholderInfo(SafeFileHandle handle, int infoClass, nint buffer, uint size, out uint returned);
     [DllImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool GetFileInformationByHandleEx(SafeFileHandle handle, int infoClass,

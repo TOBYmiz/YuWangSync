@@ -1,5 +1,6 @@
 ﻿using Microsoft.UI.Xaml.Controls;
 using YuWangCloudSync.CloudFiles;
+using Windows.ApplicationModel.DataTransfer;
 using YuWangCloudSync.Models;
 using YuWangCloudSync.Net;
 
@@ -119,8 +120,67 @@ internal sealed partial class MainWindow
             catch (IOException) { blocked = true; }
             Check("Unavailable drag backend is blocked", blocked, "No copy data is offered when the sync engine is unavailable.");
 
+            var originalBackend = browser._dragBackendAvailable;
+            browser._dragBackendAvailable = static () => true;
+            browser._downloadedPaths[(browser._currentFolder!.Disk.Id, draggedItem.Id)] = path;
+            var manifest = await browser.BuildDragManifestAsync(browser._currentFolder, [draggedItem], CancellationToken.None);
+            browser._dragBackendAvailable = originalBackend;
+            Check("Drag metadata preparation does not hydrate", manifest.Entries.Count == 1
+                && manifest.Entries[0].Name == draggedItem.Name && manifest.Entries[0].Size == new FileInfo(path).Length
+                && !manifest.Entries[0].IsPreparationStarted,
+                "Selection prepares accurate metadata, without starting file extraction or a custom preparation image.");
+            var aggregate = new DragManifest();
+            aggregate.AddFile("缓存文件.bin", 1024, 1024, ready: true);
+            var hydratedProgress = aggregate.AddFile("在线文件.bin", 3072, 0);
+            hydratedProgress(new("正在水化文件", "在线文件.bin", 1024, 3072));
+            Check("Drag progress includes cached files", aggregate.Progress.Latest is
+                { CompletedBytes: 2048, TotalBytes: 4096, Percent: 50, CompletedFiles: 1, TotalFiles: 2 },
+                "Aggregate hydration progress counts already cached bytes and ready files before their streams are requested.");
+            var originalVisual = await browser.CaptureDragItemAsync(draggedRow);
+            Check("Drag keeps original item visual", originalVisual is { Width: > 0, Height: > 0 }
+                && NativeFileDrag.CheckOriginalItemVisual(originalVisual),
+                "The full selected row supplies OLE and metadata previews; repeated creation releases GDI/USER resources.");
+            browser.ShowDragPreparationProgress(new("正在水化文件", "精确进度.txt", 512, 2048, 1, 3));
+            Check("Drag hydration progress UI", browser._transferProgress.Visibility == Microsoft.UI.Xaml.Visibility.Visible
+                && !browser._transferProgress.IsIndeterminate && browser._transferProgress.Value == 25
+                && browser._status.Text.Contains("25.00%")
+                && browser._status.Text.Contains("512 B / 2 KB")
+                && browser._status.Text.Contains("1/3") && browser._status.Text.Contains("精确进度.txt")
+                && browser._status.TextWrapping == Microsoft.UI.Xaml.TextWrapping.Wrap
+                && browser._cancelDragPreparation.Visibility == Microsoft.UI.Xaml.Visibility.Visible,
+                "The status bar shows actual percentage, suitable size units, file count, filename and a cancel button.");
+            if (saveShots) await WinUiUiHost.SaveWindowPngAsync(browser._root, "browser-drag-progress", testRoot);
+            browser.ShowDragPreparationProgress(new("正在水化文件", "大文件.bin", 1610612736, 3221225472));
+            Check("Drag progress uses common units", browser._status.Text.Contains("1.5 GB / 3 GB")
+                && !browser._status.Text.Contains("字节"), "Large file progress uses matching readable units.");
+            using (var cancel = new CancellationTokenSource())
+            {
+                browser._dragCancellation = cancel;
+                browser.CancelActiveDragPreparation();
+                Check("Drag preparation cancel button", cancel.IsCancellationRequested && !browser._cancelDragPreparation.IsEnabled,
+                    "The cancel action stops preparation and prevents repeated requests.");
+                browser._dragCancellation = null;
+                browser._cancelDragPreparation.IsEnabled = true;
+            }
+            browser.ShowDragPreparationProgress(new("正在统计文件", "测试文件夹"));
+            Check("Drag scan progress is indeterminate", browser._transferProgress.IsIndeterminate
+                && !browser._status.Text.Contains('%'), "An unknown total never displays an invented percentage.");
+            var staleProgress = new DragProgressState();
+            browser._dragProgressState = staleProgress;
+            browser.StopDragPreparationProgress(clearStatus: true);
+            staleProgress.Report(new("正在水化文件", "旧任务.txt", 1024, 2048));
+            browser.UpdateDragPreparationProgress();
+            Check("Drag progress cancellation cleanup", browser._transferProgress.Visibility == Microsoft.UI.Xaml.Visibility.Collapsed
+                && !browser._transferProgress.IsIndeterminate && !browser._dragProgressTimer.IsEnabled
+                && browser._status.Text.Length == 0,
+                "Completion and cancellation hide progress; late samples from an old selection cannot change the UI.");
+            if (Environment.GetCommandLineArgs().Contains("--ui-selftest-pointer-drag", StringComparer.OrdinalIgnoreCase))
+                checks.Add(await browser.CheckWinUiPointerDragAsync(draggedRow, path, testRoot));
+            if (browser._isClosed) return checks;
+
             browser._savedState.FavoritesExpanded = true;
             browser.ConstrainFavoritesHeight();
+            browser._root.UpdateLayout();
             var expandedHeight = browser._favoritesRow.Height.Value;
             browser._savedState.FavoritesExpanded = false;
             browser.ConstrainFavoritesHeight(animate: true);
@@ -138,7 +198,7 @@ internal sealed partial class MainWindow
             if (saveShots) await WinUiUiHost.SaveWindowPngAsync(browser._root, "browser-favorites-expanded", testRoot);
         }
         catch (Exception error) { Check("Browser interaction self-test", false, error.ToString()); }
-        finally { browser.Close(); }
+        finally { if (!browser._isClosed) browser.Close(); }
         return checks;
     }
 }

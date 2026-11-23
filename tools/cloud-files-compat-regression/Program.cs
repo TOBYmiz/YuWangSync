@@ -12,6 +12,11 @@ using static Vanara.PInvoke.CldApi;
 
 try
 {
+    if (args.Length == 2 && args[0] == "--virtual-file-client")
+    {
+        VirtualFileDragSelfTest.RunExternalClient(args[1]);
+        return;
+    }
     CloudFilesPlatform.EnsureSupported();
     if (args.Contains("--search-progress"))
     {
@@ -190,6 +195,8 @@ try
     var requestCount = 0;
     var rejectHydration = false;
     var hydrationDelayMilliseconds = 0;
+    var hydrationChunkBytes = 0;
+    var hydrationChunkDelayMilliseconds = 0;
     using var hydrationStarted = new ManualResetEventSlim(false);
     using var hydrationFinished = new ManualResetEventSlim(false);
     var registered = false;
@@ -209,14 +216,21 @@ try
             var offset = checked((int)request.RequiredFileOffset);
             var length = checked((int)Math.Min(request.RequiredLength, payload.Length - offset));
             buffer = Marshal.AllocHGlobal(length);
-            Marshal.Copy(payload, offset, buffer, length);
             var operation = CloudFilesInterop.CreateOperationInfo(info, CF_OPERATION_TYPE.CF_OPERATION_TYPE_TRANSFER_DATA);
-            var transfer = CloudFilesInterop.CreateOperationParameters(new CF_OPERATION_PARAMETERS.TRANSFERDATA
+            for (var sent = 0; sent < length;)
             {
-                Buffer = buffer, Offset = offset, Length = length,
-                CompletionStatus = rejectHydration ? NTStatus.STATUS_ACCESS_DENIED : NTStatus.STATUS_SUCCESS
-            });
-            RequireSuccess(CfExecute(operation, ref transfer), "native hydration receipt");
+                var chunk = Math.Min(hydrationChunkBytes > 0 ? hydrationChunkBytes : length, length - sent);
+                Marshal.Copy(payload, offset + sent, buffer, chunk);
+                var transfer = CloudFilesInterop.CreateOperationParameters(new CF_OPERATION_PARAMETERS.TRANSFERDATA
+                {
+                    Buffer = buffer, Offset = offset + sent, Length = chunk,
+                    CompletionStatus = rejectHydration ? NTStatus.STATUS_ACCESS_DENIED : NTStatus.STATUS_SUCCESS
+                });
+                RequireSuccess(CfExecute(operation, ref transfer), "native hydration receipt");
+                sent += chunk;
+                if (rejectHydration) break;
+                if (sent < length && hydrationChunkDelayMilliseconds > 0) Thread.Sleep(hydrationChunkDelayMilliseconds);
+            }
         }
         catch (Exception error) { errors.Enqueue(error); }
         finally
@@ -279,8 +293,17 @@ try
             try { using var prepared = DragFilePreparation.CreateAsync([path], () => false, _ => { }, CancellationToken.None).GetAwaiter().GetResult(); }
             catch (IOException) { blocked = true; }
             Check(blocked && requestCount == 0, "unavailable backend is rejected before hydration");
+            var metadataOnly = DragFilePreparation.ReadMetadata(path);
+            Check(metadataOnly.Size == payload.Length && !metadataOnly.IsReady && requestCount == 0,
+                "descriptor metadata inspects placeholder size and cached bytes without hydration");
+            hydrationChunkBytes = 32 * 1024;
+            hydrationChunkDelayMilliseconds = 180;
+            var byteProgress = new ConcurrentQueue<DragPreparationProgress>();
+            VirtualFileDragSelfTest.Run(path, payload, Check,
+                token => DragFilePreparation.CreateAsync([path], () => true, Console.WriteLine, token, byteProgress.Enqueue));
             using (var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15)))
-            using (var prepared = DragFilePreparation.CreateAsync([path], () => true, Console.WriteLine, timeout.Token).GetAwaiter().GetResult())
+            using (var prepared = DragFilePreparation.CreateAsync([path], () => true, Console.WriteLine, timeout.Token,
+                byteProgress.Enqueue).GetAwaiter().GetResult())
             {
                 prepared.ValidateReady();
                 Check(File.ReadAllBytes(path).AsSpan().SequenceEqual(payload) && requestCount > 0,
@@ -298,6 +321,13 @@ try
                 if (nativeFailure is not null) throw nativeFailure;
                 Check(nativePassed, "native Shell CF_HDROP / IDropSource ABI, image transition and GDI/USER resource cleanup");
             }
+            hydrationChunkBytes = hydrationChunkDelayMilliseconds = 0;
+            var byteSamples = byteProgress.ToArray();
+            Check(byteSamples.Any(sample => sample.CompletedBytes > 0 && sample.CompletedBytes < payload.Length
+                    && sample.TotalBytes == payload.Length && sample.Percent > 0 && sample.Percent < 100)
+                && byteSamples.Last() is { IsComplete: true, CompletedFiles: 1, TotalFiles: 1, Percent: 100 }
+                && byteSamples.Last().CompletedBytes == payload.Length,
+                "real chunked hydration reports intermediate persisted byte counts and exact final totals");
             var requestsBeforeReuse = requestCount;
             using (var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15)))
             using (var reused = DragFilePreparation.CreateAsync([path], () => true, _ => { }, timeout.Token).GetAwaiter().GetResult())
@@ -306,6 +336,21 @@ try
                 Check(requestCount == requestsBeforeReuse && File.ReadAllBytes(path).AsSpan().SequenceEqual(payload),
                     "reusing an opened or previously dragged hydrated file does not fetch data again");
             }
+            var progressFolder = Path.Combine(root, "progress-files");
+            Directory.CreateDirectory(progressFolder);
+            File.WriteAllBytes(Path.Combine(progressFolder, "cached.bin"), new byte[4097]);
+            File.WriteAllBytes(Path.Combine(progressFolder, "empty.bin"), []);
+            var mixedProgress = new List<DragPreparationProgress>();
+            using (var mixed = DragFilePreparation.CreateAsync([path, progressFolder], () => true, _ => { },
+                CancellationToken.None, mixedProgress.Add).GetAwaiter().GetResult())
+            {
+                var final = mixedProgress.Last();
+                Check(final.IsComplete && final.TotalFiles == 3 && final.CompletedFiles == 3 && final.Percent == 100
+                    && final.CompletedBytes == payload.Length + 4097 && final.TotalBytes == payload.Length + 4097
+                    && requestCount == requestsBeforeReuse,
+                    "mixed folders, cached files and zero-byte files use exact aggregate totals without refetching");
+            }
+            Directory.Delete(progressFolder, true);
             using (var cancelled = new CancellationTokenSource())
             {
                 cancelled.Cancel();

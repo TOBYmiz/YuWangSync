@@ -18,6 +18,8 @@
     <Compile Include="../../src/YuWangCloudSync/CloudFiles/SyncRootSearchIndex.cs" Link="SyncRootSearchIndex.cs" />
     <Compile Include="../../src/YuWangCloudSync/CloudFiles/DragFilePreparation.cs" Link="DragFilePreparation.cs" />
     <Compile Include="../../src/YuWangCloudSync/CloudFiles/AccountSwitchCleanup.cs" Link="AccountSwitchCleanup.cs" />
+    <Compile Include="../../src/YuWangCloudSync/Tray/VirtualFileDataObject.SelfTest.cs" Link="VirtualFileDataObject.SelfTest.cs" />
+    <Compile Include="../../src/YuWangCloudSync/Tray/VirtualFileDataObject.cs" Link="VirtualFileDataObject.cs" />
     <Compile Include="../../src/YuWangCloudSync/Tray/NativeFileDrag.cs" Link="NativeFileDrag.cs" />
     <Compile Include="../../src/YuWangCloudSync/Tray/NativeFileDrag.SelfTest.cs" Link="NativeFileDrag.SelfTest.cs" />
   </ItemGroup>

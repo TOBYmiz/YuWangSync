@@ -517,6 +517,12 @@ internal static class WinUiUiHost
         Check("Temporary config isolation", temporaryConfigIsolated,
             $"Config={configPath}; fake SyncRoot was not created.");
 
+        if (Environment.GetCommandLineArgs().Contains("--ui-selftest-browser-only", StringComparer.OrdinalIgnoreCase))
+        {
+            checks.AddRange(await MainWindow.CheckBrowserInteractionsAsync(Program.SnapshotConfig(), testRoot, saveShots));
+            return checks;
+        }
+
         // A self-test must never remove the installed provider's icon with the same GUID.
         TrayHost.Start(showUi: true, showTrayUpdateHint: Program.SnapshotConfig().TrayUpdateHintEnabled,
             trayIdOverride: Guid.NewGuid());
