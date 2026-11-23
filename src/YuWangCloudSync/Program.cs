@@ -543,9 +543,9 @@ internal static class Program
 
         var rootToUse = staleRoots[0];
         var prompt = new StringBuilder()
-            .Append($"有残留的同步目录注册（{rootToUse.Path}），是否清空其中文件并使用？选择“取消”将清理残留并选择新目录。");
+            .Append($"发现上次安装留下的同步目录：{rootToUse.Path}\n\n确定：清空并继续使用\n取消：移除并选择新目录");
         if (staleRoots.Length > 1)
-            prompt.AppendLine().Append($"另有 {staleRoots.Length - 1} 个本产品注册目录将一并注销。");
+            prompt.AppendLine().Append($"另有 {staleRoots.Length - 1} 个旧同步目录将一并移除。");
 
         var choice = MessageBoxW(IntPtr.Zero, prompt.ToString(),
             $"{ProductIdentity.DisplayNameZh}安装程序", MessageBoxOkCancel | MessageBoxIconWarning
@@ -565,7 +565,7 @@ internal static class Program
         {
             Log.Warning("残留 shell 注册对应的目录已不再由本程序持有，改为清理注册并选择新目录：{Path}", rootToUse.Path);
             MessageBoxW(IntPtr.Zero,
-                "该目录已不再由本程序注册。为保护其中现有内容，安装程序将清理本程序的残留注册，请选择新目录。",
+                "该目录已不属于本程序，为保护其中的文件，请选择新目录。",
                 $"{ProductIdentity.DisplayNameZh}安装程序", MessageBoxOk | MessageBoxIconInformation
                     | MessageBoxSetForeground | MessageBoxTopMost);
             clearAndUse = false;
@@ -768,12 +768,12 @@ internal static class Program
             }
             await RunAsync(args);
             if (_accountSwitchRestart && !_accountSwitchConnected)
-                await WinUiUiHost.FinishAccountSwitchAsync("新账户未能建立同步连接，请检查网络、登录状态和同步目录权限后重新启动应用。");
+                await WinUiUiHost.FinishAccountSwitchAsync("新账户连接失败，请检查网络后重启应用。");
         }
         catch (OperationCanceledException) when (_cts.IsCancellationRequested)
         {
             if (_accountSwitchRestart && !_accountSwitchConnected)
-                await WinUiUiHost.FinishAccountSwitchAsync("新账户登录已取消，账户切换未完成。");
+                await WinUiUiHost.FinishAccountSwitchAsync("已取消登录，账户未切换。");
             TrayHost.Shutdown();
             _client?.Dispose();
             _cache?.Dispose();
@@ -941,7 +941,7 @@ internal static class Program
         if (_accountSwitchRestart)
         {
             WinUiUiHost.BeginAccountSwitch(_ctx.Username);
-            WinUiUiHost.ReportAccountSwitch("正在加载新账户配置与会话…", 60);
+            WinUiUiHost.ReportAccountSwitch("正在加载新账户…", 60);
         }
         if (!_quiet)
         {
@@ -1015,7 +1015,7 @@ internal static class Program
         }
         Log.Information("正在登录育网云 {Server}", _ctx.Server);
         if (_accountSwitchRestart) WinUiUiHost.ReportAccountSwitch("正在登录新账户…", 65,
-            "优先复用已保存的账户会话；如需验证码，将显示输入窗口。");
+            "如需验证码，将弹出输入窗口。");
 
         var ok = false;
         var sid = Net.YuWangClient.LoadSessionFrom(cookiesPath);
@@ -1092,7 +1092,7 @@ internal static class Program
         _cts.Token.ThrowIfCancellationRequested();
         _client.SaveSessionTo(cookiesPath);
         Log.Information("登录成功");
-        if (_accountSwitchRestart) WinUiUiHost.ReportAccountSwitch("正在建立新账户的同步目录…", 80);
+        if (_accountSwitchRestart) WinUiUiHost.ReportAccountSwitch("正在创建同步目录…", 80);
 
         // 5. 创建 SyncRoot 目录
         Directory.CreateDirectory(_ctx.SyncRootPath);
@@ -1239,17 +1239,15 @@ internal static class Program
                 // "删除占位目录失败"）。直接告警退出，让用户先结束另一实例。
                 if ((uint)tryHr.Code == 0x17Au)
                 {
-                    ReportStartupFailure($"SyncRoot 已被另一个 {ProductIdentity.DisplayNameZh} 实例连接（0x17A）。"
-                                         + "请检查托盘或任务管理器中的已有实例；本次启动已取消，未清理占位。");
+                    ReportStartupFailure($"同步目录已被另一个 {ProductIdentity.DisplayNameZh} 实例占用（0x17A），请先退出该实例。");
                     return;
                 }
 
                 if (syncRootHasContent || syncRootIsRegisteredToUs)
                 {
                     ReportStartupFailure(
-                        $"检测到已有 SyncRoot 内容或注册，但连接连续失败（0x{tryHr.Code:X}，{tryHr}）。\r\n"
-                        + "为保护已有占位和已下载文件，本次启动已停止，未反注册、清空或重注册。\r\n"
-                        + "请稍后重试并检查 Windows Cloud Files 服务状态。\r\n"
+                        $"无法连接同步目录（0x{tryHr.Code:X}，{tryHr}）。\r\n"
+                        + "为保护已下载的文件，启动已停止，同步目录未做任何改动。请稍后重试。\r\n"
                         + DescribeStartupSecurityContext());
                     _callbackTable = null;
                     return;
@@ -1286,7 +1284,7 @@ internal static class Program
             }
             catch (Exception ex)
             {
-                ReportStartupFailure("SyncRoot 注册失败；启动已停止，未继续创建占位。", ex);
+                ReportStartupFailure("同步目录注册失败，启动已停止。", ex);
                 return;
             }
 
@@ -1336,7 +1334,7 @@ internal static class Program
         if (_accountSwitchRestart)
         {
             _accountSwitchConnected = true;
-            WinUiUiHost.ReportAccountSwitch("正在启用新账户的同步服务…", 95);
+            WinUiUiHost.ReportAccountSwitch("正在启动同步…", 95);
         }
 
         // 8b. 监视 Explorer 固定/释放意图，并启动目录时间修正线程。
@@ -1412,16 +1410,16 @@ internal static class Program
             Callbacks.SuppressDeleteRecovery = true;
             try
             {
-                WinUiUiHost.ReportAccountSwitch("正在结束旧账户的后台任务…", 5);
+                WinUiUiHost.ReportAccountSwitch("正在停止当前账户…", 5);
                 await _preFetchGate.WaitAsync();
                 _preFetchGate.Release();
-                WinUiUiHost.ReportAccountSwitch("正在清理旧账户的同步目录…", null, "已清理 0 项");
+                WinUiUiHost.ReportAccountSwitch("正在清理同步目录…", null, "已清理 0 项");
                 var reportedAt = Stopwatch.GetTimestamp();
                 var cleanup = AccountSwitchCleanup.Run(_ctx.SyncRootPath, (deleted, failed) =>
                 {
                     if (Stopwatch.GetElapsedTime(reportedAt).TotalMilliseconds < 100) return;
                     reportedAt = Stopwatch.GetTimestamp();
-                    WinUiUiHost.ReportAccountSwitch("正在清理旧账户的同步目录…", null,
+                    WinUiUiHost.ReportAccountSwitch("正在清理同步目录…", null,
                         $"已清理 {deleted:N0} 项，失败 {failed:N0} 项");
                 }, message => Log.Debug("{Message}", message));
                 if (cleanup.Failed == 0)
@@ -1436,7 +1434,7 @@ internal static class Program
                 else
                 {
                     Log.Error("账户切换清理失败 {Failures} 项；没有写入新账户配置，也不会自动重启", cleanup.Failed);
-                    await WinUiUiHost.FinishAccountSwitchAsync($"有 {cleanup.Failed:N0} 项未能清理，已停止切换并保留旧账户配置。\n"
+                    await WinUiUiHost.FinishAccountSwitchAsync($"有 {cleanup.Failed:N0} 项未能清理，已取消切换。\n"
                         + string.Join("\n", cleanup.Errors));
                 }
             }
@@ -1444,7 +1442,7 @@ internal static class Program
             {
                 Log.Error(ex, "账户切换清理或新账户配置保存失败；没有自动重启");
                 _restartAfterAccountSwitch = false;
-                await WinUiUiHost.FinishAccountSwitchAsync($"未能完成账户切换：{ex.Message}。请重新启动应用后重试。");
+                await WinUiUiHost.FinishAccountSwitchAsync($"切换账户失败：{ex.Message}。请重启应用后重试。");
             }
         }
         else if (_ctx.PersistSyncRoot)
@@ -1460,7 +1458,7 @@ internal static class Program
         // 11c. 断开回调通道
         if (_cloudFilesConnected)
         {
-            if (_pendingAccountSwitch is not null) WinUiUiHost.ReportAccountSwitch("正在断开旧账户的同步连接…", 50);
+            if (_pendingAccountSwitch is not null) WinUiUiHost.ReportAccountSwitch("正在断开当前账户…", 50);
             _cloudFilesConnected = false;
             Log.Information("正在断开 SyncRoot...");
             try
@@ -1515,7 +1513,7 @@ internal static class Program
             catch (Exception error)
             {
                 Log.Error(error, "启动新账户进程失败");
-                await WinUiUiHost.FinishAccountSwitchAsync($"新账户配置已保存，但启动失败：{error.Message}。请手动重新启动应用。");
+                await WinUiUiHost.FinishAccountSwitchAsync($"新账户已保存，但启动失败：{error.Message}。请手动重启应用。");
             }
         }
 
@@ -2900,7 +2898,7 @@ internal static class Program
     internal static async Task<(bool ok, string message)> ApplySettingsAsync(SyncRootContext edit)
     {
         if (System.Threading.Interlocked.Exchange(ref _settingsBusy, 1) == 1)
-            return (false, "上一次设置尚未应用完成，请稍候再试。");
+            return (false, "正在应用上一次设置，请稍后再试。");
 
         var msgs = new List<string>();
         var applied = true;
@@ -2923,7 +2921,7 @@ internal static class Program
 
             // 2) 立即生效项
             ApplyHotConfig();
-            msgs.Add("缓存/刷新/填充策略已生效");
+            msgs.Add("刷新设置已生效");
 
             // 3) 先落盘
             SaveConfig();
@@ -2959,20 +2957,20 @@ internal static class Program
                                 _ctx.EnableExplorerNavigationEntry, "新路径探测失败后应用设置时", out navigationError);
                         }
                         SaveConfig();
-                        var message = $"新位置不可用，已保留原挂载点（{oldPath}）：{probe.Describe()}";
+                        var message = $"新位置不可用，仍使用原目录（{oldPath}）：{probe.Describe()}";
                         if (!probeNavigationEntryApplied)
-                            message += $"；Explorer 导航栏入口更新失败（{navigationError}），Cloud Files 同步继续运行，后续会重试";
+                            message += $"；导航栏入口更新失败（{navigationError}），稍后将重试";
                         return (false, message);
                     }
                 }
 
                 _ctx.SyncRootPath = newPath;
                 var navigationEntryApplied = await SwitchSyncRootAsync(oldPath, oldProviderName).ConfigureAwait(false);
-                msgs.Add(pathChanged ? $"挂载目录已切换：{oldPath} → {newPath}" : "已按新 Provider 显示名重建 SyncRoot");
+                msgs.Add(pathChanged ? $"同步目录已切换：{oldPath} → {newPath}" : "显示名称已更新");
                 if (!navigationEntryApplied)
                 {
                     applied = false;
-                    msgs.Add("Explorer 导航栏入口更新失败；Cloud Files 同步已切换，入口会在下次启动或设置应用时重试");
+                    msgs.Add("导航栏入口更新失败，将在下次启动时重试");
                 }
             }
             else if (containerChanged)
@@ -2983,12 +2981,12 @@ internal static class Program
                     _cache?.ResetListingCache();
                     _cache?.ClearFolderLocalPaths();
                     await RefreshDiskTreeAndReconcileAsync().ConfigureAwait(false);
-                    msgs.Add("顶层占位已按新磁盘树入口重建");
+                    msgs.Add("已按新 TypeId 重建目录");
                 }
                 catch (Exception ex)
                 {
                     Log.Error(ex, "[SETTINGS] 顶层占位重建失败");
-                    msgs.Add("顶层占位重建失败（详见日志）");
+                    msgs.Add("目录重建失败（详见日志）");
                     applied = false;
                 }
             }
@@ -2999,13 +2997,13 @@ internal static class Program
                         _ctx.EnableExplorerNavigationEntry, "应用设置时", out var navigationError))
                 {
                     msgs.Add(_ctx.EnableExplorerNavigationEntry
-                        ? "已显示 Explorer 导航栏入口"
-                        : "已隐藏 Explorer 导航栏入口；Cloud Files 同步继续运行");
+                        ? "已显示导航栏入口"
+                        : "已隐藏导航栏入口");
                 }
                 else
                 {
                     applied = false;
-                    msgs.Add($"Explorer 导航栏入口更新失败（{navigationError}）；Cloud Files 同步继续运行，后续会重试");
+                    msgs.Add($"导航栏入口更新失败（{navigationError}），稍后将重试");
                 }
             }
 
@@ -3017,7 +3015,7 @@ internal static class Program
             Log.Error(ex, "[SETTINGS] 应用设置失败，尝试回滚到旧挂载点");
             try { await RestoreSyncRootAsync(oldPath, oldProviderName).ConfigureAwait(false); }
             catch { /* 回滚自身失败已在其内部记录 */ }
-            return (false, $"应用失败：{ex.Message}（已尝试回滚到 {oldPath}，详见日志）");
+            return (false, $"应用失败：{ex.Message}（已尝试恢复原目录 {oldPath}，详见日志）");
         }
         finally
         {
@@ -3072,7 +3070,7 @@ internal static class Program
         CloudFiles.Callbacks.ReleasePlaceholderArrays();
 
         if (cleanupFailures != 0)
-            throw new IOException("旧同步目录未能完全清理，已取消切换以保留用户文件访问。");
+            throw new IOException("旧同步目录未能清理干净，已取消切换。");
 
         // 5. 反注册旧路径
         try

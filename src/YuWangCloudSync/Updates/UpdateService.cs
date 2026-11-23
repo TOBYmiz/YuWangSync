@@ -516,7 +516,7 @@ internal static class UpdateService
 
                 UpdateTemporaryFiles.TryDeleteTransactionDirectory(transactionDirectory);
                 var error = installer.ExitCode == 0
-                    ? "安装器已退出，但当前程序仍在运行。请从托盘重新启动更新。"
+                    ? "更新未完成，请从托盘菜单重试。"
                     : $"安装器退出代码：{installer.ExitCode}。";
                 Log.Warning("快速更新安装器在旧程序仍运行时退出：{ExitCode}", installer.ExitCode);
                 Publish(CurrentState with

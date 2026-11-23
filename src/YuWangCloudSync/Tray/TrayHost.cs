@@ -261,7 +261,7 @@ internal static class TrayHost
     private static void BuildTrayIcon()
     {
         var menu = new PopupMenu();
-        _mainWindowMenuItem = new PopupMenuItem("开启主界面", (_, _) => OpenMainWindow())
+        _mainWindowMenuItem = new PopupMenuItem("打开主界面", (_, _) => OpenMainWindow())
         {
             Enabled = Volatile.Read(ref _mainWindowEnabled),
         };
@@ -638,7 +638,7 @@ internal static class TrayHost
                 var result = PlaceholderUpdater.DehydrateTree(Program.SyncRootPath,
                     message => Log.Information("{Message}", message));
                 var megabytes = result.FreedBytes / 1024.0 / 1024.0;
-                Notify("缓存清理完成", $"还原 {result.Dehydrated} 个文件，跳过 {result.Skipped} 个，释放 {megabytes:F1} MB");
+                Notify("缓存清理完成", $"已释放 {megabytes:F1} MB（清理 {result.Dehydrated} 个文件，跳过 {result.Skipped} 个）");
             }
             catch (Exception ex)
             {
@@ -664,7 +664,7 @@ internal static class TrayHost
         catch (Exception ex)
         {
             Log.Error(ex, "打开设置窗口失败");
-            Notify("设置打开失败", ex.Message);
+            Notify("无法打开设置", ex.Message);
         }
     }
 

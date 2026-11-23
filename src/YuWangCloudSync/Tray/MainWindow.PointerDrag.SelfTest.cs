@@ -11,20 +11,22 @@ internal sealed partial class MainWindow
 {
     // Opt-in desktop integration test. Move a real mouse pointer from this isolated
     // browser into a second test window and verify the receiving application can copy.
-    private async Task<UiSelfTestCheck> CheckWinUiPointerDragAsync(ListViewItem source, string path, string testRoot)
+    private async Task<UiSelfTestCheck> CheckWinUiPointerDragAsync(ListViewItem source, string path, string testRoot,
+        bool cancel = false, bool repeat = false)
     {
-        var target = new Window { Title = "YuWang drag regression target" };
-        var surface = new Grid { AllowDrop = false, Background = new Microsoft.UI.Xaml.Media.SolidColorBrush(Microsoft.UI.Colors.LightGray) };
-        surface.Children.Add(new TextBlock { Text = "拖放回归接收窗口", Margin = new Thickness(24) });
-        target.Content = surface;
+        nint target = 0;
         var dropped = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
         var overCount = 0;
         var firstX = double.NaN;
         var lastX = double.NaN;
         var coordinates = "";
-        var tracePath = Path.Combine(testRoot, "pointer-drag-trace.txt");
+        var suffix = cancel ? "-cancel" : repeat ? "-repeat" : "";
+        var tracePath = Path.Combine(testRoot, $"pointer-drag{suffix}-trace.txt");
+        var copiedPath = Path.Combine(testRoot, $"pointer-drag{suffix}-copied.txt");
         var pointerRoot = (UIElement)Content;
-        void Trace(string message) => File.AppendAllText(tracePath, $"{DateTimeOffset.Now:O} {message}{Environment.NewLine}");
+        var traceGate = new object();
+        void Trace(string message)
+        { lock (traceGate) File.AppendAllText(tracePath, $"{DateTimeOffset.Now:O} {message}{Environment.NewLine}"); }
         var presses = 0;
         var moves = 0;
         var rootPresses = 0;
@@ -59,19 +61,20 @@ internal sealed partial class MainWindow
         {
             var savedCursor = NativeFileDrag.CursorPosition;
             AppWindow.MoveAndResize(new RectInt32(30, 60, 900, 650));
-            WinUiUiHost.ConfigureWindow(target, 400, 320, resizable: false);
             // AppWindow sizes are physical pixels; the browser enforces a DIP minimum.
             // Place the receiver after that *actual* width so high DPI cannot hide it.
-            target.AppWindow.MoveAndResize(new RectInt32(AppWindow.Position.X + AppWindow.Size.Width + 30,
-                160, 800, 640));
-            target.Activate();
+            var targetX = AppWindow.Position.X + AppWindow.Size.Width + 30;
+            // Use a native window so WinUI's child InputSite drop target cannot intercept the receiver.
+            target = PointerTestCreateWindow(0, "STATIC", "拖放回归接收窗口", 0x10cf0000,
+                targetX, 160, 800, 640, 0, 0, 0, 0);
+            if (target == 0) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
             var receiver = new NativeVirtualFileReceiver(x =>
             {
                 if (double.IsNaN(firstX)) firstX = x;
                 lastX = x; overCount++;
             }, data =>
             {
-                var extraction = VirtualFileDragSelfTest.ReceiveAsync(data, Path.GetFileName(path), Path.Combine(testRoot, "pointer-drag-copied.txt"));
+                var extraction = VirtualFileDragSelfTest.ReceiveAsync(data, Path.GetFileName(path), copiedPath);
                 _ = extraction.ContinueWith(task =>
                 {
                     if (task.IsCompletedSuccessfully) dropped.TrySetResult(task.Result);
@@ -80,7 +83,7 @@ internal sealed partial class MainWindow
                 }, TaskScheduler.Default);
                 return extraction;
             });
-            receiverRegistration = NativeVirtualFileReceiver.Register(WindowNative.GetWindowHandle(target), receiver);
+            receiverRegistration = NativeVirtualFileReceiver.Register(target, receiver);
             Activate();
             var window = WindowNative.GetWindowHandle(this);
             PointerTestShowWindow(window, 9);
@@ -125,8 +128,8 @@ internal sealed partial class MainWindow
             var scale = PointerTestGetDpiForWindow(window) / 96d;
             var startX = origin.X + (int)(point.X * scale);
             var startY = origin.Y + (int)(point.Y * scale);
-            var endX = target.AppWindow.Position.X + target.AppWindow.Size.Width * 3 / 4;
-            var endY = target.AppWindow.Position.Y + target.AppWindow.Size.Height / 2;
+            var endX = targetX + 600;
+            var endY = 480;
             coordinates = $"Source=({startX},{startY}); target=({endX},{endY}); browser width={AppWindow.Size.Width}; DPI={scale * 96}; hwnd={window:X}; hits={hits}";
             if (!externalInput) input = Task.Run(async () =>
             {
@@ -146,6 +149,13 @@ internal sealed partial class MainWindow
                         await Task.Delay(25);
                     }
                     await Task.Delay(180);
+                    if (cancel)
+                    {
+                        PointerTestKeyboardEvent(27, 0, 0, 0);
+                        await Task.Delay(80);
+                        PointerTestKeyboardEvent(27, 0, 2, 0);
+                        await Task.Delay(120);
+                    }
                     PointerTestMouseEvent(4); // left up
                     await Task.Delay(600);
                     if (!dropped.Task.IsCompleted)
@@ -161,8 +171,19 @@ internal sealed partial class MainWindow
                 }
             });
             if (input is not null) await input;
+            if (cancel)
+            {
+                var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(5);
+                while (_outboundDragActive && DateTime.UtcNow < deadline) await Task.Delay(25);
+                return new UiSelfTestCheck("Pointer drag cancellation releases OLE", !_outboundDragActive
+                    && !dropped.Task.IsCompleted && !File.Exists(copiedPath) && overCount >= 2
+                    && _status.Text == "已取消拖放", $"Target events={overCount}; active={_outboundDragActive}; status={_status.Text}; no content extracted.");
+            }
             var text = await dropped.Task.WaitAsync(TimeSpan.FromSeconds(externalInput ? 300 : 5));
-            return new UiSelfTestCheck("Pointer to virtual-file OLE real copy", text == await File.ReadAllTextAsync(path)
+            var finished = DateTime.UtcNow + TimeSpan.FromSeconds(5);
+            while (_outboundDragActive && DateTime.UtcNow < finished) await Task.Delay(25);
+            return new UiSelfTestCheck(repeat ? "Pointer drag repeats after copy" : "Pointer to virtual-file OLE real copy", text == await File.ReadAllTextAsync(path)
+                && !_outboundDragActive
                 && overCount >= 2 && Math.Abs(lastX - firstX) > 10,
                 $"Target drag-over events={overCount}; X={firstX:F1} → {lastX:F1}; copied complete file contents.");
         }
@@ -185,11 +206,16 @@ internal sealed partial class MainWindow
             pointerRoot.RemoveHandler(UIElement.PointerMovedEvent, rootMoved);
             CancelDragWarmup();
             receiverRegistration?.Dispose();
-            target.Close();
+            if (target != 0) PointerTestDestroyWindow(target);
         }
     }
 
     [StructLayout(LayoutKind.Sequential)] private struct PointerTestPoint { internal int X, Y; }
+    [DllImport("user32.dll", EntryPoint = "CreateWindowExW", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern nint PointerTestCreateWindow(uint extendedStyle, string className, string title, uint style,
+        int x, int y, int width, int height, nint parent, nint menu, nint instance, nint parameter);
+    [DllImport("user32.dll", EntryPoint = "DestroyWindow")]
+    [return: MarshalAs(UnmanagedType.Bool)] private static extern bool PointerTestDestroyWindow(nint window);
     [DllImport("user32.dll", EntryPoint = "ClientToScreen")]
     [return: MarshalAs(UnmanagedType.Bool)] private static extern bool PointerTestClientToScreen(nint window, ref PointerTestPoint point);
     [DllImport("user32.dll", EntryPoint = "GetDpiForWindow")] private static extern uint PointerTestGetDpiForWindow(nint window);

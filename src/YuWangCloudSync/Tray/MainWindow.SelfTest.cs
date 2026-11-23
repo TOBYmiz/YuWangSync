@@ -132,7 +132,7 @@ internal sealed partial class MainWindow
             var aggregate = new DragManifest();
             aggregate.AddFile("缓存文件.bin", 1024, 1024, ready: true);
             var hydratedProgress = aggregate.AddFile("在线文件.bin", 3072, 0);
-            hydratedProgress(new("正在水化文件", "在线文件.bin", 1024, 3072));
+            hydratedProgress(new("正在下载文件", "在线文件.bin", 1024, 3072));
             Check("Drag progress includes cached files", aggregate.Progress.Latest is
                 { CompletedBytes: 2048, TotalBytes: 4096, Percent: 50, CompletedFiles: 1, TotalFiles: 2 },
                 "Aggregate hydration progress counts already cached bytes and ready files before their streams are requested.");
@@ -140,17 +140,26 @@ internal sealed partial class MainWindow
             Check("Drag keeps original item visual", originalVisual is { Width: > 0, Height: > 0 }
                 && NativeFileDrag.CheckOriginalItemVisual(originalVisual),
                 "The full selected row supplies OLE and metadata previews; repeated creation releases GDI/USER resources.");
-            browser.ShowDragPreparationProgress(new("正在水化文件", "精确进度.txt", 512, 2048, 1, 3));
+            browser.ShowDragPreparationProgress(new("正在下载文件", "精确进度.txt", 512, 2048, 1, 3));
             Check("Drag hydration progress UI", browser._transferProgress.Visibility == Microsoft.UI.Xaml.Visibility.Visible
                 && !browser._transferProgress.IsIndeterminate && browser._transferProgress.Value == 25
                 && browser._status.Text.Contains("25.00%")
                 && browser._status.Text.Contains("512 B / 2 KB")
                 && browser._status.Text.Contains("1/3") && browser._status.Text.Contains("精确进度.txt")
-                && browser._status.TextWrapping == Microsoft.UI.Xaml.TextWrapping.Wrap
+                && browser._status.TextWrapping == Microsoft.UI.Xaml.TextWrapping.NoWrap
                 && browser._cancelDragPreparation.Visibility == Microsoft.UI.Xaml.Visibility.Visible,
                 "The status bar shows actual percentage, suitable size units, file count, filename and a cancel button.");
+            browser._root.UpdateLayout();
+            var statusBarHeight = ((Microsoft.UI.Xaml.FrameworkElement)browser._status.Parent).ActualHeight;
+            browser.ShowDragPreparationProgress(new("正在下载文件",
+                "一个非常非常非常非常非常非常非常非常非常非常长的文件名称用于测试截断效果.docx", 512, 2048, 1, 3));
+            browser._root.UpdateLayout();
+            Check("Drag progress keeps status bar height",
+                Math.Abs(((Microsoft.UI.Xaml.FrameworkElement)browser._status.Parent).ActualHeight - statusBarHeight) < 0.5
+                && browser._status.Text.Contains('…') && browser._status.Text.EndsWith(".docx", StringComparison.Ordinal),
+                "Long names are middle-truncated (keeping the extension) and progress never grows the status bar.");
             if (saveShots) await WinUiUiHost.SaveWindowPngAsync(browser._root, "browser-drag-progress", testRoot);
-            browser.ShowDragPreparationProgress(new("正在水化文件", "大文件.bin", 1610612736, 3221225472));
+            browser.ShowDragPreparationProgress(new("正在下载文件", "大文件.bin", 1610612736, 3221225472));
             Check("Drag progress uses common units", browser._status.Text.Contains("1.5 GB / 3 GB")
                 && !browser._status.Text.Contains("字节"), "Large file progress uses matching readable units.");
             using (var cancel = new CancellationTokenSource())
@@ -168,14 +177,20 @@ internal sealed partial class MainWindow
             var staleProgress = new DragProgressState();
             browser._dragProgressState = staleProgress;
             browser.StopDragPreparationProgress(clearStatus: true);
-            staleProgress.Report(new("正在水化文件", "旧任务.txt", 1024, 2048));
+            staleProgress.Report(new("正在下载文件", "旧任务.txt", 1024, 2048));
             browser.UpdateDragPreparationProgress();
             Check("Drag progress cancellation cleanup", browser._transferProgress.Visibility == Microsoft.UI.Xaml.Visibility.Collapsed
                 && !browser._transferProgress.IsIndeterminate && !browser._dragProgressTimer.IsEnabled
                 && browser._status.Text.Length == 0,
                 "Completion and cancellation hide progress; late samples from an old selection cannot change the UI.");
             if (Environment.GetCommandLineArgs().Contains("--ui-selftest-pointer-drag", StringComparer.OrdinalIgnoreCase))
+            {
+                if (!Environment.GetCommandLineArgs().Contains("--ui-selftest-external-pointer", StringComparer.OrdinalIgnoreCase))
+                    checks.Add(await browser.CheckWinUiPointerDragAsync(draggedRow, path, testRoot, cancel: true));
                 checks.Add(await browser.CheckWinUiPointerDragAsync(draggedRow, path, testRoot));
+                if (!Environment.GetCommandLineArgs().Contains("--ui-selftest-external-pointer", StringComparer.OrdinalIgnoreCase))
+                    checks.Add(await browser.CheckWinUiPointerDragAsync(draggedRow, path, testRoot, repeat: true));
+            }
             if (browser._isClosed) return checks;
 
             browser._savedState.FavoritesExpanded = true;
@@ -192,7 +207,7 @@ internal sealed partial class MainWindow
             browser._savedState.FavoritesExpanded = true;
             browser.ConstrainFavoritesHeight(animate: true);
             await Task.Delay(300);
-            Check("Favorites reversed animation settles", !browser._favoritesAnimation.IsEnabled
+            Check("Favorites reversed animation settles", !browser._favoritesAnimating
                 && Math.Abs(browser._favoritesRow.Height.Value - expandedHeight) < 0.1 && browser._favoritesBody.Opacity == 1,
                 "A rapid reverse ends at the expanded height with visible contents.");
             if (saveShots) await WinUiUiHost.SaveWindowPngAsync(browser._root, "browser-favorites-expanded", testRoot);

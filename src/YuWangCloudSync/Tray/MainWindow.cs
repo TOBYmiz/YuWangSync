@@ -105,6 +105,7 @@ internal sealed partial class MainWindow : Window
     private const string RootGlyph = "\uE753";
     private const string FolderGlyph = "\uE8B7";
     private const string FileGlyph = "\uE8A5";
+    private const double StatusBarContentHeight = 22;
 
     private readonly SyncRootContext _config;
     private readonly Grid _root;
@@ -257,6 +258,9 @@ internal sealed partial class MainWindow : Window
     private readonly TextBlock _status = new()
     {
         TextTrimming = TextTrimming.CharacterEllipsis,
+        // Right-aligned next to the progress bar so it never runs into the item summary.
+        HorizontalAlignment = HorizontalAlignment.Right,
+        TextAlignment = TextAlignment.Right,
         VerticalAlignment = VerticalAlignment.Center,
     };
     private readonly ProgressBar _transferProgress = new()
@@ -269,11 +273,20 @@ internal sealed partial class MainWindow : Window
     };
     private readonly Button _cancelDragPreparation = new()
     {
-        Content = "取消",
+        Content = new FontIcon { Glyph = "\uE711", FontSize = 10, FontFamily = new FontFamily("Segoe MDL2 Assets") },
         Visibility = Visibility.Collapsed,
         VerticalAlignment = VerticalAlignment.Center,
-        Padding = new Thickness(10, 2, 10, 2),
+        Width = 24,
+        Height = 22,
+        MinWidth = 0,
+        MinHeight = 0,
+        Padding = new Thickness(0),
+        // Overhang into the bar padding instead of growing the status row.
+        Margin = new Thickness(0, -2, 0, -2),
     };
+    private readonly DispatcherTimer _statusClearTimer = new() { Interval = TimeSpan.FromSeconds(6) };
+    private readonly DispatcherTimer _infoBarCloseTimer = new() { Interval = TimeSpan.FromSeconds(8) };
+    private bool _statusIsProgress;
     private readonly Border _permissionBadge = new()
     {
         CornerRadius = new CornerRadius(10),
@@ -296,6 +309,8 @@ internal sealed partial class MainWindow : Window
     private readonly MenuFlyoutItem _menuUpload = NewMenuItem("\uE898", "上传文件…");
     private readonly MenuFlyoutItem _menuRefresh = NewMenuItem("\uE72C", "刷新");
     private ItemActionTarget? _itemMenuTarget;
+    private const long NavigationMenuDebounceMilliseconds = 400;
+    private long _navigationMenuShownAt = long.MinValue / 2;
 
     private readonly Stack<TreeViewNode> _backHistory = new();
     private readonly Stack<TreeViewNode> _forwardHistory = new();
@@ -390,7 +405,9 @@ internal sealed partial class MainWindow : Window
         Closed += (_, _) =>
         {
             _isClosed = true;
-            _favoritesAnimation.Stop();
+            StopFavoritesAnimation();
+            _statusClearTimer.Stop();
+            _infoBarCloseTimer.Stop();
             _dragIntentTimer.Stop();
             _dragCancellation?.Cancel();
             CancelDragWarmup();
@@ -483,14 +500,23 @@ internal sealed partial class MainWindow : Window
         _navigationTree.Name = "CloudNavigationTreeView";
         _navigationTree.ItemTemplateSelector = new NavigationTreeTemplateSelector(
             node => _nodeKinds.TryGetValue(node, out var kind) ? kind : null);
+        // Child rows get an explicit per-expansion animation (MainWindow.Animations.cs). A theme
+        // add/delete transition kept collapsed rows "deleting" and skipped a quick re-expand.
         _navigationTree.ItemContainerTransitions = new TransitionCollection
         {
-            new AddDeleteThemeTransition(),
             new RepositionThemeTransition(),
         };
         _navigationTree.SelectionChanged += (_, _) => QueueNavigationSelection();
-        _navigationTree.Expanding += (_, args) => RunUi(() => OnNavigationExpandingAsync(args.Node));
-        _navigationTree.Collapsed += (_, args) => OnNavigationCollapsed(args.Node);
+        _navigationTree.Expanding += (_, args) =>
+        {
+            QueueNavigationExpandAnimation(args.Node);
+            RunUi(() => OnNavigationExpandingAsync(args.Node));
+        };
+        _navigationTree.Collapsed += (_, args) =>
+        {
+            CancelNavigationExpandAnimation(args.Node);
+            OnNavigationCollapsed(args.Node);
+        };
         _navigationTree.ContextRequested += OnNavigationContextRequested;
         // TreeViewItem can consume the routed right-tap before ContextRequested reaches TreeView.
         _navigationTree.AddHandler(UIElement.RightTappedEvent,
@@ -572,6 +598,10 @@ internal sealed partial class MainWindow : Window
 
         Grid.SetRow(_infoBar, 2);
         grid.Children.Add(_infoBar);
+        _infoBarCountdown.Margin = _infoBar.Margin;
+        Grid.SetRow(_infoBarCountdown, 2);
+        grid.Children.Add(_infoBarCountdown);
+        _infoBar.Closed += (_, _) => StopInfoBarCountdown();
 
         BuildColumnsHeader();
         _fileSurface.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
@@ -883,21 +913,40 @@ internal sealed partial class MainWindow : Window
             BorderThickness = new Thickness(0, 1, 0, 0),
             BorderBrush = WinUiUiHost.GetBrushResource("DividerStrokeColorDefaultBrush"),
         };
+        // Every item fits the permission badge height, so progress, long names or the cancel
+        // button never make the status bar taller than its idle height.
+        bar.RowDefinitions.Add(new RowDefinition { Height = new GridLength(StatusBarContentHeight) });
+        // summary | status | progress | cancel | permission
         bar.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
         bar.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
         bar.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
         bar.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        bar.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        _statusClearTimer.Tick += (_, _) =>
+        {
+            _statusClearTimer.Stop();
+            if (!_isClosed && !_statusIsProgress && _transferProgress.Visibility != Visibility.Visible) _status.Text = "";
+        };
+        _infoBarCloseTimer.Tick += (_, _) =>
+        {
+            _infoBarCloseTimer.Stop();
+            StopInfoBarCountdown();
+            if (!_isClosed && _infoBar.Severity == InfoBarSeverity.Success) _infoBar.IsOpen = false;
+        };
 
         _summary.Style = WinUiUiHost.GetStyleResource("YuWangCaptionTextBlockStyle");
         bar.Children.Add(_summary);
 
         _status.Style = WinUiUiHost.GetStyleResource("YuWangCaptionTextBlockStyle");
+        _status.TextWrapping = TextWrapping.NoWrap; // CaptionTextBlockStyle wraps by default.
+        _status.MaxLines = 1;
         Grid.SetColumn(_status, 1);
         bar.Children.Add(_status);
 
-        bar.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        _cancelDragPreparation.Style = WinUiUiHost.GetStyleResource("SubtleButtonStyle");
         _cancelDragPreparation.Click += (_, _) => CancelActiveDragPreparation();
-        ToolTipService.SetToolTip(_cancelDragPreparation, "取消本次文件准备与提取");
+        ToolTipService.SetToolTip(_cancelDragPreparation, "取消准备文件");
+        Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(_cancelDragPreparation, "取消准备文件");
         Grid.SetColumn(_cancelDragPreparation, 3);
         bar.Children.Add(_cancelDragPreparation);
 
@@ -1071,13 +1120,13 @@ internal sealed partial class MainWindow : Window
 
             var diskCount = _diskTree.Count(node => node.IsDisk);
             if (diskCount == 0)
-                ShowInfo(InfoBarSeverity.Warning, "未找到云端磁盘", "请检查账号、服务器和磁盘树入口 TypeId。");
+                ShowInfo(InfoBarSeverity.Warning, "未找到云端磁盘", "请检查账号、服务器和 TypeId 设置。");
             SetStatus(diskCount == 0 ? "" : $"已加载 {diskCount} 个云端磁盘");
             RenderBreadcrumbs();
             UpdatePermissionBadge();
             RenderItems();
             TraceUiStage("磁盘树界面更新完成");
-        });
+        }, "无法加载云端磁盘");
 
         if (_isClosed) return;
         // Restore by stable identifiers, loading only the ancestors needed for this location.
@@ -1462,7 +1511,7 @@ internal sealed partial class MainWindow : Window
             {
                 Serilog.Log.Warning(error, "还原主界面位置时无法加载子目录，将停留在最近可访问的上级");
             }
-        });
+        }, "无法还原浏览位置");
         if (restored is null || _isClosed) return _isClosed;
         await NavigateToNodeAsync(restored, addToHistory: false);
         TraceUiStage($"主界面浏览位置还原结束：Matched={NodeKey(restored)}; RequestedDepth={path.Length}");
@@ -1479,7 +1528,7 @@ internal sealed partial class MainWindow : Window
         var client = Client;
         if (client is null || !client.IsLoggedIn)
         {
-            ShowInfo(InfoBarSeverity.Warning, "育网云会话不可用", "请等待登录完成后重试。",
+            ShowInfo(InfoBarSeverity.Warning, "尚未登录", "请等待登录完成后重试。",
                 "重试", () => RunUi(LoadCurrentFolderAsync));
             return;
         }
@@ -1489,10 +1538,10 @@ internal sealed partial class MainWindow : Window
         await RunBusyAsync($"正在加载“{folder.Name}”…", async () =>
         {
             if (!_folderNodes.TryGetValue(folder.NavigationNode, out var state))
-                throw new InvalidOperationException("导航树中的目标文件夹已失效，请刷新后重试。");
+                throw new InvalidOperationException("文件夹已失效，请刷新后重试。");
             var listing = await GetListingForNavigationAsync(state);
             ApplyCurrentFolderListing(folder, state, listing);
-        });
+        }, "无法加载文件夹");
     }
 
     private async Task RefreshCurrentFolderAsync()
@@ -1501,18 +1550,18 @@ internal sealed partial class MainWindow : Window
         var client = Client;
         if (client is null || !client.IsLoggedIn)
         {
-            ShowInfo(InfoBarSeverity.Warning, "育网云会话不可用", "请等待登录完成后重试。");
+            ShowInfo(InfoBarSeverity.Warning, "尚未登录", "请等待登录完成后重试。");
             return;
         }
 
         await RunBusyAsync($"正在刷新“{folder.Name}”…", async () =>
-            await RefreshCurrentFolderCoreAsync(client, folder));
+            await RefreshCurrentFolderCoreAsync(client, folder), "刷新失败");
     }
 
     private async Task RefreshCurrentFolderCoreAsync(YuWangClient client, RemoteFolder folder)
     {
         if (!_folderNodes.TryGetValue(folder.NavigationNode, out var state))
-            throw new InvalidOperationException("导航树中的目标文件夹已失效，请刷新后重试。");
+            throw new InvalidOperationException("文件夹已失效，请刷新后重试。");
         var listing = await GetFreshFolderListingAsync(client, state);
         state.PendingListingConsumed = true;
         ApplyCurrentFolderListing(folder, state, listing);
@@ -1555,7 +1604,7 @@ internal sealed partial class MainWindow : Window
         }
 
         var listing = await GetFreshFolderListingAsync(Client
-            ?? throw new InvalidOperationException("Cloud client 尚未初始化"), state);
+            ?? throw new InvalidOperationException("尚未连接到云端。"), state);
         state.PendingListingConsumed = true;
         return listing;
     }
@@ -1567,7 +1616,7 @@ internal sealed partial class MainWindow : Window
         if (state.ListingTask is not null) return await AwaitFolderListingTaskAsync(state);
         if (state.PendingListing is { } prefetched) return prefetched;
 
-        var client = Client ?? throw new InvalidOperationException("Cloud client 尚未初始化");
+        var client = Client ?? throw new InvalidOperationException("尚未连接到云端。");
         return await GetFreshFolderListingAsync(client, state);
     }
 
@@ -1600,7 +1649,7 @@ internal sealed partial class MainWindow : Window
         TraceUiStage($"目录与权限响应完成：Disk={state.Disk.Id}; Folder={state.Id}; "
             + $"Items={listing.Items.Count}; Permission={listing.Permission}; Valid={listing.IsValidPage}");
         if (!listing.IsValidPage)
-            throw new IOException("服务器未返回完整的目标目录列表。");
+            throw new IOException("服务器返回的目录列表不完整。");
 
         Callbacks.StoreMainWindowDirectoryListing(
             new FileIdentity(state.Disk.Id, state.ParentId, state.Id, 0),
@@ -1910,13 +1959,13 @@ internal sealed partial class MainWindow : Window
         {
             _emptyGlyph.Glyph = RootGlyph;
             _emptyTitle.Text = "选择一个云端磁盘";
-            _emptyDetail.Text = "从左侧列表中选择磁盘或文件夹即可开始浏览。";
+            _emptyDetail.Text = "从左侧选择磁盘或文件夹。";
         }
         else if (filter.Length > 0)
         {
             _emptyGlyph.Glyph = "\uE721";
             _emptyTitle.Text = $"没有与“{filter}”匹配的项目";
-            _emptyDetail.Text = "仅搜索当前位置中的名称。";
+            _emptyDetail.Text = "仅搜索当前文件夹。";
         }
         else
         {
@@ -2119,13 +2168,13 @@ internal sealed partial class MainWindow : Window
         {
             DirectoryPermission.FullAccess => ("\uE70F", "可写",
                 "SystemFillColorSuccessBackgroundBrush", "SystemFillColorSuccessBrush",
-                "可以在此文件夹中上传、新建、重命名、移动和删除。"),
+                "可上传、新建、重命名、移动和删除。"),
             DirectoryPermission.ReadOnly => ("\uE72E", "只读",
                 "SystemFillColorCautionBackgroundBrush", "SystemFillColorCautionBrush",
                 "此文件夹为只读，仅可浏览和下载。"),
             _ => ("\uE9CE", "权限未确认",
                 "SubtleFillColorSecondaryBrush", "TextFillColorSecondaryBrush",
-                "未能确认此文件夹的权限，写入操作已停用。"),
+                "无法确认权限，暂不能修改。"),
         };
         _permissionGlyph.Glyph = glyph;
         _permissionGlyph.Foreground = WinUiUiHost.GetBrushResource(foreground);
@@ -2233,6 +2282,9 @@ internal sealed partial class MainWindow : Window
     private void ShowNavigationMenu(TreeViewNode? node, Windows.Foundation.Point? point)
     {
         if (_busyNow || _isClosed || node is null || !_folderNodes.TryGetValue(node, out var folder)) return;
+        // A mouse right-click raises both ContextRequested and RightTapped. Answer only the first:
+        // hiding and re-showing the shared item menu while it opens left it closed.
+        if (Environment.TickCount64 - _navigationMenuShownAt < NavigationMenuDebounceMilliseconds) return;
         if (folder.Id == 0)
         {
             // Disk roots have no parent item to rename/delete, but can be bookmarked.
@@ -2245,7 +2297,6 @@ internal sealed partial class MainWindow : Window
             return;
         }
         if (node.Parent is not { } parentNode || !_folderNodes.TryGetValue(parentNode, out var parent)) return;
-        _itemMenu.Hide();
         var item = new YuWangItem { Type = 'D', Id = folder.Id, Name = folder.Name };
         _itemMenuTarget = new ItemActionTarget(parent.ToRemoteFolder(), [item]);
         UpdateItemMenuStates();
@@ -2254,8 +2305,16 @@ internal sealed partial class MainWindow : Window
 
     private void ShowNavigationMenuAt(MenuFlyout menu, Windows.Foundation.Point? point)
     {
-        if (point is { } position) menu.ShowAt(_navigationTree, new FlyoutShowOptions { Position = position });
-        else menu.ShowAt(_navigationTree);
+        _navigationMenuShownAt = Environment.TickCount64;
+        void Show()
+        {
+            if (point is { } position) menu.ShowAt(_navigationTree, new FlyoutShowOptions { Position = position });
+            else menu.ShowAt(_navigationTree);
+        }
+        if (!menu.IsOpen) { Show(); return; }
+        // The item menu may still be open for the file list; let it close before reopening here.
+        menu.Hide();
+        DispatcherQueue.TryEnqueue(() => RunContextMenu(() => { if (!_isClosed) Show(); }));
     }
 
     // NativeAOT may initially project a native control as its base DependencyObject.
@@ -2353,7 +2412,7 @@ internal sealed partial class MainWindow : Window
             if (_folderNodesByKey.TryGetValue((parent.Disk.Id, item.Id), out var state))
                 await NavigateToFolderAsync(state, addToHistory: true);
             else
-                ShowInfo(InfoBarSeverity.Warning, $"无法打开“{item.Name}”", "该文件夹尚未加入导航树，请刷新当前目录后重试。");
+                ShowInfo(InfoBarSeverity.Warning, $"无法打开“{item.Name}”", "请刷新后重试。");
             return;
         }
 
@@ -2365,7 +2424,7 @@ internal sealed partial class MainWindow : Window
             var path = await PrepareLocalItemPathAsync(parent, item, openRoot, Program.ApplicationCancellationToken);
             Process.Start(new ProcessStartInfo(path) { UseShellExecute = true });
             SetStatus($"已打开“{item.Name}”");
-        });
+        }, "无法打开");
     }
 
     #endregion
@@ -2492,7 +2551,7 @@ internal sealed partial class MainWindow : Window
         if (folder is null || folder.Permission != DirectoryPermission.FullAccess
             || client is null || !client.IsLoggedIn)
         {
-            ShowInfo(InfoBarSeverity.Warning, "无法上传", "云端服务尚未就绪。");
+            ShowInfo(InfoBarSeverity.Warning, "无法上传", "尚未连接，请稍后重试。");
             return;
         }
         await RunBusyAsync($"正在上传 {items.Count} 项…", async () =>
@@ -2505,9 +2564,8 @@ internal sealed partial class MainWindow : Window
             }
             await RefreshCurrentFolderCoreAsync(client, folder);
             if (errors.Count == 0) SetStatus($"已上传 {items.Count} 项");
-            else ShowInfo(InfoBarSeverity.Warning, $"上传完成，有 {errors.Count} 项失败",
-                string.Join("；", errors.Take(3)));
-        });
+            else ShowInfo(InfoBarSeverity.Warning, $"有 {errors.Count} 项未能上传", JoinFailures(errors, "\n"));
+        }, "上传失败");
     }
 
     private async Task UploadStorageItemAsync(YuWangClient client, ulong diskId, ulong folderId, IStorageItem storageItem)
@@ -2562,7 +2620,7 @@ internal sealed partial class MainWindow : Window
                 Program.ApplicationCancellationToken);
             await RefreshCurrentFolderCoreAsync(client, parent);
             SetStatus($"已创建文件夹“{name}”");
-        });
+        }, "无法创建文件夹");
     }
 
     private Task RenameSelectionAsync() => RenameItemsAsync(GetSelectionTarget());
@@ -2592,7 +2650,7 @@ internal sealed partial class MainWindow : Window
                 throw new IOException("服务器未确认重命名。");
             await RefreshItemParentAsync(client, parent);
             SetStatus($"已重命名为“{newName}”");
-        });
+        }, "重命名失败");
     }
 
     private Task MoveSelectionAsync() => MoveItemsAsync(GetSelectionTarget());
@@ -2618,7 +2676,7 @@ internal sealed partial class MainWindow : Window
         if (choices.Length == 0)
         {
             ShowInfo(InfoBarSeverity.Informational, "没有可用的目标文件夹",
-                "只能移动到当前磁盘中已浏览过、且可写的文件夹。请先在左侧展开目标文件夹。");
+                "请先在左侧展开目标文件夹（需在当前磁盘且可写）。");
             return;
         }
 
@@ -2639,7 +2697,7 @@ internal sealed partial class MainWindow : Window
                 targetPicker,
                 new TextBlock
                 {
-                    Text = "列表中仅包含已浏览过的可写文件夹。",
+                    Text = "仅显示已打开过的可写文件夹。",
                     Style = WinUiUiHost.GetStyleResource("YuWangCaptionTextBlockStyle"),
                 },
             },
@@ -2662,7 +2720,7 @@ internal sealed partial class MainWindow : Window
                 && current.Id == destination.Id && _folderNodes.ContainsKey(current.NavigationNode))
                 await RefreshCurrentFolderCoreAsync(client, current);
             SetStatus($"已移动 {selected.Count} 项到“{destination.Name}”");
-        });
+        }, "移动失败");
     }
 
     private Task DeleteSelectionAsync() => DeleteItemsAsync(GetSelectionTarget());
@@ -2675,7 +2733,7 @@ internal sealed partial class MainWindow : Window
         var client = Client;
         if (client is null || !client.IsLoggedIn) return;
         var prompt = selected.Count == 1 ? $"删除“{selected[0].Name}”？" : $"删除这 {selected.Count} 项？";
-        if (await ShowConfirmDialogAsync(prompt, "删除会作用于云端，此操作无法撤销。", "删除") != ContentDialogResult.Primary) return;
+        if (await ShowConfirmDialogAsync(prompt, "将从云端删除，无法撤销。", "删除") != ContentDialogResult.Primary) return;
         if (!CanWriteItems(target)) return;
         await RunBusyAsync($"正在删除 {selected.Count} 项…", async () =>
         {
@@ -2687,8 +2745,8 @@ internal sealed partial class MainWindow : Window
             }
             await RefreshItemParentAsync(client, parent);
             if (failures.Count == 0) SetStatus($"已删除 {selected.Count} 项");
-            else ShowInfo(InfoBarSeverity.Warning, "部分项目未能删除", "服务器未确认：" + string.Join("、", failures));
-        });
+            else ShowInfo(InfoBarSeverity.Warning, $"有 {failures.Count} 项未能删除", JoinFailures(failures, "、"));
+        }, "删除失败");
     }
 
     #endregion
@@ -2736,10 +2794,10 @@ internal sealed partial class MainWindow : Window
         {
             foreach (var item in selected)
                 await DownloadEntryAsync(parent.Disk.Id, item, destination);
-            SetStatus($"已下载 {selected.Count} 项到“{destination}”");
+            SetStatus("");
             ShowInfo(InfoBarSeverity.Success, "下载完成", $"已下载 {selected.Count} 项到“{destination}”。",
                 "打开文件夹", () => Process.Start(new ProcessStartInfo(destination) { UseShellExecute = true }));
-        });
+        }, "下载失败");
     }
 
     private async Task<string> DownloadEntryAsync(ulong diskId, YuWangItem item, string destination,
@@ -2766,7 +2824,7 @@ internal sealed partial class MainWindow : Window
         Action<string, long, long>? preparationProgress = null)
     {
         if (!cancellationToken.CanBeCanceled) cancellationToken = Program.ApplicationCancellationToken;
-        var client = Client ?? throw new InvalidOperationException("育网云客户端尚未就绪。");
+        var client = Client ?? throw new InvalidOperationException("尚未连接到云端。");
         var probe = await client.ProbeRealSizeAsync(item.Id, item.Name, item.Size).WaitAsync(cancellationToken)
             ?? throw new IOException($"无法获取“{item.Name}”的下载地址或文件大小。");
         var folder = Path.GetFullPath(destination);
@@ -2838,14 +2896,14 @@ internal sealed partial class MainWindow : Window
         _knownFolders[(folder.Disk.Id, folder.Id)] = folder;
     }
 
-    private async Task RunBusyAsync(string initialStatus, Func<Task> action)
+    private async Task RunBusyAsync(string initialStatus, Func<Task> action, string failureTitle = "操作失败")
     {
         if (_busyNow || _isClosed) return;
         CancelDragWarmup();
         _busyNow = true;
         if (_infoBar.Severity is InfoBarSeverity.Error or InfoBarSeverity.Warning) _infoBar.IsOpen = false;
         _loading.Visibility = Visibility.Visible;
-        SetStatus(initialStatus);
+        SetProgressStatus(initialStatus);
         UpdateCommandStates();
         UpdateEmptyState(_search.Text?.Trim() ?? "");
         try { await action(); }
@@ -2855,7 +2913,7 @@ internal sealed partial class MainWindow : Window
             Serilog.Log.Warning(error, "主界面操作失败；最近阶段={Stage}; HRESULT=0x{HResult:X8}",
                 LastDiagnosticStage, error.HResult);
             SetStatus("");
-            ShowInfo(InfoBarSeverity.Error, "操作失败", error.Message);
+            ShowInfo(InfoBarSeverity.Error, failureTitle, error.Message);
         }
         finally
         {
@@ -2864,6 +2922,7 @@ internal sealed partial class MainWindow : Window
             {
                 _loading.Visibility = Visibility.Collapsed;
                 _transferProgress.Visibility = Visibility.Collapsed;
+                if (_statusIsProgress) SetStatus("");
                 UpdateCommandStates();
                 UpdateEmptyState(_search.Text?.Trim() ?? "");
                 QueueDragPreparation();
@@ -2872,11 +2931,29 @@ internal sealed partial class MainWindow : Window
         }
     }
 
-    private void SetStatus(string text) => _status.Text = text;
+    /// <summary>Shows a result message; it clears itself after a few seconds.</summary>
+    private void SetStatus(string text)
+    {
+        _statusClearTimer.Stop();
+        _statusIsProgress = false;
+        _status.Text = text;
+        if (text.Length > 0) _statusClearTimer.Start();
+    }
+
+    /// <summary>Shows an in-progress message; it stays until the operation finishes.</summary>
+    private void SetProgressStatus(string text)
+    {
+        _statusClearTimer.Stop();
+        _statusIsProgress = true;
+        _status.Text = text;
+    }
+
+    private static string JoinFailures(IReadOnlyList<string> failures, string separator)
+        => string.Join(separator, failures.Take(3)) + (failures.Count > 3 ? $" 等 {failures.Count} 项" : "");
 
     private void SetTransferProgress(string text, double percent)
     {
-        _status.Text = text;
+        SetProgressStatus(text);
         _transferProgress.Value = Math.Clamp(percent, 0, 100);
         _transferProgress.Visibility = Visibility.Visible;
     }
@@ -2884,6 +2961,8 @@ internal sealed partial class MainWindow : Window
     private void ShowInfo(InfoBarSeverity severity, string title, string message,
         string? actionText = null, Action? action = null)
     {
+        _infoBarCloseTimer.Stop();
+        StopInfoBarCountdown();
         _infoBar.Severity = severity;
         _infoBar.Title = title;
         _infoBar.Message = message;
@@ -2900,6 +2979,9 @@ internal sealed partial class MainWindow : Window
         }
         else _infoBar.ActionButton = null;
         _infoBar.IsOpen = true;
+        if (severity != InfoBarSeverity.Success) return;
+        _infoBarCloseTimer.Start();
+        StartInfoBarCountdown();
     }
 
     private async Task<ContentDialogResult> ShowInputDialogAsync(string title, UIElement content, string primary)

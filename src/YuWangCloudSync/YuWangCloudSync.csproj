@@ -123,6 +123,16 @@
            Text="MRT Core native implementation is missing: Microsoft.Windows.ApplicationModel.Resources.dll. WinUI cannot resolve theme resources." />
   </Target>
 
+  <Target Name="PruneBuildWindowsAppSdkPayload" AfterTargets="PruneBuildSatelliteResources"
+          Condition="'$(OS)' == 'Windows_NT' and ('$(Configuration)' == 'Debug' or '$(Configuration)' == 'Release') and '$(DesignTimeBuild)' != 'true' and '$(_IsPublishing)' != 'true'">
+    <PropertyGroup>
+      <_BuildAppSdkRuntimeMode Condition="'$(WindowsAppSDKSelfContained)' == 'true'">Bundled</_BuildAppSdkRuntimeMode>
+      <_BuildAppSdkRuntimeMode Condition="'$(_BuildAppSdkRuntimeMode)' == ''">Framework</_BuildAppSdkRuntimeMode>
+    </PropertyGroup>
+    <!-- Installer scripts prune after publishing; incremental builds may already be pruned. -->
+    <Exec Command="powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;$(MSBuildProjectDirectory)\..\..\tools\Prune-WindowsAppSdkPayload.ps1&quot; -PayloadDirectory &quot;$(TargetDir).&quot; -RuntimeMode $(_BuildAppSdkRuntimeMode)" />
+  </Target>
+
   <!-- Unpackaged WinUI publish omits compiled XAML and its project PRI by default. -->
   <Target Name="CopyUnpackagedWinUiResourcesToPublish" AfterTargets="Publish"
           Condition="'$(UseWinUI)' == 'true' and '$(WindowsPackageType)' == 'None' and '$(PublishDir)' != ''">

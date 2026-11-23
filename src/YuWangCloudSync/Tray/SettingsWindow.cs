@@ -17,7 +17,7 @@ internal sealed class SettingsWindow : Window
 {
     private const double RowHeight = 36;
     private const double SettingsTextBoxHeight = 32;
-    private const double LabelColumnWidth = 210;
+    private const double LabelColumnWidth = 170;
     private const int ApplyFadeMilliseconds = 180;
     private const int MinimumApplyIndicatorMilliseconds = 300;
     private const int CompositionFrameGraceMilliseconds = 40;
@@ -97,7 +97,7 @@ internal sealed class SettingsWindow : Window
         Height = SettingsTextBoxHeight,
     };
     private readonly InfoBar _status = new() { Name = "SettingsStatusInfoBar", IsClosable = false };
-    private readonly StackPanel _content = new() { Spacing = 10 };
+    private readonly StackPanel _content = new() { Spacing = 10, Margin = new Thickness(0, 0, 14, 0) };
     private readonly TaskCompletionSource<bool> _loaded = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly ScrollViewer _scroll;
     private readonly Button _okButton;
@@ -216,22 +216,22 @@ internal sealed class SettingsWindow : Window
         var accountGrid = NewGrid(RowHeight, 0);
         Add(accountGrid, NewLabel("当前账户"), 0, 0);
         Add(accountGrid, AccountInputRow(), 0, 1);
-        Add(accountGrid, NewNote("更换账户，会先清空同步目录。"), 1, 0);
+        Add(accountGrid, NewNote("切换账户会清空同步目录。"), 1, 0);
         AddCard(content, "账户", accountGrid);
 
         var pathGrid = NewGrid(RowHeight, 0);
-        Add(pathGrid, NewLabel("同步根目录"), 0, 0);
+        Add(pathGrid, NewLabel("目录位置"), 0, 0);
         Add(pathGrid, PathInputRow(), 0, 1);
-        Add(pathGrid, NewNote("请选择空目录，更换后旧目录会被清理。"), 1, 0, 2);
-        AddCard(content, "挂载位置", pathGrid);
+        Add(pathGrid, NewNote("请选择空目录，更换后会清理旧目录。"), 1, 0, 2);
+        AddCard(content, "同步目录", pathGrid);
 
         var cacheGrid = NewGrid(RowHeight, 0, RowHeight, RowHeight, 0);
-        cacheGrid.ColumnDefinitions[0].Width = new GridLength(LabelColumnWidth * 1.1);
-        Add(cacheGrid, NewLabel("保持目录刷新频率（分钟）"), 0, 0);
+        Add(cacheGrid, NewLabel("刷新间隔（分钟）"), 0, 0);
         Add(cacheGrid, MinutesInputRow(_directoryRefreshInterval, 1, 60), 0, 1);
-        Add(cacheGrid, NewNote("对选择保持刷新的目录生效，其他目录仅在主界面可实时刷新。"), 1, 0, 2);
-        var manageKeptDirectories = new Button { Name = "ManageKeptDirectoriesButton", Content = "管理保持更新的目录", MinWidth = 150 };
+        Add(cacheGrid, NewNote("仅对保持更新的目录生效，其他目录在主界面中刷新。"), 1, 0, 2);
+        var manageKeptDirectories = new Button { Name = "ManageKeptDirectoriesButton", Content = "管理", MinWidth = 100, HorizontalAlignment = HorizontalAlignment.Right };
         manageKeptDirectories.Click += (_, _) => DirectoryRefreshManagementRequested?.Invoke(this);
+        Add(cacheGrid, NewLabel("保持更新的目录"), 2, 0);
         Add(cacheGrid, manageKeptDirectories, 2, 1);
         _automaticFileCacheCleanup.Content = "自动清理文件缓存";
         foreach (var (text, hours) in new[] { ("每 8 小时", 8), ("每 12 小时", 12), ("每天", 24), ("每 7 天", 168) })
@@ -248,7 +248,7 @@ internal sealed class SettingsWindow : Window
         _persist.Content = "退出后保留同步目录";
         var persistGrid = NewGrid(RowHeight);
         AddCheck(persistGrid, _persist, 0);
-        AddCard(content, "退出与常驻", persistGrid);
+        AddCard(content, "退出", persistGrid);
 
         _enableNavigationEntry.Content = "导航栏入口";
         _enableMainWindow.Content = "启用主界面";
@@ -258,7 +258,7 @@ internal sealed class SettingsWindow : Window
         _enableMainWindow.VerticalAlignment = VerticalAlignment.Center;
         Add(featuresGrid, _enableNavigationEntry, 0, 0);
         Add(featuresGrid, _enableMainWindow, 0, 1);
-        Add(featuresGrid, NewLabel("快捷方式启动："), 1, 0);
+        Add(featuresGrid, NewLabel("快捷方式打开"), 1, 0);
         var shortcutTargets = new StackPanel
         {
             Orientation = Orientation.Horizontal,
@@ -268,8 +268,8 @@ internal sealed class SettingsWindow : Window
         shortcutTargets.Children.Add(_shortcutOpensMainWindow);
         shortcutTargets.Children.Add(_shortcutOpensSyncFolder);
         Add(featuresGrid, shortcutTargets, 1, 1);
-        Add(featuresGrid, NewNote("对安装程序创建的快捷方式生效，改变“-open-folder”参数行为。"), 2, 0, 2);
-        Add(featuresGrid, NewLabel("托盘单击："), 3, 0);
+        Add(featuresGrid, NewNote("适用于安装时创建的桌面快捷方式。"), 2, 0, 2);
+        Add(featuresGrid, NewLabel("单击托盘图标"), 3, 0);
         var trayClickTargets = new StackPanel
         {
             Orientation = Orientation.Horizontal,
@@ -279,15 +279,15 @@ internal sealed class SettingsWindow : Window
         trayClickTargets.Children.Add(_trayClickOpensMainWindow);
         trayClickTargets.Children.Add(_trayClickOpensSyncFolder);
         Add(featuresGrid, trayClickTargets, 3, 1);
-        AddCard(content, "功能选择", featuresGrid);
+        AddCard(content, "功能", featuresGrid);
 
         var cloudGrid = NewGrid(RowHeight, 0, RowHeight, 0);
-        Add(cloudGrid, NewLabel("目录树顶层容器 TypeId"), 0, 0);
+        Add(cloudGrid, NewLabel("顶层目录 TypeId"), 0, 0);
         Add(cloudGrid, TypeIdRow(), 0, 1);
-        Add(cloudGrid, NewNote("决定 SyncRoot 顶层对应的云端层级。"), 1, 0, 2);
-        Add(cloudGrid, NewLabel("Provider 显示名"), 2, 0);
+        Add(cloudGrid, NewNote("同步目录顶层对应的云端目录。"), 1, 0, 2);
+        Add(cloudGrid, NewLabel("显示名称"), 2, 0);
         Add(cloudGrid, Styled(_providerName), 2, 1);
-        Add(cloudGrid, NewNote("系统注册信息，实时生效。"), 3, 0, 2);
+        Add(cloudGrid, NewNote("资源管理器中显示的名称，立即生效。"), 3, 0, 2);
         AddCard(content, "云盘参数", cloudGrid);
 
         var serverGrid = NewGrid(RowHeight, 0);
@@ -301,11 +301,11 @@ internal sealed class SettingsWindow : Window
         _automaticUpdateDownload.Content = "自动下载更新";
         var updateGrid = NewGrid(RowHeight, 0, RowHeight, 0, RowHeight, 0);
         AddCheck(updateGrid, _automaticUpdateCheck, 0);
-        Add(updateGrid, NewNote("每日检查，有更新时在托盘菜单提示。"), 1, 0, 2);
+        Add(updateGrid, NewNote("每天检查一次，有更新时在托盘菜单中提示。"), 1, 0, 2);
         AddCheck(updateGrid, _trayUpdateHint, 2);
-        Add(updateGrid, NewNote("有更新时，在托盘图标显示角标提示。"), 3, 0, 2);
+        Add(updateGrid, NewNote("有更新时在托盘图标上显示标记。"), 3, 0, 2);
         AddCheck(updateGrid, _automaticUpdateDownload, 4);
-        Add(updateGrid, NewNote("需要手动重启更新。"), 5, 0, 2);
+        Add(updateGrid, NewNote("下载后需手动重启完成更新。"), 5, 0, 2);
         AddCard(content, "更新", updateGrid);
 
         var footer = new Grid { ColumnSpacing = 8 };
@@ -437,7 +437,7 @@ internal sealed class SettingsWindow : Window
     private static Border NewCard(string title, UIElement content)
     {
         var stack = new StackPanel { Spacing = 8 };
-        stack.Children.Add(new TextBlock { Text = title, Style = WinUiUiHost.GetStyleResource("SubtitleTextBlockStyle") });
+        stack.Children.Add(new TextBlock { Text = title, Style = WinUiUiHost.GetStyleResource("BodyStrongTextBlockStyle") });
         stack.Children.Add(content);
         return new Border
         {
@@ -520,12 +520,12 @@ internal sealed class SettingsWindow : Window
     private TextBlock ConfigurationFileNote()
     {
         var note = NewNote("");
-        note.Inlines.Add(new Microsoft.UI.Xaml.Documents.Run { Text = "运行中不可编辑，请编辑" });
+        note.Inlines.Add(new Microsoft.UI.Xaml.Documents.Run { Text = "如需修改，请编辑" });
         var link = new Microsoft.UI.Xaml.Documents.Hyperlink();
         link.Inlines.Add(new Microsoft.UI.Xaml.Documents.Run { Text = "配置文件" });
         link.Click += async (_, _) => await OpenConfigurationFileAsync();
         note.Inlines.Add(link);
-        note.Inlines.Add(new Microsoft.UI.Xaml.Documents.Run { Text = "并重启应用。" });
+        note.Inlines.Add(new Microsoft.UI.Xaml.Documents.Run { Text = "后重启应用。" });
         return note;
     }
 
@@ -549,7 +549,7 @@ internal sealed class SettingsWindow : Window
         var dialog = new ContentDialog
         {
             Title = "是否关闭应用？",
-            Content = "编辑配置文件，需要先关闭应用。已更改的设置不会保存。",
+            Content = "编辑配置文件需先关闭应用，未保存的设置将丢失。",
             PrimaryButtonText = "确认",
             CloseButtonText = "取消",
             DefaultButton = ContentDialogButton.Primary,
@@ -575,7 +575,7 @@ internal sealed class SettingsWindow : Window
         var grid = new Grid { ColumnSpacing = 8 };
         grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
         grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-        _path.PlaceholderText = "选择同步根目录";
+        _path.PlaceholderText = "选择同步目录";
         var browse = new Button { Name = "BrowseSyncRootButton", Content = "浏览", Width = 88 };
         browse.Click += OnBrowse;
         grid.Children.Add(_path);
@@ -611,16 +611,15 @@ internal sealed class SettingsWindow : Window
     private async Task ShowTypeIdDetailAsync()
     {
         await ShowMessageAsync("TypeId 说明",
-            "该数值决定挂载目录顶层对应的云端层级，默认值 0 映射为根目录。\n"
-            + "修改请使用网页端对应目录的 TypeId。\n"
-            + "要获取 TypeId，请在进入网页端后按 F12 打开开发者工具，进入“网络”，打开目录后查看对应 fmsDiskInfoIndexAction.do 请求 URL 的 TypeId。\n"
-            + "修改后会重建同步目录，清理已缓存文件。无效值会导致目录为空。");
+            "决定同步目录顶层对应的云端目录，默认 0 表示根目录。\n"
+            + "获取方法：在网页端按 F12 打开开发者工具，切换到“网络”，打开目标目录，在 fmsDiskInfoIndexAction.do 请求地址中找到 TypeId。\n"
+            + "修改后会重建同步目录并清理缓存。填写无效值会导致目录为空。");
     }
 
     private async void OnBrowse(object sender, RoutedEventArgs args)
     {
         var owner = WindowNative.GetWindowHandle(this);
-        var picked = await FolderPicker.PickAsync(owner, "选择同步根目录",
+        var picked = await FolderPicker.PickAsync(owner, "选择同步目录",
             !string.IsNullOrWhiteSpace(_path.Text) && Directory.Exists(_path.Text) ? _path.Text : null);
         if (string.IsNullOrWhiteSpace(picked)) return;
         _path.Text = picked;
@@ -640,7 +639,7 @@ internal sealed class SettingsWindow : Window
         try { probe = SyncRootProbe.Probe(path, _source.SyncRootPath, _source.ProviderName); }
         catch (Exception error)
         {
-            SetStatus(InfoBarSeverity.Informational, $"位置探测未完成：{error.Message}");
+            SetStatus(InfoBarSeverity.Informational, $"无法检测该位置：{error.Message}");
             return;
         }
 
@@ -681,7 +680,7 @@ internal sealed class SettingsWindow : Window
         }
         catch (Exception exception)
         {
-            SetStatus(InfoBarSeverity.Informational, $"位置探测未完成：{exception.Message}");
+            SetStatus(InfoBarSeverity.Informational, $"无法检测该位置：{exception.Message}");
             return true;
         }
     }
@@ -689,13 +688,13 @@ internal sealed class SettingsWindow : Window
     private async Task<(string? Path, string? Error)> TryResolvePathAsync()
     {
         var raw = (_path.Text ?? "").Trim();
-        if (raw.Length == 0) return (null, "同步根目录不能为空。");
+        if (raw.Length == 0) return (null, "请选择同步目录。");
 
         string full;
         try { full = Path.GetFullPath(raw); }
         catch (Exception exception) { return (null, $"路径不合法：{exception.Message}"); }
         if (!Path.IsPathRooted(full) || full.StartsWith("\\\\", StringComparison.Ordinal))
-            return (null, "同步根目录必须位于本地。");
+            return (null, "同步目录必须位于本地磁盘。");
 
         string root = "";
         try { root = Path.GetFullPath(_source.SyncRootPath); } catch { }
@@ -705,7 +704,7 @@ internal sealed class SettingsWindow : Window
             var newRoot = full.TrimEnd('\\') + "\\";
             if (currentRoot.Length > 1 && newRoot.Length > currentRoot.Length
                 && newRoot.StartsWith(currentRoot, StringComparison.OrdinalIgnoreCase))
-                return (null, "不能选择当前同步根目录内部的位置。");
+                return (null, "不能选择当前同步目录内的位置。");
         }
         catch { }
 
@@ -729,9 +728,9 @@ internal sealed class SettingsWindow : Window
             return (full, null);
         }
 
-        var message = (SyncRootProbe.IsDriveRoot(full) ? "盘符根目录不能直接作为同步根目录。\n" : "")
-            + $"所选目录非空：{full}\n是否建立并使用子目录“YuWang”？";
-        if (!await AskYesNoAsync("目录非空", message)) return (null, null);
+        var message = (SyncRootProbe.IsDriveRoot(full) ? "不能直接使用磁盘根目录。\n" : "")
+            + $"所选目录不为空：{full}\n是否在其中新建子目录“YuWang”并使用？";
+        if (!await AskYesNoAsync("目录不为空", message)) return (null, null);
 
         var child = Path.Combine(full, "YuWang");
         if (Directory.Exists(child))
@@ -739,7 +738,7 @@ internal sealed class SettingsWindow : Window
             try { _ = Directory.EnumerateFileSystemEntries(child).FirstOrDefault(); }
             catch (Exception exception) { return (null, $"子目录不可访问：\n{child}\n{exception.Message}"); }
             if (SyncRootProbe.HasAnyEntry(child))
-                return (null, $"子目录已存在且不为空：\n{child}\n请手动处理后再试。");
+                return (null, $"子目录已存在且不为空：\n{child}\n请清空后重试。");
         }
         else
         {
@@ -760,7 +759,7 @@ internal sealed class SettingsWindow : Window
         var validationError = ValidateEditableValues(out var refreshMinutes, out var containerTypeId);
         if (validationError is not null) return validationError;
         if (_enableNavigationEntry.IsChecked != true && _enableMainWindow.IsChecked != true)
-            return "导航栏入口与主界面至少需要启用一项。";
+            return "导航栏入口和主界面至少启用一项。";
 
         var providerName = _providerName.Text.Trim();
         var selectedAccount = (_accountSelector.SelectedItem as ComboBoxItem)?.Tag as string;
@@ -768,7 +767,7 @@ internal sealed class SettingsWindow : Window
             return "请先选择账户，或通过“管理账户”添加。";
         var selectedCredential = _accounts.FirstOrDefault(account =>
             account.Username.Equals(selectedAccount, StringComparison.OrdinalIgnoreCase));
-        if (selectedCredential is null) return "账户凭据不存在。";
+        if (selectedCredential is null) return "找不到账户密码，请重新添加账户。";
         selectedCredential.DirectoryRefreshIntervalMinutes = refreshMinutes;
         string password;
         try
@@ -824,9 +823,9 @@ internal sealed class SettingsWindow : Window
         refreshMinutes = int.TryParse(_directoryRefreshInterval.Text, out var refreshValue) ? refreshValue : 0;
         containerTypeId = 0;
         if (refreshMinutes is < 1 or > 60)
-            return "保持目录刷新频率必须在 1—60 分钟之间。";
+            return "刷新间隔须为 1—60 分钟。";
         if (!ulong.TryParse(_containerTypeId.Text.Trim(), out containerTypeId))
-            return "磁盘树入口容器 TypeId 必须是整数。";
+            return "TypeId 必须是整数。";
         return null;
     }
 
@@ -837,12 +836,12 @@ internal sealed class SettingsWindow : Window
         try
         {
             _containerTypeId.Text = "not-an-id";
-            if (ValidateEditableValues(out _, out _) != "磁盘树入口容器 TypeId 必须是整数。") return false;
+            if (ValidateEditableValues(out _, out _) != "TypeId 必须是整数。") return false;
             _containerTypeId.Text = "0";
             if (ValidateEditableValues(out _, out var zeroTypeId) is not null || zeroTypeId != 0) return false;
             _containerTypeId.Text = originalTypeId;
             _directoryRefreshInterval.Text = "0";
-            return ValidateEditableValues(out _, out _) == "保持目录刷新频率必须在 1—60 分钟之间。";
+            return ValidateEditableValues(out _, out _) == "刷新间隔须为 1—60 分钟。";
         }
         finally
         {
@@ -888,7 +887,7 @@ internal sealed class SettingsWindow : Window
         catch (Exception preparationError)
         {
             Serilog.Log.Error(preparationError, "准备设置结果失败");
-            error = $"准备设置失败：{preparationError.Message}";
+            error = $"无法保存设置：{preparationError.Message}";
         }
         finally { _isBuildingResult = false; }
 
@@ -910,7 +909,7 @@ internal sealed class SettingsWindow : Window
         if (!result.Username.Equals(_source.Username, StringComparison.OrdinalIgnoreCase))
         {
             if (!await AskYesNoAsync("切换账户",
-                    "将删除同步目录内全部文件，然后连接新账户。是否继续？"))
+                    "切换账户会清空同步目录，是否继续？"))
             {
                 SetApplyVisualState(ApplyVisualState.Normal);
                 return;
@@ -919,7 +918,7 @@ internal sealed class SettingsWindow : Window
             if (switchRequested is null)
             {
                 SetApplyVisualState(ApplyVisualState.Normal);
-                await ShowMessageAsync("切换账户失败", "账户切换当前不可用，请重试。");
+                await ShowMessageAsync("切换账户失败", "暂时无法切换账户，请稍后重试。");
                 return;
             }
             try
@@ -955,7 +954,7 @@ internal sealed class SettingsWindow : Window
         if (applyRequested is null)
         {
             SetApplyVisualState(ApplyVisualState.Normal);
-            await ShowMessageAsync("设置未完成", "设置应用当前不可用，请重试。");
+            await ShowMessageAsync("设置未完成", "暂时无法应用设置，请稍后重试。");
             return;
         }
 
@@ -1024,7 +1023,7 @@ internal sealed class SettingsWindow : Window
 
         try
         {
-            await ShowMessageAsync("设置应用失败", message);
+            await ShowMessageAsync("无法应用设置", message);
         }
         finally
         {

@@ -145,7 +145,9 @@ internal sealed unsafe class VirtualFileDataObject : DragComObject
     private readonly IReadOnlyList<VirtualDragEntry> _entries;
     private readonly CancellationToken _token;
     private readonly object _gate = new();
-    private readonly Dictionary<ushort, byte[]> _extra = [];
+    // The Shell drag image helper stores private IStream media as well as HGLOBALs.
+    // Preserve each native medium and its ownership instead of converting everything to bytes.
+    private readonly Dictionary<(ushort Id, int Index, uint Type), Medium> _extra = [];
     private readonly TaskCompletionSource _ended = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private Exception? _failure;
     private int _async = 1, _inOperation, _streams;
@@ -164,7 +166,15 @@ internal sealed unsafe class VirtualFileDataObject : DragComObject
         => id == new Guid("0000010E-0000-0000-C000-000000000046") ? Identity
             : id == new Guid("3D8B0590-F691-11d2-8EA9-006097DF5BD4") ? Node(1) : 0;
     protected override void ReleaseResources()
-    { foreach (var entry in _entries) entry.DisposeContent(); }
+    {
+        foreach (var entry in _entries) entry.DisposeContent();
+        foreach (var value in _extra.Values)
+        {
+            var medium = value;
+            ReleaseStgMedium(ref medium);
+        }
+        _extra.Clear();
+    }
     internal void Fail(Exception error)
     { Interlocked.CompareExchange(ref _failure, error, null); }
     internal void StreamOpened() { Retain(); Interlocked.Increment(ref _streams); }
@@ -180,8 +190,8 @@ internal sealed unsafe class VirtualFileDataObject : DragComObject
             new Format { Id = Descriptor, Aspect = 1, Index = -1, Medium = 1 },
             new Format { Id = Contents, Aspect = 1, Index = -1, Medium = 4 },
             new Format { Id = PreferredEffect, Aspect = 1, Index = -1, Medium = 1 },
-        }.Concat(_extra.Keys.Where(id => id != PreferredEffect).Select(id =>
-            new Format { Id = id, Aspect = 1, Index = -1, Medium = 1 })).ToArray();
+        }.Concat(_extra.Keys.Where(key => key.Id != PreferredEffect || key.Index != -1 || key.Type != 1).Select(key =>
+            new Format { Id = key.Id, Aspect = 1, Index = key.Index, Medium = key.Type })).ToArray();
     }
     private int CanGet(Format format, bool query = false)
     {
@@ -194,9 +204,14 @@ internal sealed unsafe class VirtualFileDataObject : DragComObject
             if (query && format.Index == -1) return 0;
             return format.Index < 0 || format.Index >= _entries.Count || _entries[format.Index].Directory ? InvalidIndex : 0;
         }
-        if ((format.Medium & 1) == 0) return unchecked((int)0x80040069);
-        lock (_gate) return format.Index == -1 && (format.Id == Descriptor || format.Id == PreferredEffect
-            || _extra.ContainsKey(format.Id)) ? 0 : BadFormat;
+        if (format.Index == -1 && (format.Id == Descriptor || format.Id == PreferredEffect))
+            return (format.Medium & 1) != 0 ? 0 : unchecked((int)0x80040069);
+        lock (_gate)
+        {
+            var matches = _extra.Keys.Where(key => key.Id == format.Id && key.Index == format.Index);
+            return matches.Any(key => (key.Type & format.Medium) != 0) ? 0
+                : matches.Any() ? unchecked((int)0x80040069) : BadFormat;
+        }
     }
     private byte[] Descriptors()
     {
@@ -206,7 +221,7 @@ internal sealed unsafe class VirtualFileDataObject : DragComObject
         for (var i = 0; i < _entries.Count; i++)
         {
             var entry = _entries[i]; var span = bytes.AsSpan(4 + i * 592, 592);
-            if (entry.Name.Length == 0 || entry.Name.Length >= 260) throw new IOException("拖放文件相对路径超过 259 个字符。");
+            if (entry.Name.Length == 0 || entry.Name.Length >= 260) throw new IOException("文件路径过长（超过 259 个字符）。");
             uint flags = 0x80000004; // FD_UNICODE | FD_ATTRIBUTES
             BitConverter.TryWriteBytes(span[36..], entry.Directory ? 0x10u : 0x80u);
             if (entry.Size is { } size && !entry.Directory)
@@ -268,12 +283,20 @@ internal sealed unsafe class VirtualFileDataObject : DragComObject
                 var stream = new VirtualFileStream(owner, owner._entries[format->Index], owner._token);
                 *medium = new Medium { Type = 4, Value = stream.Pointer }; // STGMEDIUM owns the initial reference.
             }
+            else if (format->Id == Descriptor) *medium = Memory(owner.Descriptors());
             else
             {
-                byte[] bytes;
-                if (format->Id == Descriptor) bytes = owner.Descriptors();
-                else { lock (owner._gate) bytes = owner._extra.TryGetValue(format->Id, out var value) ? value : BitConverter.GetBytes(1); }
-                *medium = Memory(bytes);
+                lock (owner._gate)
+                {
+                    foreach (var stored in owner._extra)
+                        if (stored.Key.Id == format->Id && stored.Key.Index == format->Index && (stored.Key.Type & format->Medium) != 0)
+                        {
+                            var value = stored.Value;
+                            return CopyStgMedium(in value, out *medium);
+                        }
+                    if (format->Id != PreferredEffect) return BadFormat;
+                    *medium = Memory(BitConverter.GetBytes(1));
+                }
             }
             return 0;
         }
@@ -294,15 +317,29 @@ internal sealed unsafe class VirtualFileDataObject : DragComObject
         try
         {
             if (format->Id == 15 || format->Id == ShellIdList || format->Id == Descriptor || format->Id == Contents) return BadFormat;
-            if (medium->Type != 1 || medium->Value == 0) return unchecked((int)0x80040069);
-            var size = checked((int)GlobalSize(medium->Value));
-            var buffer = GlobalLock(medium->Value); if (buffer == 0) throw new Win32Exception();
-            byte[] bytes;
-            try { bytes = new byte[size]; Marshal.Copy(buffer, bytes, 0, size); }
-            finally { GlobalUnlock(medium->Value); }
+            if (format->Device != 0) return unchecked((int)0x80040065);
+            if (format->Aspect != 1) return unchecked((int)0x8004006B);
+            if (medium->Type is not (1 or 2 or 4 or 8 or 16 or 32 or 64) || medium->Value == 0
+                || (format->Medium & medium->Type) == 0) return unchecked((int)0x80040069);
+            var stored = *medium;
+            if (release == 0) Marshal.ThrowExceptionForHR(CopyStgMedium(in *medium, out stored));
             var owner = Get<VirtualFileDataObject>(self);
-            lock (owner._gate) owner._extra[format->Id] = bytes;
-            if (release != 0) ReleaseStgMedium(ref *medium);
+            var previous = new Medium();
+            try
+            {
+                lock (owner._gate)
+                {
+                    var key = (format->Id, format->Index, medium->Type);
+                    owner._extra.TryGetValue(key, out previous);
+                    owner._extra[key] = stored;
+                }
+            }
+            catch
+            {
+                if (release == 0) ReleaseStgMedium(ref stored);
+                throw;
+            }
+            if (previous.Type != 0) ReleaseStgMedium(ref previous);
             return 0;
         }
         catch (Exception error) { return Marshal.GetHRForException(error); }
@@ -341,11 +378,11 @@ internal sealed unsafe class VirtualFileDataObject : DragComObject
     }
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern uint RegisterClipboardFormatW(string name);
     [DllImport("shell32.dll")] private static extern int SHCreateStdEnumFmtEtc(uint count, Format* formats, out nint result);
+    [DllImport("urlmon.dll")] private static extern int CopyStgMedium(in Medium source, out Medium destination);
     [DllImport("kernel32.dll")] private static extern nint GlobalAlloc(uint flags, nuint size);
     [DllImport("kernel32.dll")] private static extern nint GlobalLock(nint memory);
     [DllImport("kernel32.dll")] private static extern bool GlobalUnlock(nint memory);
     [DllImport("kernel32.dll")] private static extern nint GlobalFree(nint memory);
-    [DllImport("kernel32.dll")] private static extern nuint GlobalSize(nint memory);
     [DllImport("ole32.dll")] private static extern void ReleaseStgMedium(ref Medium medium);
 }
 
@@ -489,7 +526,10 @@ internal static class VirtualDragWait
 {
     internal static async Task FinishAsync(VirtualFileDataObject data, CancellationToken token)
     {
-        while (data.InAsyncOperation || data.OpenStreams != 0)
+        // EndOperation is the receiver's completion signal. A Shell/WinUI target
+        // may retain unused probe streams after it finishes; their COM references
+        // still keep resources alive, but must not keep the source UI busy.
+        while (data.InAsyncOperation || (!data.OperationEnded.IsCompleted && data.OpenStreams != 0))
         {
             token.ThrowIfCancellationRequested();
             if (data.Failure is { } failure) throw new IOException(failure.Message, failure);

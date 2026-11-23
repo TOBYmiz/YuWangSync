@@ -464,7 +464,7 @@ FunctionEnd
 Function WelcomePageShow
   SendMessage $mui.WelcomePage.Title ${WM_SETFONT} $InstallerPageTitleFont 1
   ${If} $IsInstalled == "1"
-    SendMessage $mui.WelcomePage.Text ${WM_SETTEXT} 0 "STR:将安装${PRODUCT_NAME_ZH}。继续以升级程序，升级会保留已有同步内容。"
+    SendMessage $mui.WelcomePage.Text ${WM_SETTEXT} 0 "STR:将升级${PRODUCT_NAME_ZH}，已有同步内容会保留。"
   ${EndIf}
 FunctionEnd
 
@@ -500,7 +500,7 @@ Function FinishPagePre
   StrCpy $FinishRebootText "$(MUI_TEXT_FINISH_INFO_REBOOT)"
   ${If} $ExplorerRestartDeferred == "1"
     StrCpy $FinishRebootNowText "重启资源管理器(&Y)"
-    StrCpy $FinishRebootText "需要重启资源管理器，或注销/重启计算机，才能完成${PRODUCT_NAME_ZH}的安装。是否立即重启资源管理器？"
+    StrCpy $FinishRebootText "需要重启资源管理器才能完成安装，是否立即重启？"
   ${EndIf}
   ${If} $QuickUpdateRequested == "1"
   ${AndIf} $IsInstalled == "1"
@@ -705,7 +705,7 @@ Function AccountPageLeave
     Call InvalidateInstallerCaptcha
     ${Switch} $R9
       ${Case} "1"
-        MessageBox MB_OK|MB_ICONEXCLAMATION "账密或验证码不正确"
+        MessageBox MB_OK|MB_ICONEXCLAMATION "账号、密码或验证码错误。"
         ${Break}
       ${Case} "30"
       ${Case} "timeout"
@@ -906,7 +906,7 @@ Function ValidateServer
   ${EndIf}
   ${StrStr} $R1 $ServerAuthority "@"
   ${If} $R1 != ""
-    MessageBox MB_OK|MB_ICONEXCLAMATION "服务器地址中不能包含账密。"
+    MessageBox MB_OK|MB_ICONEXCLAMATION "服务器地址中不能包含账号或密码。"
     Return
   ${EndIf}
 
@@ -1071,41 +1071,41 @@ Function SyncRootPage
     ${EndIf}
     DeleteRegKey HKCU "SOFTWARE\${PRODUCT_IDENTIFIER}\SetupRecovery"
   ${EndIf}
-  !insertmacro MUI_HEADER_TEXT "选择同步目录与功能" "同步目录由 Cloud Files 使用；导航栏入口与主界面可分别设置。"
+  !insertmacro MUI_HEADER_TEXT "选择同步目录与功能" "选择本地同步目录和要启用的功能。"
   nsDialogs::Create 1018
   Pop $PageDialog
   ${If} $PageDialog == error
     Abort
   ${EndIf}
-  ${NSD_CreateLabel} 0 0 100% 12u "Cloud Files 本地同步根目录"
+  ${NSD_CreateLabel} 0 0 100% 12u "本地同步目录"
   Pop $0
   ${NSD_CreateText} 0 14u 78% 13u "$SyncRoot"
   Pop $SyncRootEdit
   ${NSD_CreateButton} 81% 13u 19% 15u "浏览"
   Pop $SyncRootBrowse
   ${NSD_OnClick} $SyncRootBrowse BrowseSyncRoot
-  ${NSD_CreateCheckbox} 0 48u 100% 14u "创建桌面快捷方式（打开同步目录或主界面，可在设置中选择）"
+  ${NSD_CreateCheckbox} 0 48u 100% 14u "创建桌面快捷方式"
   Pop $DesktopShortcutCheckbox
   ${If} $CreateDesktopShortcut == "1"
     ${NSD_SetState} $DesktopShortcutCheckbox ${BST_CHECKED}
   ${EndIf}
-  ${NSD_CreateCheckbox} 0 76u 100% 16u "显示 Explorer 导航栏入口"
+  ${NSD_CreateCheckbox} 0 76u 100% 16u "在资源管理器导航栏中显示"
   Pop $NavigationEntryOptionCheckbox
   ${If} $EnableExplorerNavigationEntry == "true"
     ${NSD_SetState} $NavigationEntryOptionCheckbox ${BST_CHECKED}
   ${EndIf}
-  ${NSD_CreateCheckbox} 0 96u 100% 16u "启用主界面（远程文件浏览与拖放）"
+  ${NSD_CreateCheckbox} 0 96u 100% 16u "启用主界面（浏览云端文件）"
   Pop $MainWindowOptionCheckbox
   ${If} $EnableMainWindow == "true"
     ${NSD_SetState} $MainWindowOptionCheckbox ${BST_CHECKED}
   ${EndIf}
-  ${NSD_CreateLabel} 0 117u 100% 24u "至少启用导航栏入口或主界面一项。关闭入口不影响 Cloud Files 同步；开机启动只在托盘运行。"
+  ${NSD_CreateLabel} 0 117u 100% 24u "以上两项至少启用一项。开机后程序在托盘中运行。"
   Pop $0
   nsDialogs::Show
 FunctionEnd
 
 Function BrowseSyncRoot
-  nsDialogs::SelectFolderDialog "选择同步根目录" "$SyncRoot"
+  nsDialogs::SelectFolderDialog "选择同步目录" "$SyncRoot"
   Pop $0
   ${If} $0 != ""
     ${NSD_SetText} $SyncRootEdit $0
@@ -1134,7 +1134,7 @@ Function SyncRootPageLeave
   ${EndIf}
   ${If} $EnableExplorerNavigationEntry == "false"
   ${AndIf} $EnableMainWindow == "false"
-    MessageBox MB_OK|MB_ICONEXCLAMATION "导航栏入口与主界面至少需要启用一项。"
+    MessageBox MB_OK|MB_ICONEXCLAMATION "导航栏入口和主界面至少启用一项。"
     Abort
   ${EndIf}
   ${If} $SyncRoot == ""
@@ -1289,13 +1289,13 @@ Function SummaryPage
   ${If} $PageDialog == error
     Abort
   ${EndIf}
-  StrCpy $0 "程序目录：$InstallDirectory$\r$\n服务器：$Server$\r$\n服务器账号：$Username$\r$\n同步根目录：$SyncRoot$\r$\n桌面快捷方式："
+  StrCpy $0 "程序目录：$InstallDirectory$\r$\n服务器：$Server$\r$\n服务器账号：$Username$\r$\n同步目录：$SyncRoot$\r$\n桌面快捷方式："
   ${If} $CreateDesktopShortcut == "1"
     StrCpy $0 "$0创建"
   ${Else}
     StrCpy $0 "$0不创建"
   ${EndIf}
-  StrCpy $0 "$0$\r$\nExplorer 导航栏入口："
+  StrCpy $0 "$0$\r$\n导航栏入口："
   ${If} $EnableExplorerNavigationEntry == "true"
     StrCpy $0 "$0启用"
   ${Else}
@@ -1331,7 +1331,7 @@ Function un.FinishPagePre
   StrCpy $FinishRebootText "$(MUI_UNTEXT_FINISH_INFO_REBOOT)"
   ${If} $ExplorerRestartDeferred == "1"
     StrCpy $FinishRebootNowText "重启资源管理器(&Y)"
-    StrCpy $FinishRebootText "需要重启资源管理器，或注销/重启计算机，才能完成${PRODUCT_NAME_ZH}的卸载。是否立即重启资源管理器？"
+    StrCpy $FinishRebootText "需要重启资源管理器才能完成卸载，是否立即重启？"
   ${EndIf}
 FunctionEnd
 
@@ -1725,7 +1725,7 @@ Function un.UninstallOptionsPage
   ${If} $PageDialog == error
     Abort
   ${EndIf}
-  ${NSD_CreateLabel} 0 0 100% 32u "卸载会移除程序、桌面快捷方式、侧边栏入口和 SyncRoot 注册。保留的已下载内容会转换为普通文件；清理后为空的同步目录会删除。"
+  ${NSD_CreateLabel} 0 0 100% 32u "将移除程序、桌面快捷方式和导航栏入口。保留的已下载文件会转为普通文件，空的同步目录将被删除。"
   Pop $0
   ${NSD_CreateCheckbox} 0 46u 100% 28u "保留已下载文件和离线内容"
   Pop $KeepDownloadedCheckbox
@@ -1961,7 +1961,7 @@ upgrade_obsolete_files_open_failed:
   Abort
 upgrade_obsolete_files_invalid_path:
   FileClose $PreviousManifestHandle
-  MessageBox MB_OK|MB_ICONSTOP "旧版安装文件清单包含越界路径或重解析路径；为保护其他文件，升级已停止。"
+  MessageBox MB_OK|MB_ICONSTOP "旧版安装文件清单包含无效路径；为保护其他文件，升级已停止。"
   SetErrorLevel 1
   Abort
 upgrade_obsolete_files_new_manifest_failed:
@@ -2037,7 +2037,7 @@ upgrade_obsolete_directories_open_failed:
   Abort
 upgrade_obsolete_directories_invalid_path:
   FileClose $PreviousManifestHandle
-  MessageBox MB_OK|MB_ICONSTOP "旧版安装目录清单包含越界路径或重解析路径；为保护其他文件，升级已停止。"
+  MessageBox MB_OK|MB_ICONSTOP "旧版安装目录清单包含无效路径；为保护其他文件，升级已停止。"
   SetErrorLevel 1
   Abort
 upgrade_obsolete_directories_new_manifest_failed:
@@ -2354,7 +2354,7 @@ install_shell_file_done:
   ; Preserve the user's shortcut name and contents during upgrades.
   ${If} $IsInstalled != "1"
   ${AndIf} $CreateDesktopShortcut == "1"
-    CreateShortCut "$DESKTOP\${PRODUCT_NAME_ZH}.lnk" "$INSTDIR\${PRODUCT_IDENTIFIER}.exe" "-open-folder" "$INSTDIR\Assets\${PRODUCT_IDENTIFIER}-shortcut-${PRODUCT_VERSION}.ico" 0 SW_SHOWNORMAL "" "启动${PRODUCT_NAME_ZH}并打开同步目录或主界面（可在设置中选择）"
+    CreateShortCut "$DESKTOP\${PRODUCT_NAME_ZH}.lnk" "$INSTDIR\${PRODUCT_IDENTIFIER}.exe" "-open-folder" "$INSTDIR\Assets\${PRODUCT_IDENTIFIER}-shortcut-${PRODUCT_VERSION}.ico" 0 SW_SHOWNORMAL "" "启动${PRODUCT_NAME_ZH}"
   ${EndIf}
   Call RefreshDesktopShortcutIcons
 
@@ -2388,7 +2388,7 @@ Section "Uninstall"
   Call un.ValidateInstalledLists
   DetailPrint "正在停止${PRODUCT_NAME_ZH}并清理同步目录…"
   IfFileExists "$INSTDIR\${PRODUCT_IDENTIFIER}.exe" uninstall_app_present 0
-  MessageBox MB_OK|MB_ICONSTOP "主程序文件缺失，无法清理同步目录并注销 SyncRoot。请重新安装后再重试卸载。"
+  MessageBox MB_OK|MB_ICONSTOP "主程序文件缺失，无法清理同步目录。请重新安装后再卸载。"
   SetErrorLevel 1
   Abort
 uninstall_app_present:
@@ -2408,7 +2408,7 @@ uninstall_app_present:
   Pop $R9
   Pop $R8
   ${If} $R9 != "0"
-    MessageBox MB_OK|MB_ICONSTOP "SyncRoot 清理失败，卸载已停止。请查看程序日志。"
+    MessageBox MB_OK|MB_ICONSTOP "同步目录清理失败，卸载已停止。请查看程序日志。"
     SetErrorLevel 1
     Abort
   ${EndIf}
@@ -2455,7 +2455,7 @@ uninstall_shell_done:
     IntOp $R2 $R1 & 0x400
     IntCmp $R2 0 uninstall_appdata_remove uninstall_appdata_reparse uninstall_appdata_reparse
 uninstall_appdata_reparse:
-    MessageBox MB_OK|MB_ICONSTOP "用户配置目录或其子项包含重解析路径。为保护目标内容，卸载已停止。"
+    MessageBox MB_OK|MB_ICONSTOP "用户配置目录中包含链接目录，为保护其指向的文件，卸载已停止。"
     SetErrorLevel 1
     Abort
 uninstall_appdata_remove:
@@ -2547,7 +2547,7 @@ un_session_directory_exists:
   IntOp $R1 $R0 & 0x400
   StrCmp $R1 "0" un_session_directory_safe un_session_directory_reparse
 un_session_directory_reparse:
-  MessageBox MB_OK|MB_ICONSTOP "登录会话目录是重解析路径。为保护其目标内容，卸载已停止。"
+  MessageBox MB_OK|MB_ICONSTOP "登录会话目录是链接目录，为保护其指向的文件，卸载已停止。"
   SetErrorLevel 1
   Abort
 un_session_directory_safe:
@@ -2877,11 +2877,11 @@ un_validate_list_missing:
   SetErrorLevel 1
   Abort
 un_validate_file_list_invalid:
-  MessageBox MB_OK|MB_ICONSTOP "安装文件清单包含越界路径或经过重解析目录的路径。为保护其他文件，卸载已停止。"
+  MessageBox MB_OK|MB_ICONSTOP "安装文件清单包含无效路径。为保护其他文件，卸载已停止。"
   SetErrorLevel 1
   Abort
 un_validate_directory_list_invalid:
-  MessageBox MB_OK|MB_ICONSTOP "安装目录清单包含越界路径或经过重解析目录的路径。为保护其他文件，卸载已停止。"
+  MessageBox MB_OK|MB_ICONSTOP "安装目录清单包含无效路径。为保护其他文件，卸载已停止。"
   SetErrorLevel 1
   Abort
 FunctionEnd
@@ -2924,7 +2924,7 @@ un_delete_file_failed:
   Abort
 un_delete_list_invalid:
   FileClose $R0
-  MessageBox MB_OK|MB_ICONSTOP "安装文件清单包含越界路径或经过重解析目录的路径。为保护其他文件，卸载已停止。"
+  MessageBox MB_OK|MB_ICONSTOP "安装文件清单包含无效路径。为保护其他文件，卸载已停止。"
   SetErrorLevel 1
   Abort
 un_delete_files_done:
@@ -2947,7 +2947,7 @@ un_delete_directories_loop:
   Goto un_delete_directories_loop
 un_delete_directories_invalid:
   FileClose $R0
-  MessageBox MB_OK|MB_ICONSTOP "安装目录清单包含越界路径或经过重解析目录的路径。为保护其他文件，卸载已停止。"
+  MessageBox MB_OK|MB_ICONSTOP "安装目录清单包含无效路径。为保护其他文件，卸载已停止。"
   SetErrorLevel 1
   Abort
 un_delete_directories_done:

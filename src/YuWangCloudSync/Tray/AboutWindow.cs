@@ -166,7 +166,7 @@ internal sealed class AboutWindow : Window
         card.Children.Add(new TextBlock
         {
             Text = "应用信息",
-            Style = WinUiUiHost.GetStyleResource("SubtitleTextBlockStyle"),
+            Style = WinUiUiHost.GetStyleResource("BodyStrongTextBlockStyle"),
         });
         card.Children.Add(new Border
         {
@@ -182,14 +182,14 @@ internal sealed class AboutWindow : Window
         card.Children.Add(new TextBlock
         {
             Text = "关于此应用",
-            Style = WinUiUiHost.GetStyleResource("SubtitleTextBlockStyle"),
+            Style = WinUiUiHost.GetStyleResource("BodyStrongTextBlockStyle"),
         });
         card.Children.Add(new Border
         {
             Style = WinUiUiHost.GetStyleResource("YuWangCardStyle"),
             Child = new TextBlock
             {
-                Text = "将育网云盘目录接入 Windows 文件资源管理器，按需获取云端文件。",
+                Text = "在资源管理器中直接访问育网云盘，文件按需下载。",
                 TextWrapping = TextWrapping.Wrap,
                 Style = WinUiUiHost.GetStyleResource("YuWangCaptionTextBlockStyle"),
             },
@@ -228,7 +228,7 @@ internal sealed class AboutWindow : Window
         card.Children.Add(new TextBlock
         {
             Text = "开源许可",
-            Style = WinUiUiHost.GetStyleResource("SubtitleTextBlockStyle"),
+            Style = WinUiUiHost.GetStyleResource("BodyStrongTextBlockStyle"),
         });
         card.Children.Add(new Border
         {
@@ -568,7 +568,7 @@ internal sealed class AboutWindow : Window
 
         if (_releaseDialogStatus is not null)
         {
-            _releaseDialogStatus.Text = state.ErrorMessage ?? (state.IsDownloaded ? "下载完成，需要手动重启更新。" : "");
+            _releaseDialogStatus.Text = state.ErrorMessage ?? (state.IsDownloaded ? "已下载，点击“重启更新”完成安装。" : "");
             _releaseDialogStatus.Visibility = string.IsNullOrWhiteSpace(_releaseDialogStatus.Text)
                 ? Visibility.Collapsed
                 : Visibility.Visible;

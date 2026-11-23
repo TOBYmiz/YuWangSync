@@ -1,4 +1,5 @@
 using System.Runtime.InteropServices;
+using System.Runtime.CompilerServices;
 using System.Text;
 using YuWangCloudSync.CloudFiles;
 
@@ -23,6 +24,10 @@ internal static unsafe class VirtualFileDragSelfTest
         Marshal.ThrowExceptionForHR(initialized);
         try
         {
+            check(NativeFileDrag.CheckOriginalItemVisual(new DragItemVisual(new byte[32 * 16 * 4], 32, 16, 2, 2)),
+                "original item image initializes on the actual virtual data object without leaking GDI/USER resources");
+            RunPrivateMedia(check);
+            RunCompletionWithUnusedStream(check);
             var requested = 0; var disposed = 0;
             using var gate = new ManualResetEventSlim(false);
             using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
@@ -110,6 +115,107 @@ internal static unsafe class VirtualFileDragSelfTest
         finally { CoUninitialize(); }
     }
     internal static bool SupportsDescriptors(nint data) => Query(data, F("FileGroupDescriptorW", 1, -1)) == 0;
+    private static void RunCompletionWithUnusedStream(Action<bool, string> check)
+    {
+        var requested = 0;
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+        using var data = new VirtualFileDataObject([new("探测流.txt", false, 20, null, _ =>
+        {
+            Interlocked.Increment(ref requested);
+            throw new IOException("未使用的探测流不应提取内容。");
+        })], timeout.Token);
+        var stream = GetData(data.Pointer, F("FileContents", 4, 0));
+        var asyncId = new Guid("3D8B0590-F691-11d2-8EA9-006097DF5BD4");
+        nint capability = 0;
+        try
+        {
+            Marshal.ThrowExceptionForHR(Marshal.QueryInterface(data.Pointer, in asyncId, out capability));
+            var methods = *(nint**)capability;
+            Marshal.ThrowExceptionForHR(((delegate* unmanaged[Stdcall]<nint, nint, int>)methods[5])(capability, 0));
+            var finished = data.FinishExtractionAsync(timeout.Token);
+            check(!finished.IsCompleted, "the source stays busy until the receiver ends its asynchronous operation");
+            Marshal.ThrowExceptionForHR(((delegate* unmanaged[Stdcall]<nint, int, nint, uint, int>)methods[7])(capability, 0, 0, 1));
+            finished.GetAwaiter().GetResult();
+            check(data.OpenStreams == 1 && requested == 0,
+                "EndOperation finishes the source UI even when a receiver retains an unread probe stream");
+        }
+        finally
+        {
+            if (capability != 0) Marshal.Release(capability);
+            ReleaseStgMedium(ref stream);
+        }
+        check(data.OpenStreams == 0, "retained probe stream resources release through their own COM lifetime");
+    }
+    private sealed class MediumOwner(Action release) : DragComObject(OwnerTable)
+    {
+        internal nint Pointer => Identity;
+        protected override nint FindInterface(Guid id) => 0;
+        protected override void ReleaseResources() => release();
+        private static readonly nint OwnerTable = Table(typeof(MediumOwner),
+            (nint)(delegate* unmanaged[Stdcall]<nint, Guid*, nint*, int>)&Query,
+            (nint)(delegate* unmanaged[Stdcall]<nint, uint>)&AddRef,
+            (nint)(delegate* unmanaged[Stdcall]<nint, uint>)&Release);
+    }
+    private static void RunPrivateMedia(Action<bool, string> check)
+    {
+        var format = F("YuWang private stream ownership regression", 4, 2);
+        for (var transfer = 0; transfer <= 1; transfer++)
+        {
+            var released = 0; var replacementReleased = 0;
+            VirtualFileDataObject.Medium MakeStream(Action onRelease)
+            {
+                Marshal.ThrowExceptionForHR(CreateStreamOnHGlobal(0, true, out var stream));
+                byte* sample = stackalloc byte[] { 11, 22, 33 };
+                uint written;
+                Marshal.ThrowExceptionForHR(((delegate* unmanaged[Stdcall]<nint, void*, uint, uint*, int>)(*(nint**)stream)[4])(stream, sample, 3, &written));
+                Marshal.ThrowExceptionForHR(((delegate* unmanaged[Stdcall]<nint, long, uint, ulong*, int>)(*(nint**)stream)[5])(stream, 0, 0, null));
+                var owner = new MediumOwner(() => { Marshal.Release(stream); onRelease(); });
+                return new() { Type = 4, Value = stream, Owner = owner.Pointer };
+            }
+            var original = MakeStream(() => released++);
+            var replacement = MakeStream(() => replacementReleased++);
+            var received = new VirtualFileDataObject.Medium();
+            try
+            {
+                using (var data = new VirtualFileDataObject([], CancellationToken.None))
+                {
+                    Marshal.ThrowExceptionForHR(SetData(data.Pointer, format, ref original, transfer));
+                    if (transfer != 0) original = default;
+                    else { ReleaseStgMedium(ref original); original = default; }
+                    check(Query(data.Pointer, format) == 0 && Query(data.Pointer, F("YuWang private stream ownership regression", 1, 2)) < 0
+                        && Query(data.Pointer, F("YuWang private stream ownership regression", 4, -1)) < 0,
+                        $"private media preserve native type and index (fRelease={transfer})");
+                    received = GetData(data.Pointer, format);
+                    check(received.Type == 4 && ReadPointer(received.Value, 8).AsSpan().SequenceEqual(new byte[] { 11, 22, 33 }),
+                        $"private IStream remains readable after the caller releases its medium (fRelease={transfer})");
+                    Marshal.ThrowExceptionForHR(SetData(data.Pointer, format, ref replacement, 1));
+                    replacement = default;
+                    check(released == 0 && !data.HasFailure,
+                        $"replacing private media preserves outstanding receiver ownership (fRelease={transfer})");
+                    var denied = format; denied.Id = 15;
+                    check(SetData(data.Pointer, denied, ref received, 1) < 0 && released == 0,
+                        $"refused raw paths do not take ownership of the caller medium (fRelease={transfer})");
+                }
+                check(replacementReleased == 1 && released == 0,
+                    $"final data-object release frees stored media without invalidating the receiver (fRelease={transfer})");
+                ReleaseStgMedium(ref received);
+                received = default;
+                check(released == 1, $"the receiver releases pUnkForRelease exactly once (fRelease={transfer})");
+            }
+            finally
+            {
+                if (original.Type != 0) ReleaseStgMedium(ref original);
+                if (replacement.Type != 0) ReleaseStgMedium(ref replacement);
+                if (received.Type != 0) ReleaseStgMedium(ref received);
+            }
+        }
+    }
+    private static int SetData(nint data, VirtualFileDataObject.Format format, ref VirtualFileDataObject.Medium medium, int release)
+    {
+        fixed (VirtualFileDataObject.Medium* pointer = &medium)
+            return ((delegate* unmanaged[Stdcall]<nint, VirtualFileDataObject.Format*, VirtualFileDataObject.Medium*, int, int>)(*(nint**)data)[7])
+                (data, &format, pointer, release);
+    }
     internal static Task<string> ReceiveAsync(nint data, string expectedName, string copyPath)
     {
         var asyncId = new Guid("3D8B0590-F691-11d2-8EA9-006097DF5BD4");

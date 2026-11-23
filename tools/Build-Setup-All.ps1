@@ -33,7 +33,7 @@ if (-not [string]::IsNullOrWhiteSpace($MakensisPath)) {
     $buildArguments['MakensisPath'] = $MakensisPath
 }
 
-# Both scripts clear and regenerate the app's obj directory, so run them in sequence.
+# Build sequentially to avoid competing for the shell-extension output and native compiler resources.
 foreach ($build in $builds) {
     Write-Output ("开始构建{0}安装包…" -f $build.Name)
     & $build.Script @buildArguments

@@ -37,8 +37,8 @@ internal sealed partial class MainWindow
     };
     private readonly HashSet<(ulong Disk, ulong Folder)> _unavailableFavorites = [];
     private double _preferredFavoritesHeight;
-    private readonly DispatcherTimer _favoritesAnimation = new() { Interval = TimeSpan.FromMilliseconds(16) };
     private readonly RotateTransform _favoritesChevronRotation = new();
+    private bool _favoritesAnimating;
     private long _favoritesAnimationStarted;
     private double _favoritesAnimationFrom;
     private double _favoritesAnimationTo;
@@ -52,7 +52,6 @@ internal sealed partial class MainWindow
         _favoritesChevron.Glyph = "\uE76C";
         _favoritesChevron.RenderTransformOrigin = new Windows.Foundation.Point(0.5, 0.5);
         _favoritesChevron.RenderTransform = _favoritesChevronRotation;
-        _favoritesAnimation.Tick += (_, _) => TickFavoritesAnimation();
         _favoritesBody.SizeChanged += (_, _) => _favoritesBody.Clip = new RectangleGeometry
         {
             Rect = new Windows.Foundation.Rect(0, 0, _favoritesBody.ActualWidth, _favoritesBody.ActualHeight),
@@ -81,7 +80,7 @@ internal sealed partial class MainWindow
             if (!_savedState.FavoritesExpanded || !point.Properties.IsLeftButtonPressed
                 || !_favoritesGrip.CapturePointer(args.Pointer)) return;
             dragging = true;
-            _favoritesAnimation.Stop();
+            StopFavoritesAnimation();
             startY = point.Position.Y;
             startHeight = _favoritesRow.ActualHeight;
             args.Handled = true;
@@ -174,10 +173,9 @@ internal sealed partial class MainWindow
         var target = expanded ? ClampFavoritesHeight(_preferredFavoritesHeight) : CollapsedFavoritesHeight;
         _favoritesGrip.IsHitTestVisible = expanded;
         AutomationProperties.SetName(_favoritesToggle, expanded ? "收起收藏" : "展开收藏");
-        if (!animate && _favoritesAnimation.IsEnabled) return;
-        _favoritesAnimation.Stop();
-        if (animate && _sidebarPanes.ActualHeight > 0
-            && new Windows.UI.ViewManagement.UISettings().AnimationsEnabled)
+        if (!animate && _favoritesAnimating) return;
+        StopFavoritesAnimation();
+        if (animate && _sidebarPanes.ActualHeight > 0 && _uiSettings.AnimationsEnabled)
         {
             _favoritesAnimationFrom = _favoritesRow.ActualHeight;
             _favoritesAnimationTo = target;
@@ -185,16 +183,41 @@ internal sealed partial class MainWindow
             _favoritesRotationFrom = _favoritesChevronRotation.Angle;
             _favoritesOpacityFrom = _favoritesBody.Opacity;
             _favoritesBody.Visibility = Visibility.Visible;
+            // Freeze both panes at their larger extent and let the grid rows clip them. Each frame then
+            // only re-arranges two rows instead of re-measuring the tree list and the favorites list.
+            var gripTo = expanded ? FavoritesGripHeight : 1;
+            var treeHeight = Math.Max(_navigationTree.ActualHeight,
+                _sidebarPanes.ActualHeight - target - gripTo);
+            _navigationTree.Height = Math.Max(MinimumNavigationTreeHeight, treeHeight);
+            _navigationTree.VerticalAlignment = VerticalAlignment.Top;
+            _favoritesBody.Height = Math.Max(0,
+                Math.Max(_favoritesAnimationFrom, _favoritesAnimationTo) - CollapsedFavoritesHeight);
+            _favoritesBody.VerticalAlignment = VerticalAlignment.Top;
             _favoritesAnimationStarted = Stopwatch.GetTimestamp();
-            _favoritesAnimation.Start();
+            _favoritesAnimating = true;
+            CompositionTarget.Rendering += OnFavoritesAnimationFrame;
             return;
         }
         ApplyFavoritesAnimation(target, expanded ? FavoritesGripHeight : 1, expanded ? 90 : 0, expanded ? 1 : 0);
         _favoritesBody.Visibility = expanded ? Visibility.Visible : Visibility.Collapsed;
     }
 
-    private void TickFavoritesAnimation()
+    private void StopFavoritesAnimation()
     {
+        if (!_favoritesAnimating) return;
+        _favoritesAnimating = false;
+        CompositionTarget.Rendering -= OnFavoritesAnimationFrame;
+        _navigationTree.ClearValue(FrameworkElement.HeightProperty);
+        _navigationTree.ClearValue(FrameworkElement.VerticalAlignmentProperty);
+        _favoritesBody.ClearValue(FrameworkElement.HeightProperty);
+        _favoritesBody.ClearValue(FrameworkElement.VerticalAlignmentProperty);
+    }
+
+    // CompositionTarget.Rendering runs once per composed frame, unlike a 16 ms DispatcherTimer
+    // that drifts against vsync and visibly skips frames.
+    private void OnFavoritesAnimationFrame(object? sender, object args)
+    {
+        if (_isClosed) { StopFavoritesAnimation(); return; }
         var progress = Math.Clamp(Stopwatch.GetElapsedTime(_favoritesAnimationStarted).TotalMilliseconds / 200, 0, 1);
         var eased = 1 - Math.Pow(1 - progress, 3);
         var expanded = _savedState.FavoritesExpanded;
@@ -203,14 +226,15 @@ internal sealed partial class MainWindow
             _favoritesRotationFrom + ((expanded ? 90 : 0) - _favoritesRotationFrom) * eased,
             _favoritesOpacityFrom + ((expanded ? 1 : 0) - _favoritesOpacityFrom) * eased);
         if (progress < 1) return;
-        _favoritesAnimation.Stop();
+        StopFavoritesAnimation();
         ConstrainFavoritesHeight();
     }
 
     private void ApplyFavoritesAnimation(double height, double gripHeight, double angle, double opacity)
     {
-        _favoritesRow.Height = new GridLength(height);
-        _sidebarPanes.RowDefinitions[1].Height = new GridLength(gripHeight);
+        if (_favoritesRow.Height.Value != height) _favoritesRow.Height = new GridLength(height);
+        if (_sidebarPanes.RowDefinitions[1].Height.Value != gripHeight)
+            _sidebarPanes.RowDefinitions[1].Height = new GridLength(gripHeight);
         _favoritesChevronRotation.Angle = angle;
         _favoritesBody.Opacity = opacity;
     }
@@ -315,7 +339,7 @@ internal sealed partial class MainWindow
             };
             AutomationProperties.SetName(button, favorite.Name + (unavailable ? "，目录暂不可用" : "，收藏文件夹"));
             ToolTipService.SetToolTip(button, unavailable
-                ? "目录暂不可用，可点击重试或右键移除收藏。" : favorite.DisplayPath);
+                ? "暂不可用，点击重试或右键移除。" : favorite.DisplayPath);
             button.Click += (_, _) => RunUi(() => OpenFavoriteAsync(favorite));
             var menu = new MenuFlyout();
             var remove = NewMenuItem("\uE77A", "移除收藏");
@@ -372,8 +396,8 @@ internal sealed partial class MainWindow
             _unavailableFavorites.Add((favorite.DiskId, favorite.FolderId));
             RenderFavorites();
             ShowInfo(InfoBarSeverity.Warning, "收藏目录暂不可用",
-                "目录可能已移动、删除或无权访问。收藏已保留，可刷新磁盘后重试，或右键移除。");
-        });
+                "目录可能已移动、删除或无权访问。可刷新后重试，或右键移除收藏。");
+        }, "无法打开收藏");
         if (target is null || _isClosed) return;
         await NavigateToFolderAsync(target, addToHistory: true);
     }

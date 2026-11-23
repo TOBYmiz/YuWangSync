@@ -16,7 +16,7 @@ internal static class AccountSwitchCleanup
         if (!Directory.Exists(root)) return new(0, 0, []);
         // This guard is intentionally checked before *any* recursive enumeration or deletion.
         if ((File.GetAttributes(root) & FileAttributes.ReparsePoint) != 0 && !ProviderIdentity.OwnsSyncRootPlaceholder(root))
-            throw new IOException("同步根目录是未确认归属的重解析目录，已停止清理。");
+            throw new IOException("无法确认同步目录归属，已停止清理。");
         long deleted = 0, failed = 0;
         var errors = new List<string>();
         void Failed(string path, Exception error)

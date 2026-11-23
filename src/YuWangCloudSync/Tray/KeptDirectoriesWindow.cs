@@ -65,8 +65,8 @@ internal sealed class KeptDirectoriesWindow : Window
             });
             var cancel = new Button
             {
-                Content = "取消目录自动刷新",
-                MinWidth = 142,
+                Content = "取消保持更新",
+                MinWidth = 112,
                 VerticalAlignment = VerticalAlignment.Center,
             };
             cancel.Click += (_, _) =>

@@ -52,14 +52,27 @@ internal sealed partial class MainWindow
             text += $" {percent:F2}% · {FormatSize(progress.CompletedBytes)} / {FormatSize(progress.TotalBytes)}";
         if (progress.TotalFiles > 0 && progress.TotalBytes is not null)
             text += $" · 已完成 {progress.CompletedFiles}/{progress.TotalFiles} 个文件";
-        if (!string.IsNullOrEmpty(progress.FileName)) text += $" · {progress.FileName}";
-        _status.TextWrapping = TextWrapping.Wrap;
-        _status.TextTrimming = TextTrimming.None;
+        var fullText = string.IsNullOrEmpty(progress.FileName) ? text : $"{text} · {progress.FileName}";
+        if (!string.IsNullOrEmpty(progress.FileName)) text += $" · {ShortenFileName(progress.FileName)}";
         SetTransferProgress(text, progress.Percent ?? 0);
         _transferProgress.IsIndeterminate = progress.Percent is null;
-        ToolTipService.SetToolTip(_status, text);
+        ToolTipService.SetToolTip(_status, fullText);
         _dragProgressShown = true;
         _cancelDragPreparation.Visibility = Visibility.Visible;
+    }
+
+    private const int MaxStatusFileNameLength = 36;
+
+    /// <summary>Middle-truncates a long name so the extension stays visible in the one-line status bar.</summary>
+    internal static string ShortenFileName(string name)
+    {
+        if (name.Length <= MaxStatusFileNameLength) return name;
+        var extension = Path.GetExtension(name);
+        if (extension.Length > 10) extension = "";
+        var stem = name[..^extension.Length];
+        var keep = MaxStatusFileNameLength - extension.Length - 1;
+        var head = (keep + 1) / 2;
+        return $"{stem[..head]}…{stem[^(keep - head)..]}{extension}";
     }
 
     private void StopDragPreparationProgress(bool clearStatus = false)
@@ -72,8 +85,6 @@ internal sealed partial class MainWindow
         _dragProgressShown = false;
         _transferProgress.IsIndeterminate = false;
         _transferProgress.Visibility = Visibility.Collapsed;
-        _status.TextWrapping = TextWrapping.NoWrap;
-        _status.TextTrimming = TextTrimming.CharacterEllipsis;
         ToolTipService.SetToolTip(_status, null);
         if (clearStatus) SetStatus("");
     }
@@ -165,7 +176,7 @@ internal sealed partial class MainWindow
             return (Directory: directory, Size: directory ? (long?)null : readiness.Size,
                 ReadyBytes: readiness.ReadyBytes, IsReady: readiness.IsReady, Modified: File.GetLastWriteTimeUtc(path));
         }, token);
-        if (name.Length >= 260) throw new IOException("拖放文件相对路径超过 259 个字符。");
+        if (name.Length >= 260) throw new IOException("文件路径过长（超过 259 个字符）。");
         if (metadata.Directory)
         {
             manifest.Entries.Add(new(name, true, null, metadata.Modified));
@@ -187,7 +198,7 @@ internal sealed partial class MainWindow
     private async Task AddRemoteDragEntriesAsync(DragManifest manifest, ulong disk, YuWangItem item, string name, CancellationToken token)
     {
         token.ThrowIfCancellationRequested();
-        if (name.Length >= 260) throw new IOException("拖放文件相对路径超过 259 个字符。");
+        if (name.Length >= 260) throw new IOException("文件路径过长（超过 259 个字符）。");
         if (item.IsFolder)
         {
             manifest.Entries.Add(new(name, true, null, item.UploadTime));
@@ -237,7 +248,7 @@ internal sealed partial class MainWindow
         _dragCancelledByUser = true;
         _dragCancellation?.Cancel();
         _cancelDragPreparation.IsEnabled = false;
-        SetStatus("正在取消文件准备…");
+        SetProgressStatus("正在取消文件准备…");
     }
 
     private void CheckDragIntent()
@@ -292,7 +303,7 @@ internal sealed partial class MainWindow
         try
         {
             EnsureDragBackendAvailable();
-            if (warmup is null) throw new IOException("没有可拖放的文件，请重新选择文件后重试。");
+            if (warmup is null) throw new IOException("没有可拖放的文件。");
             _dragProgressState = new(); _dragProgressTask = session.Task;
             _dragProgressState.Report(new("正在读取文件信息")); _dragProgressTimer.Start();
             monitor.Tick += (_, _) =>
@@ -313,21 +324,21 @@ internal sealed partial class MainWindow
             var manifest = await warmup.WaitAsync(cancellation.Token);
             metadataPreview?.Dispose(); metadataPreview = null;
             _dragProgressState = manifest.Progress;
-            manifest.Progress.Report(new("拖动项目到目标位置，松手后提取文件"));
+            manifest.Progress.Report(new("拖到目标位置后松开"));
             EnsureDragBackendAvailable(); cancellation.Token.ThrowIfCancellationRequested();
             if (!NativeFileDrag.IsLeftButtonDown || NativeFileDrag.IsEscapeDown) throw new OperationCanceledException();
             using var data = new VirtualFileDataObject(manifest.Entries, cancellation.Token);
-            _dragDiagnostic?.Invoke($"Entering virtual file drag; descriptors={manifest.Entries.Count}; no hydration started");
+            ReportDragDiagnostic($"Entering virtual file drag; descriptors={manifest.Entries.Count}; no hydration started");
             enteredOle = true;
             _items.ReleasePointerCaptures(); NativeFileDrag.ReleaseMouseCapture();
             var copied = await NativeFileDrag.DropVirtualAsync(data, visual,
-                () => !cancellation.IsCancellationRequested && _dragBackendAvailable() && !data.HasFailure);
-            _dragDiagnostic?.Invoke($"OLE returned; copied={copied}; async extraction={data.InAsyncOperation}");
+                () => !cancellation.IsCancellationRequested && _dragBackendAvailable() && !data.HasFailure, ReportDragDiagnostic);
+            ReportDragDiagnostic($"OLE returned; copied={copied}; async extraction={data.InAsyncOperation}; streams={data.OpenStreams}; ended={data.OperationEnded.IsCompleted}");
             if (copied)
             {
                 await data.FinishExtractionAsync(cancellation.Token);
                 EnsureDragBackendAvailable();
-                SetStatus("已交给目标复制");
+                SetStatus("已开始复制");
             }
             else
             {
@@ -341,14 +352,14 @@ internal sealed partial class MainWindow
             if (!_isClosed)
             {
                 SetStatus("已取消文件准备");
-                if (!_dragBackendAvailable()) ShowInfo(InfoBarSeverity.Error, "拖放失败", "同步引擎已停止，无法继续提取文件。");
+                if (!_dragBackendAvailable()) ShowInfo(InfoBarSeverity.Error, "拖放失败", "同步已停止，无法继续。");
                 else if (!_dragCancelledByUser && !Program.ApplicationCancellationToken.IsCancellationRequested && cancellation.IsCancellationRequested)
-                    ShowInfo(InfoBarSeverity.Error, "拖放失败", "文件准备超时，请检查网络连接与同步引擎后重试。");
+                    ShowInfo(InfoBarSeverity.Error, "拖放失败", "准备文件超时，请检查网络后重试。");
             }
         }
         catch (Exception error)
         {
-            _dragDiagnostic?.Invoke($"Virtual drag failed: {error}"); Serilog.Log.Warning(error, "向外拖放失败");
+            ReportDragDiagnostic($"Virtual drag failed: {error}"); Serilog.Log.Warning(error, "向外拖放失败");
             if (!_isClosed) { SetStatus("拖放失败"); ShowInfo(InfoBarSeverity.Error, "拖放失败", error.Message); }
         }
         finally
@@ -364,8 +375,15 @@ internal sealed partial class MainWindow
         }
     }
 
+    private void ReportDragDiagnostic(string message)
+    {
+        Serilog.Log.Information("[DRAG] {Detail}", message);
+        try { _dragDiagnostic?.Invoke(message); }
+        catch (Exception error) { Serilog.Log.Debug(error, "写入拖放诊断失败"); }
+    }
+
     private void EnsureDragBackendAvailable()
     {
-        if (!_dragBackendAvailable()) throw new IOException("同步引擎尚未连接或正在停止，请等待同步恢复后再拖放。");
+        if (!_dragBackendAvailable()) throw new IOException("同步尚未就绪，请稍后再拖放。");
     }
 }

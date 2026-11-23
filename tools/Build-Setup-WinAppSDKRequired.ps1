@@ -68,6 +68,7 @@ $publish = Join-Path $stage 'payload'
 $shellExtensionFileName = $productIdentifier + 'ShellExt-' + [guid]::NewGuid().ToString('N') + '.dll'
 $shellExtensionPath = Join-Path $stage ($productIdentifier + 'ShellExt.dll')
 $mainBuildOutput = Join-Path $stage 'main-build'
+$mainBuildArtifacts = Join-Path $stage 'main-artifacts'
 $installedFilesPath = Join-Path $stage 'installed-files.txt'
 $installedDirectoriesPath = Join-Path $stage 'installed-directories.txt'
 $generatedNsisScript = Join-Path $stage 'Setup.generated.nsi'
@@ -77,20 +78,9 @@ try {
     & (Join-Path $PSScriptRoot 'New-OverlayIcon.ps1')
     Invoke-Checked $MSBuildPath @((Join-Path $repository 'src\YuWangCloudSync.ShellExt\YuWangCloudSync.ShellExt.vcxproj'), '/p:Configuration=Release', '/p:Platform=x64', ('/p:ProductVersion=' + $version), '/nologo')
 
-    # A prior packaged or differently configured WinUI build can leave an incompatible
-    # PRI/XBF set in obj. Generate this unpackaged, self-contained NativeAOT build's own
-    # application resource index instead of reusing those intermediates.
-    $appProject = [System.IO.Path]::GetFullPath((Join-Path $repository 'src\YuWangCloudSync'))
-    $appIntermediate = [System.IO.Path]::GetFullPath((Join-Path $appProject 'obj'))
-    $appProjectPrefix = $appProject.TrimEnd('\') + '\'
-    if (-not $appIntermediate.StartsWith($appProjectPrefix, [System.StringComparison]::OrdinalIgnoreCase) -or
-        [System.IO.Path]::GetFileName($appIntermediate) -ne 'obj') {
-        throw 'WinUI intermediate directory validation failed; stale resources were not removed.'
-    }
-    if (Test-Path -LiteralPath $appIntermediate) {
-        Write-Output '清理主程序 WinUI 中间产物，确保生成 unpackaged PRI…'
-        Remove-Item -LiteralPath $appIntermediate -Recurse -Force
-    }
+    # Fresh, per-project intermediates isolate PRI/XBF and NuGet assets from ordinary
+    # builds and the helper publish. Never delete or read the shared project obj here.
+    Write-Output '使用独立主程序构建目录，隔离 WinUI 资源和 NuGet 还原产物…'
 
     # Require the machine-wide Windows App Runtime instead of copying its framework
     # payload next to the app. .NET itself is published self-contained with NativeAOT.
@@ -99,11 +89,11 @@ try {
     # GenerateDepsFile writes into OutDir before every project reference has
     # necessarily created it, so prepare the shared custom output directory first.
     [System.IO.Directory]::CreateDirectory($mainBuildOutput) | Out-Null
-    Invoke-Checked 'dotnet' @('publish', (Join-Path $repository 'src\YuWangCloudSync\YuWangCloudSync.csproj'), '-c', 'Release', '-r', 'win-x64', '--self-contained', 'true', '-p:PublishAot=true', '-p:PublishTrimmed=true', ('-p:ProductVersion=' + $version), '-p:WindowsAppSDKSelfContained=false', '-p:DebugType=None', '-p:DebugSymbols=false', ('-p:OutDir=' + $mainBuildOutput + '\'), '-o', $publish)
-    & (Join-Path $PSScriptRoot 'Publish-AdminHelper.ps1') -PayloadDirectory $publish
+    Invoke-Checked 'dotnet' @('publish', (Join-Path $repository 'src\YuWangCloudSync\YuWangCloudSync.csproj'), '-c', 'Release', '-r', 'win-x64', '--self-contained', 'true', '--artifacts-path', $mainBuildArtifacts, '-p:PublishAot=true', '-p:PublishTrimmed=true', ('-p:ProductVersion=' + $version), '-p:WindowsAppSDKSelfContained=false', '-p:DebugType=None', '-p:DebugSymbols=false', ('-p:OutDir=' + $mainBuildOutput + '\'), '-o', $publish)
     & (Join-Path $PSScriptRoot 'Copy-DotNetRuntimeNotices.ps1') `
-        -ProjectAssetsFile (Join-Path $appProject 'obj\project.assets.json') `
+        -ProjectAssetsFile (Join-Path $mainBuildArtifacts 'obj\YuWangCloudSync\project.assets.json') `
         -PublishDirectory $publish
+    & (Join-Path $PSScriptRoot 'Publish-AdminHelper.ps1') -PayloadDirectory $publish
 
     # Version the shortcut icon path so Explorer can use a fresh icon-cache key after updates.
     $shortcutIconSource = Join-Path $publish 'Assets\yw_tray.ico'
@@ -121,17 +111,8 @@ try {
         }
     }
 
-    # The machine-wide Windows App Runtime supplies the WinUI framework resources;
-    # local MUI directories may be absent. When local MUI directories exist,
-    # keep simplified Chinese and English and remove the other languages.
-    $unselectedLanguageDirectories = @(Get-ChildItem -LiteralPath $publish -Directory | Where-Object {
-        $_.Name -notin @('zh-CN', 'en-us') -and @(Get-ChildItem -LiteralPath $_.FullName -Filter '*.mui' -File).Count -gt 0
-    })
-    $languageFiles = @($unselectedLanguageDirectories | ForEach-Object { Get-ChildItem -LiteralPath $_.FullName -Recurse -File })
-    $languageBytes = ($languageFiles | Measure-Object -Property Length -Sum).Sum
-    foreach ($file in $languageFiles) { Write-Output ('裁剪未使用语言资源：' + $file.FullName.Substring($publish.Length + 1)) }
-    foreach ($directory in $unselectedLanguageDirectories) { Remove-Item -LiteralPath $directory.FullName -Recurse -Force }
-    Write-Output ('裁剪 WinUI 非中文/英文资源目录：{0} 个文件，未压缩 {1:N2} MiB。' -f $languageFiles.Count, ($languageBytes / 1MB))
+    # This variant can omit local MUI files; prune any that are present using the shared policy.
+    & (Join-Path $PSScriptRoot 'Prune-WindowsAppSdkPayload.ps1') -PayloadDirectory $publish -RuntimeMode Framework
 
     # This variant must not carry app-local Windows App Runtime files. Keep the small
     # bootstrapper NuGet asset if the SDK emits it; it activates the separately

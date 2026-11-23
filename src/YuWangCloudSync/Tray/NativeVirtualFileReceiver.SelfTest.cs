@@ -53,23 +53,3 @@ internal sealed partial class NativeVirtualFileReceiver(Action<int> over, Func<n
     [DllImport("ole32.dll")] private static extern int RegisterDragDrop(nint window, nint target);
     [DllImport("ole32.dll")] private static extern int RevokeDragDrop(nint window);
 }
-
-internal sealed unsafe partial class NativeFileDrag
-{
-    internal static bool CheckOriginalItemVisual(DragItemVisual visual)
-    {
-        void Exercise()
-        {
-            using var drag = new NativeFileDrag(preparing: false);
-            drag.SetItemVisual(visual);
-            drag.ShowItemPreview(visual);
-            drag.MovePreparationImage();
-            drag.HidePreparationImage();
-        }
-        Exercise();
-        var process = GetCurrentProcess();
-        var gdi = GetGuiResources(process, 0); var user = GetGuiResources(process, 1);
-        for (var i = 0; i < 5; i++) Exercise();
-        return GetGuiResources(process, 0) <= gdi + 1 && GetGuiResources(process, 1) <= user + 1;
-    }
-}

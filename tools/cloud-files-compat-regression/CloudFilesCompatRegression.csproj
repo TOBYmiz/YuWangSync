@@ -21,6 +21,7 @@
     <Compile Include="../../src/YuWangCloudSync/Tray/VirtualFileDataObject.SelfTest.cs" Link="VirtualFileDataObject.SelfTest.cs" />
     <Compile Include="../../src/YuWangCloudSync/Tray/VirtualFileDataObject.cs" Link="VirtualFileDataObject.cs" />
     <Compile Include="../../src/YuWangCloudSync/Tray/NativeFileDrag.cs" Link="NativeFileDrag.cs" />
+    <Compile Include="../../src/YuWangCloudSync/Tray/NativeFileDrag.Virtual.cs" Link="NativeFileDrag.Virtual.cs" />
     <Compile Include="../../src/YuWangCloudSync/Tray/NativeFileDrag.SelfTest.cs" Link="NativeFileDrag.SelfTest.cs" />
   </ItemGroup>
 </Project>

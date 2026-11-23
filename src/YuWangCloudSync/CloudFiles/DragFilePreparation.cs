@@ -112,7 +112,7 @@ internal sealed class DragFilePreparation : IDisposable
             // An unavailable native counter produces indeterminate UI, never a guessed value.
             long? ready = 0;
             foreach (var file in _entries) ready += file.ReadyBytes;
-            detailedProgress?.Invoke(new("正在水化文件", Path.GetFileName(entry.Path), ready, totalBytes,
+            detailedProgress?.Invoke(new("正在下载文件", Path.GetFileName(entry.Path), ready, totalBytes,
                 completedFiles, _entries.Count));
         }
         foreach (var entry in _entries)
@@ -124,11 +124,14 @@ internal sealed class DragFilePreparation : IDisposable
             if (NeedsHydration(entry.Handle))
                 Hydrate(entry.Handle, entry.Path, token, () =>
                 {
-                    entry.ReadyBytes = ReadHydratedBytes(entry);
+                    // Keep a high-water mark: committing a range moves bytes from in-flight to on-disk.
+                    var sampled = ReadHydratedBytes(entry);
+                    entry.ReadyBytes = sampled is { } bytes && entry.ReadyBytes is { } previous
+                        ? Math.Max(bytes, previous) : sampled;
                     Report(entry);
                 });
             token.ThrowIfCancellationRequested();
-            if (NeedsHydration(entry.Handle)) throw new IOException($"文件“{Path.GetFileName(entry.Path)}”仍未完整水化，已取消拖放。");
+            if (NeedsHydration(entry.Handle)) throw new IOException($"文件“{Path.GetFileName(entry.Path)}”未下载完整，已取消拖放。");
             entry.ReadyBytes = entry.Size;
             completedFiles++;
             Report(entry);
@@ -137,11 +140,16 @@ internal sealed class DragFilePreparation : IDisposable
 
     private static unsafe long? ReadHydratedBytes(Entry entry)
     {
-        // CF_PLACEHOLDER_STANDARD_INFO begins with OnDiskDataSize. Allow the full
-        // identity tail (up to 4 KiB); querying metadata never reads/hydrates file data.
+        // CF_PLACEHOLDER_STANDARD_INFO begins with OnDiskDataSize; FileId (the NTFS ID that the
+        // provider's FETCH_DATA callback also sees) is at offset 40. Allow the full identity tail
+        // (up to 4 KiB); querying metadata never reads/hydrates file data.
         var buffer = stackalloc byte[8192];
         var result = GetPlaceholderInfo(entry.Handle, 1 /* STANDARD */, (nint)buffer, 8192, out var returned);
-        return result >= 0 && returned >= sizeof(long) ? Math.Clamp(*(long*)buffer, 0, entry.Size) : null;
+        if (result < 0 || returned < sizeof(long)) return null;
+        var onDisk = *(long*)buffer;
+        // OnDiskDataSize only grows per committed range; add bytes already received for ranges in flight.
+        if (returned >= 48) onDisk += Callbacks.GetInFlightHydrationBytes(*(long*)(buffer + 40));
+        return Math.Clamp(onDisk, 0, entry.Size);
     }
 
     private static unsafe void Hydrate(SafeFileHandle handle, string path, CancellationToken token, Action reportProgress)

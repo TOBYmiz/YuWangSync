@@ -664,7 +664,7 @@ internal static class WinUiUiHost
         try
         {
             switchProgress.Activate();
-            switchProgress.Update("正在清理旧账户的同步目录…", null, "已清理 1,234 项，失败 0 项");
+            switchProgress.Update("正在清理同步目录…", null, "已清理 1,234 项，失败 0 项");
             await Task.Delay(100);
             if (saveShots) await SaveWindowPngAsync((FrameworkElement)switchProgress.Content, "account-switch-progress", testRoot);
             switchProgress.Fail("有 1 项未能清理，已停止切换并保留旧账户配置。\n测试文件.txt：文件正被其他程序占用，请关闭文件后重试。");

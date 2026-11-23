@@ -829,6 +829,21 @@ public static class Callbacks
 
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<ulong, HydrationActivity> Hydration = new();
 
+    // Bytes received over HTTP for FETCH_DATA requests not yet committed with TRANSFER_DATA,
+    // keyed by (NTFS file ID, request offset). Placeholder OnDiskDataSize only grows once a whole
+    // range is transferred, so callers add this to show live download progress.
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<(long FileId, long Offset), long>
+        InFlightFetchBytes = new();
+
+    /// <summary>Received but not yet transferred bytes for the placeholder with this NTFS file ID.</summary>
+    internal static long GetInFlightHydrationBytes(long fileSystemId)
+    {
+        long bytes = 0;
+        foreach (var (key, value) in InFlightFetchBytes)
+            if (key.FileId == fileSystemId) bytes += value;
+        return bytes;
+    }
+
     private sealed record PendingRename(string Source, string Target, ulong? TargetFolder,
         DateTime? CleanWriteTime, long? CleanLength)
     {
@@ -1233,6 +1248,7 @@ public static class Callbacks
         var offset = fetch.RequiredFileOffset;
         IntPtr buffer = IntPtr.Zero;
         HydrationActivity? activity = null;
+        (long FileId, long Offset)? inFlightKey = null;
         try
         {
             var identity = ReadIdentity(info);
@@ -1262,6 +1278,9 @@ public static class Callbacks
             // 让 Windows 在 HTTP 分片读取期间也能更新自动文件下载的进度 UI。
             var connectionKey = info.ConnectionKey;
             var transferKey = info.TransferKey;
+            inFlightKey = (info.FileId, offset);
+            var requestKey = inFlightKey.Value;
+            var requestLength = fetch.RequiredLength;
             long reportedTotal = 0;
             long reportedCompleted = 0;
             Action<long, long> reportProgress = (totalProgress, completedProgress) =>
@@ -1276,9 +1295,15 @@ public static class Callbacks
                 }
                 reportedCompleted = Math.Clamp(completedProgress, 0, totalProgress);
                 ReportProviderProgress(connectionKey, transferKey, totalProgress, reportedCompleted);
+                // A whole-file fallback reports progress from file start; count only this range.
+                var rangeBytes = totalProgress == requestLength ? reportedCompleted
+                    : Math.Clamp(reportedCompleted - offset, 0, requestLength);
+                InFlightFetchBytes.AddOrUpdate(requestKey, rangeBytes, (_, previous) => Math.Max(previous, rangeBytes));
             };
             var (data, total, viaDirect, contentless) =
                 FetchRange(identity, offset, fetch.RequiredLength, reportProgress);
+            // Remove before TRANSFER_DATA: a sampler may briefly under-count, never double-count.
+            InFlightFetchBytes.TryRemove(requestKey, out _);
             Log?.Invoke($"[FETCH_DATA] file={identity.FileId} offset={offset} 请求={fetch.RequiredLength} " +
                         $"实得={data.Length} 文件总长={total} 占位声明={info.FileSize} " +
                         $"来源={(viaDirect ? "直链Range" : "整文件缓存")} 用时={sw.Elapsed.TotalSeconds:F1}s");
@@ -1389,6 +1414,7 @@ public static class Callbacks
         }
         finally
         {
+            if (inFlightKey is { } key) InFlightFetchBytes.TryRemove(key, out _);
             if (activity != null)
             {
                 Interlocked.Decrement(ref activity.InFlight);

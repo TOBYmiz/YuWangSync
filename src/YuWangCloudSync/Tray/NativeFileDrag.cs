@@ -13,11 +13,19 @@ internal partial interface IFileDropSource
 }
 
 [GeneratedComClass]
-internal sealed partial class FileDropSource(Func<bool> canContinue) : IFileDropSource
+internal sealed partial class FileDropSource(Func<bool> canContinue, Action<string>? diagnostic = null) : IFileDropSource
 {
+    private bool _reportedContinue, _reportedFeedback;
     public int QueryContinueDrag(int escapePressed, uint keyState)
-        => escapePressed != 0 || !canContinue() ? 0x40101 : (keyState & 1) == 0 ? 0x40100 : 0;
-    public int GiveFeedback(uint effect) => 0x40102;
+    {
+        if (!_reportedContinue) { _reportedContinue = true; diagnostic?.Invoke($"OLE QueryContinueDrag; escape={escapePressed}; keys={keyState}"); }
+        return escapePressed != 0 || !canContinue() ? 0x40101 : (keyState & 1) == 0 ? 0x40100 : 0;
+    }
+    public int GiveFeedback(uint effect)
+    {
+        if (!_reportedFeedback) { _reportedFeedback = true; diagnostic?.Invoke($"OLE GiveFeedback; effect={effect}"); }
+        return 0x40102;
+    }
 }
 
 /// <summary>OLE image/preview resources for one apartment; legacy ready-path helpers also serve regression checks.</summary>

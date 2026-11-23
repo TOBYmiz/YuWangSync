@@ -49,11 +49,9 @@ public sealed class SyncRootProbeResult
 
         var parts = new List<string>();
         if (!string.IsNullOrEmpty(FileSystem)) parts.Add(FileSystem);
-        if (SupportsReparsePoints) parts.Add("支持重解析点");
-        if (WriteDeleteOk) parts.Add("可写可删");
         if (FreeBytes > 0) parts.Add("剩余 " + FormatBytes(FreeBytes));
 
-        var s = parts.Count == 0 ? "可用" : string.Join(" / ", parts);
+        var s = parts.Count == 0 ? "可用" : string.Join("，", parts);
         if (withWarnings && Warnings.Count > 0) s += "；注意：" + string.Join("；", Warnings);
         return s;
     }
@@ -130,13 +128,13 @@ public static class SyncRootProbe
         }
 
         if (full.StartsWith("\\\\", StringComparison.Ordinal))
-            return Fail(full, "不支持 UNC 网络路径");
+            return Fail(full, "不支持网络路径");
 
         var driveRoot = Path.GetPathRoot(full) ?? "";
         if (driveRoot.Length == 0)
             return Fail(full, "必须使用绝对路径");
         if (IsDriveRoot(full))
-            return Fail(full, "不能直接使用磁盘根目录（设置窗口会询问是否新建子目录）");
+            return Fail(full, "不能直接使用磁盘根目录");
 
         // ---- 2. 卷能力（文件系统 + 是否支持重解析点）----
         var (fsName, flags, volOk) = QueryVolume(driveRoot);
@@ -144,11 +142,11 @@ public static class SyncRootProbe
 
         var warnings = new List<string>();
         if (!volOk)
-            warnings.Add("无法读取卷信息");
+            warnings.Add("无法读取磁盘信息");
         else if (!supportsReparse)
-            return Fail(full, $"卷 {driveRoot} 不支持重解析点");
+            return Fail(full, $"{driveRoot} 的文件系统不受支持，请使用 NTFS 磁盘");
         else if (fsName.Length > 0 && !KnownGoodFileSystems.Contains(fsName, StringComparer.OrdinalIgnoreCase))
-            warnings.Add($"文件系统为 {fsName}，支持重解析点，但非 NTFS 可能不稳定");
+            warnings.Add($"文件系统为 {fsName}，建议使用 NTFS 磁盘");
 
         var result = new SyncRootProbeResult
         {
@@ -178,13 +176,13 @@ public static class SyncRootProbe
             if (mine)
             {
                 warnings.Add(string.Equals(hitProvider, providerName, StringComparison.OrdinalIgnoreCase)
-                    ? "本程序已注册该位置"
-                    : $"本程序已注册该位置（旧 Provider 名称：{DescribeProvider(hitProvider)}）");
+                    ? "该位置已由本程序使用"
+                    : $"该位置已由本程序使用（旧名称：{DescribeProvider(hitProvider)}）");
             }
             else if (result.IsSelfRegistration)
             {
                 return Finish(result, warnings,
-                    $"该位置已被其它云 Provider 占用（{DescribeProvider(hitProvider)}）");
+                    $"该位置已被其他云盘程序使用（{DescribeProvider(hitProvider)}）");
             }
             else if (currentSyncRootPath != null
                 && string.Equals(hitPath.TrimEnd('\\'), Path.GetFullPath(currentSyncRootPath).TrimEnd('\\'),
@@ -235,7 +233,7 @@ public static class SyncRootProbe
             {
                 File.WriteAllBytes(tmp, [0x59, 0x57]);   // "YW"
                 if (!File.Exists(tmp))
-                    return Finish(result, warnings, "写入测试失败：临时文件丢失");
+                    return Finish(result, warnings, "写入测试失败");
             }
             catch (Exception ex)
             {
@@ -265,7 +263,7 @@ public static class SyncRootProbe
             var di = new DriveInfo(driveRoot);
             free = di.AvailableFreeSpace;
             if (di.DriveType is DriveType.Removable or DriveType.Network or DriveType.CDRom)
-                warnings.Add($"驱动器类型为 {di.DriveType}，建议选择固定磁盘");
+                warnings.Add($"建议选择本地固定磁盘（当前为 {di.DriveType}）");
         }
         catch (Exception ex)
         {
@@ -386,7 +384,7 @@ public static class SyncRootProbe
     };
 
     private static string DescribeProvider(string? p) =>
-        string.IsNullOrWhiteSpace(p) ? "未知 Provider" : p;
+        string.IsNullOrWhiteSpace(p) ? "未知程序" : p;
 
     /// <summary>
     /// 自下而上查路径落在哪个已注册 SyncRoot 内。

@@ -7,6 +7,7 @@ $stage = Join-Path $repository ('_buildtmp\admin-helper-' + [guid]::NewGuid().To
 try {
     & dotnet publish (Join-Path $repository 'src\YuWangCloudSync.Admin\YuWangCloudSync.Admin.csproj') `
         -c Release -r win-x64 --self-contained true -p:PublishAot=true -p:PublishTrimmed=true `
+        --artifacts-path (Join-Path $stage 'artifacts') `
         -p:DebugType=None -p:DebugSymbols=false -o $stage
     if ($LASTEXITCODE -ne 0) { throw '权限辅助程序发布失败。' }
     $executable = Join-Path $stage $executableName

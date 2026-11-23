@@ -44,7 +44,7 @@ internal sealed class AccountSwitchProgressWindow : Window
         WinUiWindowChrome.Attach(this, root, Title, "\uE8D4");
         WinUiUiHost.ConfigureWindow(this, 520, 350, resizable: false);
         AppWindow.Closing += (_, args) => args.Cancel = !_canClose;
-        Update("正在停止旧账户的后台任务…", null, "切换完成后将自动连接新账户。");
+        Update("正在停止当前账户…", null, "完成后将自动连接新账户。");
     }
 
     internal void Update(string stage, double? percent, string detail)

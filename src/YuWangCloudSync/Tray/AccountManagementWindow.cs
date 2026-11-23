@@ -100,9 +100,9 @@ internal sealed class AccountManagementWindow : Window
             });
             var labels = new List<string>();
             if (account.Username.Equals(_runningAccount, StringComparison.OrdinalIgnoreCase))
-                labels.Add("当前运行");
+                labels.Add("使用中");
             if (account.Username.Equals(_selectedAccount, StringComparison.OrdinalIgnoreCase))
-                labels.Add("设置中选中");
+                labels.Add("已选择");
             if (labels.Count > 0)
                 details.Children.Add(new TextBlock { Text = string.Join(" · ", labels), Opacity = 0.72 });
 
@@ -130,7 +130,7 @@ internal sealed class AccountManagementWindow : Window
         var dialog = new ContentDialog
         {
             Title = "删除账户",
-            Content = $"确定从设置账户列表中删除“{displayName}”吗？",
+            Content = $"确定删除账户“{displayName}”？",
             PrimaryButtonText = "删除",
             CloseButtonText = "取消",
             DefaultButton = ContentDialogButton.Close,
@@ -191,8 +191,8 @@ internal sealed class AccountManagementWindow : Window
             Background = new Microsoft.UI.Xaml.Media.SolidColorBrush(Microsoft.UI.Colors.Transparent),
             VerticalAlignment = VerticalAlignment.Center,
         };
-        AutomationProperties.SetName(refreshCaptcha, "点击刷新验证码");
-        ToolTipService.SetToolTip(refreshCaptcha, "点击刷新验证码");
+        AutomationProperties.SetName(refreshCaptcha, "刷新验证码");
+        ToolTipService.SetToolTip(refreshCaptcha, "刷新验证码");
 
         var captchaRow = new Grid
         {
@@ -277,7 +277,7 @@ internal sealed class AccountManagementWindow : Window
                     if (dialogClosed) return;
                     captchaCode.Text = "";
                     await RefreshCaptchaAsync();
-                    if (!dialogClosed) status.Text = "账密或验证码不正确，请重试。";
+                    if (!dialogClosed) status.Text = "账号、密码或验证码错误。";
                     return;
                 }
                 if (dialogClosed) return;

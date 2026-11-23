@@ -22,7 +22,7 @@ public static class ConfigurationStore
         var legacyPath = legacyDirectory == null ? null : Path.Combine(legacyDirectory, "appsettings.json");
         var source = File.Exists(targetPath) ? targetPath : legacyPath;
         if (source == null || !File.Exists(source))
-            throw new FileNotFoundException("请重装应用配置服务器、账号和同步目录。", targetPath);
+            throw new FileNotFoundException("未找到配置，请重新安装应用。", targetPath);
 
         var json = File.ReadAllText(source);
         var config = JsonSerializer.Deserialize(json, SerializerContext.SyncRootContext)

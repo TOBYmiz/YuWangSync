@@ -7,9 +7,10 @@ internal sealed record DragItemVisual(byte[] Pixels, int Width, int Height, int 
 
 internal sealed unsafe partial class NativeFileDrag
 {
-    // The OLE source owns an independent STA and input queue. The WinUI dispatcher remains
-    // available for exact progress, cancellation and async download continuations after drop.
-    internal static Task<bool> DropVirtualAsync(VirtualFileDataObject data, DragItemVisual? visual, Func<bool> canContinue)
+    // WinUI owns pointer input; OLE consumes legacy mouse messages on its own STA.
+    // Forward the current gesture to that queue without changing global input or waiting for content.
+    internal static Task<bool> DropVirtualAsync(VirtualFileDataObject data, DragItemVisual? visual, Func<bool> canContinue,
+        Action<string>? diagnostic = null)
     {
         var completion = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
         var thread = new Thread(() =>
@@ -22,12 +23,16 @@ internal sealed unsafe partial class NativeFileDrag
                 Marshal.AddRef(drag._data);
                 data.SetSourceThread();
                 if (visual is not null) drag.SetItemVisual(visual);
-                var source = new FileDropSource(canContinue);
+                var source = new FileDropSource(canContinue, diagnostic);
                 var pointer = ComInterfaceMarshaller<IFileDropSource>.ConvertToUnmanaged(source);
                 try
                 {
+                    using var input = new OleMouseInput(canContinue);
+                    diagnostic?.Invoke($"OLE mouse bridge ready; thread={Environment.CurrentManagedThreadId}");
                     var hr = DoDragDrop(drag._data, (nint)pointer, 1, out var effect);
-                    Marshal.ThrowExceptionForHR(hr);
+                    input.ThrowIfFailed();
+                    diagnostic?.Invoke($"OLE finished; HRESULT=0x{hr:X8}; effect={effect}");
+                    if (hr < 0) throw new COMException($"启动系统拖放失败（HRESULT 0x{hr:X8}）。", hr);
                     completion.TrySetResult(hr == 0x40100 && effect == 1);
                 }
                 finally { ComInterfaceMarshaller<IFileDropSource>.Free(pointer); GC.KeepAlive(source); }
@@ -41,6 +46,73 @@ internal sealed unsafe partial class NativeFileDrag
         return completion.Task;
     }
 
+    private sealed class OleMouseInput : IDisposable
+    {
+        private readonly object _gate = new();
+        private readonly uint _thread = GetCurrentThreadId();
+        private readonly Func<bool> _canContinue;
+        private readonly System.Threading.Timer _timer;
+        private Exception? _failure;
+        private bool _stopped;
+
+        internal OleMouseInput(Func<bool> canContinue)
+        {
+            _canContinue = canContinue;
+            // OLE initialization waits for its first WM_MOUSE message before capture.
+            // A worker has no such message, and WinUI sends WM_POINTER on the UI thread.
+            PeekMessageW(out _, 0, 0, 0, 0);
+            Forward();
+            _timer = new(_ => Tick(), null, 16, 16);
+        }
+
+        private void Tick()
+        {
+            try { Forward(); }
+            catch (Exception error)
+            {
+                lock (_gate)
+                {
+                    _failure ??= error;
+                    PostThreadMessageW(_thread, 0x0100, 27, 0);
+                    _stopped = true;
+                }
+            }
+        }
+
+        internal void ThrowIfFailed()
+        {
+            lock (_gate) if (_failure is { } error) throw new IOException("拖放鼠标消息传递失败。", error);
+        }
+
+        private void Forward()
+        {
+            lock (_gate)
+            {
+                if (_stopped) return;
+                var cancel = IsEscapeDown || !_canContinue();
+                var down = IsLeftButtonDown;
+                var cursor = CursorPosition;
+                var position = (nint)((uint)(ushort)cursor.X | ((uint)(ushort)cursor.Y << 16));
+                var message = cancel ? 0x0100u : down ? 0x0200u : 0x0202u;
+                nuint keys = cancel ? 27u : down ? 1u : 0u;
+                if (!cancel)
+                {
+                    if ((GetAsyncKeyState(16) & 0x8000) != 0) keys |= 4;
+                    if ((GetAsyncKeyState(17) & 0x8000) != 0) keys |= 8;
+                }
+                if (!PostThreadMessageW(_thread, message, keys, cancel ? 0 : position))
+                    throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(), "无法传递拖放鼠标消息。");
+                if (cancel || !down) _stopped = true;
+            }
+        }
+
+        public void Dispose()
+        {
+            // An in-flight callback must finish before the native thread can exit or be reused.
+            lock (_gate) _stopped = true;
+            _timer.Dispose();
+        }
+    }
     private void SetItemVisual(DragItemVisual visual)
     {
         var info = new BitmapInfo { Size = 40, Width = visual.Width, Height = -visual.Height, Planes = 1, BitCount = 32 };
@@ -56,7 +128,8 @@ internal sealed unsafe partial class NativeFileDrag
                 Bitmap = bitmap, ColorKey = 0xffffffff,
             };
             var initialize = (delegate* unmanaged[Stdcall]<nint, DragImage*, nint, int>)(*(nint**)_helper)[3];
-            Marshal.ThrowExceptionForHR(initialize(_helper, &image, _data));
+            var hr = initialize(_helper, &image, _data);
+            if (hr < 0) throw new COMException($"初始化拖拽外观失败（HRESULT 0x{hr:X8}）。", hr);
             bitmap = 0;
         }
         finally { if (bitmap != 0) DeleteObject(bitmap); }
@@ -99,4 +172,13 @@ internal sealed unsafe partial class NativeFileDrag
 
     internal static void ReleaseMouseCapture() => ReleaseCapture();
     [DllImport("user32.dll")] private static extern bool ReleaseCapture();
+    [StructLayout(LayoutKind.Sequential)] private struct MouseMessage
+    { internal nint Window; internal uint Id; internal nuint Keys; internal nint Position; internal uint Time; internal Point Screen; internal uint Private; }
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool PeekMessageW(out MouseMessage message, nint window, uint min, uint max, uint remove);
+    [DllImport("kernel32.dll")] private static extern uint GetCurrentThreadId();
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool PostThreadMessageW(uint thread, uint message, nuint wparam, nint lparam);
 }
