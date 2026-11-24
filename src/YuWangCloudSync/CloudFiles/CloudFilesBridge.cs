@@ -1220,6 +1220,17 @@ public static class Callbacks
     /// 水化途中把文件**缩小**会让在途/后续的 TRANSFER_DATA 落到新长度之外，
     /// cfapi 直接报 ERROR_CLOUD_FILE_INVALID_REQUEST，整次水化失败（实测复制损坏）。
     /// </summary>
+    /// <summary>
+    /// A FETCH_DATA for this cloud file is running, or ended within <paramref name="graceMs"/>.
+    /// The grace bridges the short gap between consecutive ranges of one hydration.
+    /// </summary>
+    internal static bool IsHydrationActive(ulong fileId, long graceMs = 3000)
+    {
+        if (!Hydration.TryGetValue(fileId, out var a)) return false;
+        return Volatile.Read(ref a.InFlight) > 0
+            || Environment.TickCount64 - Volatile.Read(ref a.LastTick) < graceMs;
+    }
+
     public static bool IsHydrationQuiet(ulong fileId, long quietMs)
     {
         if (!Hydration.TryGetValue(fileId, out var a)) return true;

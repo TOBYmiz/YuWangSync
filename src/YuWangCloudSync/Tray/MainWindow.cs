@@ -2941,6 +2941,7 @@ internal sealed partial class MainWindow : Window
             lastReportedBytes = completed;
             SetTransferProgress($"正在下载“{item.Name}”… {FormatSize(completed)} / {FormatSize(probe.Size)}",
                 probe.Size <= 0 ? 100 : completed * 100d / probe.Size);
+            SetBrowserDownloadProgress(item.Id, completed, probe.Size);
         }
         // HTTP callbacks run off the UI thread. Sample their latest byte count rather than
         // waiting for a complete 4 MB range or queuing one UI action for every network read.
@@ -2988,6 +2989,7 @@ internal sealed partial class MainWindow : Window
         finally
         {
             progressTimer.Stop();
+            if (!_isClosed) SetBrowserDownloadProgress(item.Id, null, 0);
         }
     }
 

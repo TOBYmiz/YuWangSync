@@ -15,6 +15,16 @@ internal sealed partial class MainWindow
     private readonly HashSet<(YuWangItem Item, Border Cell)> _availabilityRows = [];
     private bool _availabilityPending;
     private enum FileSyncError { None, Download, Writeback }
+    private static readonly TimeSpan IdleStatusInterval = TimeSpan.FromSeconds(1);
+    private static readonly TimeSpan ActiveStatusInterval = TimeSpan.FromMilliseconds(300);
+
+    /// <summary>An in-progress transfer shown in the status column instead of the availability icon.</summary>
+    /// <param name="Percent">Null while the transfer cannot be measured (the ring spins).</param>
+    private readonly record struct CellActivity(string Glyph, double? Percent, string Description);
+
+    // Main-window downloads outside the sync folder (save as / open fallback), keyed by cloud ID.
+    // UI thread only; the download's own progress timer updates the visible cell directly.
+    private readonly Dictionary<ulong, (long Completed, long Total)> _browserDownloads = [];
 
     private void ResetFileAvailabilityRows() => _availabilityRows.Clear();
 
@@ -48,15 +58,23 @@ internal sealed partial class MainWindow
                     row.Item, failures)).ToArray());
                 if (_isClosed || version != _fileRenderVersion || !Equals(folder, _currentFolder)
                     || !ReferenceEquals(failures, Callbacks.DownloadFailures)) return;
+                var active = false;
                 for (var i = 0; i < rows.Length; ++i)
-                    if (_availabilityRows.Contains(rows[i]))
-                        SetAvailability(rows[i].Cell, states[i].Availability, states[i].Error, states[i].Upload);
+                {
+                    if (!_availabilityRows.Contains(rows[i])) continue;
+                    var activity = BrowserDownloadActivity(rows[i].Item.Id) ?? states[i].Activity;
+                    active |= activity is not null;
+                    SetAvailability(rows[i].Cell, states[i].Availability, states[i].Error, activity);
+                }
+                // Sample faster only while something in this folder is transferring.
+                var interval = active ? ActiveStatusInterval : IdleStatusInterval;
+                if (_fileStatusTimer.Interval != interval) _fileStatusTimer.Interval = interval;
             }
             finally { _availabilityPending = false; }
         });
     }
 
-    private static (SyncRootAvailability Availability, FileSyncError Error, UploadActivitySnapshot? Upload) ReadFileSyncStatus(
+    private static (SyncRootAvailability Availability, FileSyncError Error, CellActivity? Activity) ReadFileSyncStatus(
         ulong disk, ulong folder, YuWangItem item, SyncRootDownloadFailures failures)
     {
         var identity = new FileIdentity(disk, folder, item.Id, 1);
@@ -67,8 +85,14 @@ internal sealed partial class MainWindow
             var path = Program.ResolveLocalItemPath(disk, folder, item);
             // An active local-change upload (including a retry after an earlier failure) wins.
             if (path is not null && UploadActivity.TryGet(path, out var upload))
-                return (SyncRootAvailability.Local, FileSyncError.None, upload);
+                return (SyncRootAvailability.Local, FileSyncError.None, UploadCellActivity(upload));
             availability = path is null ? SyncRootAvailability.OnlineOnly : DragFilePreparation.ReadAvailability(path);
+            // Sync-folder hydration from any source: this window's "下载", Explorer, or another app.
+            if (path is not null && availability == SyncRootAvailability.OnlineOnly && Callbacks.IsHydrationActive(item.Id))
+            {
+                var (size, ready, isReady) = DragFilePreparation.ReadMetadata(path);
+                if (!isReady) return (availability, FileSyncError.None, DownloadCellActivity(ready, size));
+            }
             if (path is not null && Callbacks.HasWritebackFailure(path)) return (availability, FileSyncError.Writeback, null);
         }
         catch (Exception error) when (error is IOException or UnauthorizedAccessException or System.ComponentModel.Win32Exception)
@@ -77,15 +101,15 @@ internal sealed partial class MainWindow
     }
 
     private void SetAvailability(Border cell, SyncRootAvailability state, FileSyncError error = FileSyncError.None,
-        UploadActivitySnapshot? upload = null)
+        CellActivity? activity = null)
     {
-        if (cell.Tag is ValueTuple<SyncRootAvailability, FileSyncError, UploadActivitySnapshot?> previous
-            && previous == (state, error, upload)) return;
-        cell.Tag = (state, error, upload);
+        if (cell.Tag is ValueTuple<SyncRootAvailability, FileSyncError, CellActivity?> previous
+            && previous == (state, error, activity)) return;
+        cell.Tag = (state, error, activity);
         var dark = _root.ActualTheme == ElementTheme.Dark;
-        if (upload is { } active)
+        if (activity is { } active)
         {
-            SetUploadActivity(cell, active, dark);
+            SetCellActivity(cell, active, dark);
             return;
         }
         var green = new SolidColorBrush(dark ? Microsoft.UI.Colors.LightGreen : Windows.UI.Color.FromArgb(255, 16, 124, 16));
@@ -130,16 +154,56 @@ internal sealed partial class MainWindow
     }
 
     /// <summary>
-    /// Progress ring around a stage glyph: upload arrow, then download arrow while the uploaded
-    /// copy is read back and compared, then a check mark while the local identity is bound.
-    /// The ring spans upload and verification; it spins while waiting for the server.
+    /// Upload: upload arrow, then download arrow while the uploaded copy is read back and
+    /// compared, then a check mark while the local identity is bound. The ring spans upload
+    /// and verification; it spins while waiting for the server.
     /// </summary>
-    private static void SetUploadActivity(Border cell, UploadActivitySnapshot upload, bool dark)
+    private static CellActivity UploadCellActivity(UploadActivitySnapshot upload) => new(
+        upload.Stage switch
+        {
+            UploadStage.Verifying => "\uE896",
+            UploadStage.Finalizing => "\uE73E",
+            _ => "\uE898",
+        },
+        upload.Stage is UploadStage.Preparing or UploadStage.Confirming ? null : upload.OverallPercent,
+        upload.Describe());
+
+    private static CellActivity DownloadCellActivity(long? completed, long total)
     {
-        var description = upload.Describe();
-        ToolTipService.SetToolTip(cell, description);
-        AutomationProperties.SetName(cell, description);
-        if (cell.Child is not Grid { Tag: "upload" } visual
+        if (completed is not { } done || total <= 0) return new("\uE896", null, "正在下载");
+        var percent = Math.Clamp(done * 100d / total, 0, 100);
+        return new("\uE896", Math.Min(percent, 99.5), $"正在下载 {percent:F0}% · {FormatSize(done)} / {FormatSize(total)}");
+    }
+
+    private CellActivity? BrowserDownloadActivity(ulong id)
+        => _browserDownloads.TryGetValue(id, out var download) ? DownloadCellActivity(download.Completed, download.Total) : null;
+
+    /// <summary>Called from a main-window download's progress timer; null completed ends the download.</summary>
+    private void SetBrowserDownloadProgress(ulong id, long? completed, long total)
+    {
+        if (completed is { } done) _browserDownloads[id] = (done, total);
+        else if (!_browserDownloads.Remove(id)) return;
+        var activity = BrowserDownloadActivity(id);
+        if (activity is null)
+        {
+            RefreshFileAvailability();
+            return;
+        }
+        foreach (var (item, cell) in _availabilityRows)
+        {
+            if (item.Id != id) continue;
+            var (state, error) = cell.Tag is ValueTuple<SyncRootAvailability, FileSyncError, CellActivity?> previous
+                ? (previous.Item1, previous.Item2) : (SyncRootAvailability.OnlineOnly, FileSyncError.None);
+            SetAvailability(cell, state, error, activity);
+        }
+    }
+
+    /// <summary>Progress ring around a stage glyph; reused across updates so the ring animates smoothly.</summary>
+    private static void SetCellActivity(Border cell, CellActivity activity, bool dark)
+    {
+        ToolTipService.SetToolTip(cell, activity.Description);
+        AutomationProperties.SetName(cell, activity.Description);
+        if (cell.Child is not Grid { Tag: "transfer" } visual
             || visual.Children is not [ProgressRing ring, FontIcon icon])
         {
             var accent = dark ? Microsoft.UI.Colors.DeepSkyBlue : Windows.UI.Color.FromArgb(255, 0, 120, 212);
@@ -155,19 +219,14 @@ internal sealed partial class MainWindow
                 FontSize = 8, Foreground = new SolidColorBrush(accent),
                 HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center,
             };
-            visual = new Grid { Tag = "upload", Width = 16, Height = 16 };
+            visual = new Grid { Tag = "transfer", Width = 16, Height = 16 };
             visual.Children.Add(ring);
             visual.Children.Add(icon);
             cell.Child = visual;
         }
-        ring.IsIndeterminate = upload.Stage is UploadStage.Preparing or UploadStage.Confirming;
-        if (!ring.IsIndeterminate) ring.Value = upload.OverallPercent;
-        icon.Glyph = upload.Stage switch
-        {
-            UploadStage.Verifying => "\uE896",
-            UploadStage.Finalizing => "\uE73E",
-            _ => "\uE898",
-        };
+        ring.IsIndeterminate = activity.Percent is null;
+        if (activity.Percent is { } percent) ring.Value = percent;
+        icon.Glyph = activity.Glyph;
     }
 
     private static async Task<IReadOnlyList<YuWangItem>> ListSyncRootFolderChildrenAsync(YuWangClient client,
@@ -206,6 +265,8 @@ internal sealed partial class MainWindow
                 _transferProgress.IsIndeterminate = current.Percent is null;
             };
             timer.Start();
+            // Show per-file rings in the status column promptly; it slows down again when idle.
+            _fileStatusTimer.Interval = ActiveStatusInterval;
             try
             {
                 var ancestors = new HashSet<ulong> { target.Parent.Id };
