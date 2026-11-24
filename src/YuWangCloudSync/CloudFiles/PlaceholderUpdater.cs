@@ -1,6 +1,8 @@
 using System.Runtime.InteropServices;
 using System.Runtime.Versioning;
 using Vanara.PInvoke;
+using YuWangCloudSync.Core;
+using YuWangCloudSync.Models;
 using static Vanara.PInvoke.CldApi;
 
 namespace YuWangCloudSync.CloudFiles;
@@ -616,6 +618,55 @@ public static class PlaceholderUpdater
         }
 
         return (total, dehydrated, freed, skipped);
+    }
+
+    /// <summary>Evict only clean, unpinned placeholders belonging to the selected cloud item.</summary>
+    internal static (int Removed, int Skipped, long FreedBytes) RemoveCachedContent(string path, FileIdentity selected,
+        Action checkConnection, Func<string, bool> hasPendingWrite, Action<string>? log = null)
+    {
+        var removed = 0;
+        var skipped = 0;
+        var freed = 0L;
+        var pending = new Stack<(string Path, ulong FolderId, bool IsSelected)>();
+        pending.Push((path, selected.FolderId, true));
+        while (pending.TryPop(out var entry))
+        {
+            checkConnection();
+            if (!ProviderIdentity.TryReadPlaceholderIdentity(entry.Path, out var identity)
+                || identity.IsVirtual || identity.DiskId != selected.DiskId || identity.FolderId != entry.FolderId
+                || (entry.IsSelected && (identity.FileId != selected.FileId || identity.Type != selected.Type)))
+                continue;
+            if (identity.Type == 0)
+            {
+                string[] children;
+                try { children = Directory.GetFileSystemEntries(entry.Path); }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                {
+                    skipped++;
+                    log?.Invoke($"[DEHY] 无法枚举: {entry.Path} ({ex.Message})");
+                    continue;
+                }
+                foreach (var child in children) pending.Push((child, identity.FileId, false));
+                continue;
+            }
+            if (identity.Type != 1) continue;
+            if (!TryGetPlaceholderDataState(entry.Path, out var state)) { skipped++; continue; }
+            if (state.OnDiskDataSize <= 0) continue;
+            if (state.InSyncState != CF_IN_SYNC_STATE.CF_IN_SYNC_STATE_IN_SYNC
+                || state.PinState is CF_PIN_STATE.CF_PIN_STATE_PINNED or CF_PIN_STATE.CF_PIN_STATE_EXCLUDED
+                || hasPendingWrite(entry.Path))
+            {
+                skipped++;
+                continue;
+            }
+            if (TryDehydrate(entry.Path, out var bytes, log))
+            {
+                removed++;
+                freed += bytes;
+            }
+            else skipped++;
+        }
+        return (removed, skipped, freed);
     }
 
     /// <summary>

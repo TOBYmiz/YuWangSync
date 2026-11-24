@@ -451,6 +451,63 @@ try
         Check(DragFilePreparation.ReadAvailability(path) == SyncRootAvailability.Local,
             "explicit hydration stays cached locally, without pinning or a second dehydration");
         Console.WriteLine("PASS: native pin / hydrate / unpin / dehydrate cycle.");
+
+        void CreateCacheFixture(string parent, string name, FileIdentity identity)
+        {
+            var identityBytes = identity.Serialize();
+            Marshal.Copy(identityBytes, 0, fileIdentityBuffer, identityBytes.Length);
+            RequireSuccess(CfCreatePlaceholders(parent, [new()
+            {
+                RelativeFileName = name, FileIdentity = fileIdentityBuffer, FileIdentityLength = (uint)identityBytes.Length,
+                Flags = CF_PLACEHOLDER_CREATE_FLAGS.CF_PLACEHOLDER_CREATE_FLAG_MARK_IN_SYNC,
+                FsMetadata = new()
+                {
+                    FileSize = identity.Type == 0 ? 0 : payload.Length,
+                    BasicInfo = new() { FileAttributes = identity.Type == 0
+                        ? FileFlagsAndAttributes.FILE_ATTRIBUTE_DIRECTORY : FileFlagsAndAttributes.FILE_ATTRIBUTE_NORMAL },
+                },
+            }], CF_CREATE_FLAGS.CF_CREATE_FLAG_NONE, out _), "create scoped-cache fixture " + name);
+        }
+
+        var cacheFolderId = new FileIdentity(1, 0, 1, 0);
+        var cacheFolder = Path.Combine(root, "cache-folder");
+        CreateCacheFixture(root, "cache-folder", cacheFolderId);
+        CreateCacheFixture(cacheFolder, "nested", new(1, 1, 2, 0));
+        var cacheNested = Path.Combine(cacheFolder, "nested");
+        var directFileId = new FileIdentity(1, 1, 3, 1);
+        CreateCacheFixture(cacheFolder, "direct.bin", directFileId);
+        CreateCacheFixture(cacheNested, "ready.bin", new(1, 2, 4, 1));
+        CreateCacheFixture(cacheNested, "dirty.bin", new(1, 2, 5, 1));
+        CreateCacheFixture(cacheNested, "online-only.bin", new(1, 2, 6, 1));
+        CreateCacheFixture(cacheNested, "different-parent.bin", new(1, 999, 7, 1));
+        CreateCacheFixture(cacheNested, "pinned.bin", new(1, 2, 8, 1));
+        var ordinary = Path.Combine(cacheNested, "ordinary.bin");
+        File.WriteAllBytes(ordinary, payload);
+        var direct = Path.Combine(cacheFolder, "direct.bin");
+        var ready = Path.Combine(cacheNested, "ready.bin");
+        var dirty = Path.Combine(cacheNested, "dirty.bin");
+        var unrelated = Path.Combine(cacheNested, "different-parent.bin");
+        var pinned = Path.Combine(cacheNested, "pinned.bin");
+        using (var content = await DragFilePreparation.CreateAsync([direct, ready, dirty, unrelated, pinned], () => true,
+                   _ => { }, CancellationToken.None))
+            content.ValidateReady();
+        SetPin(CF_PIN_STATE.CF_PIN_STATE_PINNED, pinned);
+        var fetchesBeforeEviction = requestCount;
+        var directResult = PlaceholderUpdater.RemoveCachedContent(direct, directFileId, () => { }, _ => false, Console.WriteLine);
+        Check(directResult is { Removed: 1, Skipped: 0, FreedBytes: > 0 }
+              && ProviderIdentity.TryReadPlaceholderIdentity(direct, out _)
+              && DragFilePreparation.ReadAvailability(direct) == SyncRootAvailability.OnlineOnly
+              && DragFilePreparation.ReadAvailability(ready) == SyncRootAvailability.Local,
+            "removing one file drops its data but preserves its placeholder and sibling data");
+        var treeResult = PlaceholderUpdater.RemoveCachedContent(cacheFolder, cacheFolderId, () => { },
+            file => file == dirty, Console.WriteLine);
+        Check(treeResult is { Removed: 1, Skipped: 2, FreedBytes: > 0 } && Directory.Exists(cacheNested)
+              && DragFilePreparation.ReadAvailability(pinned) == SyncRootAvailability.Pinned
+              && DragFilePreparation.ReadAvailability(ready) == SyncRootAvailability.OnlineOnly
+              && DragFilePreparation.ReadAvailability(dirty) == SyncRootAvailability.Local
+              && DragFilePreparation.ReadAvailability(unrelated) == SyncRootAvailability.Local
+              && File.ReadAllBytes(ordinary).AsSpan().SequenceEqual(payload) && requestCount == fetchesBeforeEviction,
+            "scoped folder removal dehydrates descendants without fetching data or touching pins, pending writes and foreign/local files");
     }
     finally
     {
@@ -463,9 +520,9 @@ try
         if (Directory.Exists(root)) Directory.Delete(root, true);
     }
 
-    void SetPin(CF_PIN_STATE state)
+    void SetPin(CF_PIN_STATE state, string? file = null)
     {
-        var handle = Native.Open(path, 0x00040080, 7, IntPtr.Zero, 3, 0x02200000, IntPtr.Zero);
+        var handle = Native.Open(file ?? path, 0x00040080, 7, IntPtr.Zero, 3, 0x02200000, IntPtr.Zero);
         if (handle == new IntPtr(-1)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
         try { RequireSuccess(CfSetPinState(new HFILE(handle), state, CF_SET_PIN_FLAGS.CF_SET_PIN_FLAG_NONE, IntPtr.Zero), "set pin"); }
         finally { Native.CloseHandle(handle); }

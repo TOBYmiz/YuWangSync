@@ -1,3 +1,4 @@
+using System.Globalization;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Media;
@@ -53,27 +54,29 @@ internal sealed partial class MainWindow
             text += $" {percent:F2}% · {FormatSize(progress.CompletedBytes)} / {FormatSize(progress.TotalBytes)}";
         if (progress.TotalFiles > 0 && progress.TotalBytes is not null)
             text += $" · 已完成 {progress.CompletedFiles}/{progress.TotalFiles} 个文件";
-        var fullText = string.IsNullOrEmpty(progress.FileName) ? text : $"{text} · {progress.FileName}";
-        if (!string.IsNullOrEmpty(progress.FileName)) text += $" · {ShortenFileName(progress.FileName)}";
-        SetTransferProgress(text, progress.Percent ?? 0);
+        SetTransferProgress(text, progress.Percent ?? 0, progress.FileName);
         _transferProgress.IsIndeterminate = progress.Percent is null;
-        ToolTipService.SetToolTip(_status, fullText);
         _dragProgressShown = true;
         _cancelDragPreparation.Visibility = Visibility.Visible;
     }
 
-    private const int MaxStatusFileNameLength = 36;
+    private const int MaxStatusFileNameLength = 12;
 
     /// <summary>Middle-truncates a long name so the extension stays visible in the one-line status bar.</summary>
     internal static string ShortenFileName(string name)
     {
         if (name.Length <= MaxStatusFileNameLength) return name;
+        var elements = StringInfo.ParseCombiningCharacters(name);
+        if (elements.Length <= MaxStatusFileNameLength) return name;
         var extension = Path.GetExtension(name);
-        if (extension.Length > 10) extension = "";
-        var stem = name[..^extension.Length];
-        var keep = MaxStatusFileNameLength - extension.Length - 1;
+        var extensionStart = Array.BinarySearch(elements, name.Length - extension.Length);
+        var extensionLength = extensionStart < 0 ? 0 : elements.Length - extensionStart;
+        // Leave space for the ellipsis and at least one text element from the stem.
+        if (extensionLength > MaxStatusFileNameLength - 2) extensionLength = 0;
+        var keep = MaxStatusFileNameLength - extensionLength - 1;
         var head = (keep + 1) / 2;
-        return $"{stem[..head]}…{stem[^(keep - head)..]}{extension}";
+        var tail = extensionLength + keep - head;
+        return $"{name[..elements[head]]}…{(tail > 0 ? name[elements[^tail]..] : "")}";
     }
 
     private void StopDragPreparationProgress(bool clearStatus = false)
@@ -88,6 +91,7 @@ internal sealed partial class MainWindow
         _transferProgress.Visibility = Visibility.Collapsed;
         ToolTipService.SetToolTip(_status, null);
         if (clearStatus) SetStatus("");
+        else UpdateTransferStatusLayout();
     }
 
     private sealed class DragManifest

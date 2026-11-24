@@ -93,6 +93,10 @@ internal sealed partial class MainWindow
             Check("Navigation folder context target", browser._itemMenuTarget?.Items.Single().Id == 20
                 && browser._itemMenuTarget.Parent.Id == 0 && browser._menuRename.IsEnabled,
                 "Folder menu targets the clicked folder in its parent disk and exposes writable actions.");
+            Check("Item cache-removal menu", browser._menuRemoveCache.Text == "移除缓存"
+                && Equals(browser._itemMenu.Items[browser._itemMenu.Items.IndexOf(browser._menuDownload) + 1], browser._menuRemoveCache)
+                && !browser._menuRemoveCache.IsEnabled,
+                "The shared file/folder menu places cache removal after Download and disables it without a SyncRoot connection.");
             browser._itemMenu.Hide();
 
             var oldItem = new YuWangItem { Id = 30, Name = "先前选中.txt", Type = 'F' };
@@ -216,13 +220,40 @@ internal sealed partial class MainWindow
                 "The status bar shows actual percentage, suitable size units, file count, filename and a cancel button.");
             browser._root.UpdateLayout();
             var statusBarHeight = ((Microsoft.UI.Xaml.FrameworkElement)browser._status.Parent).ActualHeight;
-            browser.ShowDragPreparationProgress(new("正在下载文件",
-                "一个非常非常非常非常非常非常非常非常非常非常长的文件名称用于测试截断效果.docx", 512, 2048, 1, 3));
+            const string longName = "一个非常非常非常非常非常非常非常非常非常非常长的文件名称用于测试截断效果.docx";
+            browser.ShowDragPreparationProgress(new("正在下载文件", longName, 512, 2048, 1, 3));
             browser._root.UpdateLayout();
             Check("Drag progress keeps status bar height",
                 Math.Abs(((Microsoft.UI.Xaml.FrameworkElement)browser._status.Parent).ActualHeight - statusBarHeight) < 0.5
                 && browser._status.Text.Contains('…') && browser._status.Text.EndsWith(".docx", StringComparison.Ordinal),
                 "Long names are middle-truncated (keeping the extension) and progress never grows the status bar.");
+            var shortName = ShortenFileName(longName);
+            const string emojiName = "👩‍💻👩‍💻👩‍💻👩‍💻👩‍💻👩‍💻👩‍💻👩‍💻👩‍💻👩‍💻👩‍💻👩‍💻👩‍💻.txt";
+            Check("Status filename limit and tooltip", shortName.Length == 12
+                && ShortenFileName("12345678.txt") == "12345678.txt"
+                && ShortenFileName(emojiName) == "👩‍💻👩‍💻👩‍💻👩‍💻…👩‍💻👩‍💻👩‍💻.txt"
+                && Equals(ToolTipService.GetToolTip(browser._status), browser._status.Text[..^shortName.Length] + longName),
+                "The 12-character limit includes the ellipsis and extension, respects Unicode and keeps the complete name in the tooltip.");
+            var statusText = browser._status.Text;
+            var progressText = statusText[..^(shortName.Length + " · ".Length)];
+            browser._status.Text = progressText;
+            browser._root.UpdateLayout();
+            browser._status.MaxWidth = browser._status.ActualWidth + 8;
+            browser._status.Text = statusText;
+            browser._root.UpdateLayout();
+            Check("Progress before filename in narrow status bar", progressText.Contains("25.00% · 512 B / 2 KB")
+                && statusText.EndsWith(" · " + shortName, StringComparison.Ordinal) && browser._status.IsTextTrimmed,
+                "With limited text width the end ellipsis affects the filename first, after the progress numbers.");
+            browser._status.MaxWidth = double.PositiveInfinity;
+            var statusBar = browser._statusBar!;
+            statusBar.Width = 430;
+            browser._root.UpdateLayout();
+            await Task.Delay(50);
+            Check("Compact status bar prioritizes progress text", browser._summary.Visibility == Microsoft.UI.Xaml.Visibility.Collapsed
+                && browser._transferProgress.Width < TransferGaugeWidth && browser._status.ActualWidth > 240,
+                "A narrow layout reclaims summary and gauge width while leaving the progress text and cancel action visible.");
+            statusBar.Width = double.NaN;
+            browser._root.UpdateLayout();
             if (saveShots) await WinUiUiHost.SaveWindowPngAsync(browser._root, "browser-drag-progress", testRoot);
             browser.ShowDragPreparationProgress(new("正在下载文件", "大文件.bin", 1610612736, 3221225472));
             Check("Drag progress uses common units", browser._status.Text.Contains("1.5 GB / 3 GB")

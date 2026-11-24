@@ -56,7 +56,6 @@ internal static class WinUiUiHost
     private static AccountManagementWindow? _accountManager;
     private static AboutWindow? _about;
     private static CaptchaWindow? _captcha;
-    private static CacheCleanupConfirmationWindow? _cacheCleanupConfirmation;
     private static KeptDirectoriesWindow? _keptDirectories;
     private static MainWindow? _mainWindow;
     private static AccountSwitchProgressWindow? _accountSwitchProgress;
@@ -256,43 +255,6 @@ internal static class WinUiUiHost
             Serilog.Log.Warning("WinUI UI 线程不可用，无法打开关于窗口");
     }
 
-    internal static async Task<bool> ConfirmCacheCleanupAsync()
-    {
-        var queued = new TaskCompletionSource<CacheCleanupConfirmationWindow?>(
-            TaskCreationOptions.RunContinuationsAsynchronously);
-        if (!Post(() =>
-            {
-                try
-                {
-                    var window = _cacheCleanupConfirmation;
-                    if (window is null)
-                    {
-                        window = new CacheCleanupConfirmationWindow();
-                        _cacheCleanupConfirmation = window;
-                        window.Closed += (_, _) =>
-                        {
-                            if (ReferenceEquals(_cacheCleanupConfirmation, window))
-                                _cacheCleanupConfirmation = null;
-                        };
-                    }
-                    ActivateWindow(window);
-                    queued.TrySetResult(window);
-                }
-                catch (Exception error)
-                {
-                    Serilog.Log.Error(error, "创建缓存清理确认窗口失败");
-                    queued.TrySetResult(null);
-                }
-            }))
-        {
-            Serilog.Log.Warning("WinUI UI 线程不可用，无法确认缓存清理");
-            return false;
-        }
-
-        var confirmation = await queued.Task.ConfigureAwait(false);
-        return confirmation is not null && await confirmation.Completion.ConfigureAwait(false);
-    }
-
     private static void ShowAboutOnUi()
     {
         if (_about is not null)
@@ -452,14 +414,12 @@ internal static class WinUiUiHost
         try { _settings?.Close(); } catch { }
         try { _about?.Close(); } catch { }
         try { _captcha?.Close(); } catch { }
-        try { _cacheCleanupConfirmation?.Close(); } catch { }
         try { _mainWindow?.Close(); } catch { }
         _settings = null;
         _accountManager = null;
         _keptDirectories = null;
         _about = null;
         _captcha = null;
-        _cacheCleanupConfirmation = null;
         _mainWindow = null;
         while (CaptchaQueue.TryDequeue(out var request)) request.Completion.TrySetResult("");
     }
@@ -670,6 +630,46 @@ internal static class WinUiUiHost
                 "The progress window renders cleanup counts and a dismissible detailed failure.");
         }
         finally { switchProgress.Finish(); }
+
+        var cachePrompts = 0;
+        var cacheScans = 0;
+        var cacheConfirmation = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var cacheScanStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var cacheScan = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        Task<bool> CountCachePrompt() { cachePrompts++; return Task.FromResult(true); }
+        Task CountCacheScan() { cacheScans++; cacheScanStarted.TrySetResult(); return cacheScan.Task; }
+        var wasInitiallyEnabled = TrayHost.IsCacheCleanupMenuEnabled;
+        var firstCacheCleanup = TrayHost.RunCacheCleanupOnceAsync(() =>
+        {
+            cachePrompts++;
+            return cacheConfirmation.Task;
+        }, CountCacheScan);
+        var wasDisabledDuringConfirmation = !TrayHost.IsCacheCleanupMenuEnabled;
+        await TrayHost.RunCacheCleanupOnceAsync(CountCachePrompt, CountCacheScan);
+        var ignoredDuringConfirmation = cachePrompts == 1 && cacheScans == 0;
+        cacheConfirmation.SetResult(true);
+        await cacheScanStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        var wasDisabledDuringScan = !TrayHost.IsCacheCleanupMenuEnabled;
+        await TrayHost.RunCacheCleanupOnceAsync(CountCachePrompt, CountCacheScan);
+        var ignoredDuringScan = cachePrompts == 1 && cacheScans == 1;
+        cacheScan.SetResult();
+        await firstCacheCleanup;
+        var wasEnabledAfterScan = TrayHost.IsCacheCleanupMenuEnabled;
+        var wasDisabledDuringCancel = false;
+        await TrayHost.RunCacheCleanupOnceAsync(() =>
+        {
+            wasDisabledDuringCancel = !TrayHost.IsCacheCleanupMenuEnabled;
+            return Task.FromResult(false);
+        }, CountCacheScan);
+        var wasEnabledAfterCancel = TrayHost.IsCacheCleanupMenuEnabled;
+        var cancelDidNotScan = cacheScans == 1;
+        await TrayHost.RunCacheCleanupOnceAsync(CountCachePrompt, CountCacheScan);
+        Check("Tray cache cleanup single flight", ignoredDuringConfirmation && ignoredDuringScan
+                && cancelDidNotScan && cachePrompts == 2 && cacheScans == 2,
+            "Re-entry during confirmation and scanning is ignored; cancel does not scan and the menu works again afterward.");
+        Check("Tray cache cleanup menu enabled state", wasInitiallyEnabled && wasDisabledDuringConfirmation
+                && wasDisabledDuringScan && wasEnabledAfterScan && wasDisabledDuringCancel && wasEnabledAfterCancel,
+            "The cache cleanup menu item stays disabled from selection through confirmation and scanning, and is restored on completion or cancel.");
 
         TrayHost.Shutdown();
         await Task.Run(() => TrayHost.Join(TimeSpan.FromSeconds(3)));

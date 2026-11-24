@@ -106,6 +106,8 @@ internal sealed partial class MainWindow : Window
     private const string FolderGlyph = "\uE8B7";
     private const string FileGlyph = "\uE8A5";
     private const double StatusBarContentHeight = 22;
+    private const double TransferGaugeWidth = 140;
+    private const double CompactStatusWidth = 620;
 
     private readonly SyncRootContext _config;
     private readonly Grid _root;
@@ -254,6 +256,7 @@ internal sealed partial class MainWindow : Window
     };
 
     // Status bar
+    private Grid? _statusBar;
     private readonly TextBlock _summary = new() { VerticalAlignment = VerticalAlignment.Center };
     private readonly TextBlock _status = new()
     {
@@ -265,7 +268,8 @@ internal sealed partial class MainWindow : Window
     };
     private readonly ProgressBar _transferProgress = new()
     {
-        Width = 140,
+        Width = TransferGaugeWidth,
+        MinWidth = 0,
         Minimum = 0,
         Maximum = 100,
         Visibility = Visibility.Collapsed,
@@ -301,6 +305,7 @@ internal sealed partial class MainWindow : Window
     private readonly MenuFlyout _backgroundMenu = new();
     private readonly MenuFlyoutItem _menuOpen = NewMenuItem("\uE8E5", "打开");
     private readonly MenuFlyoutItem _menuDownload = NewMenuItem("\uE896", "下载");
+    private readonly MenuFlyoutItem _menuRemoveCache = NewMenuItem("\uE8D4", "移除缓存");
     private readonly MenuFlyoutItem _menuSaveAs = NewMenuItem("\uE792", "另存为…");
     private readonly MenuFlyoutItem _menuFavorite = NewMenuItem("\uE734", "添加到收藏");
     private readonly MenuFlyoutItem _menuRename = NewMenuItem("\uE8AC", "重命名");
@@ -415,7 +420,7 @@ internal sealed partial class MainWindow : Window
             _dragIntentTimer.Stop();
             _fileSortTimer.Stop();
             _fileStatusTimer.Stop();
-            _syncDownloadCancellation?.Cancel();
+            _syncTransferCancellation?.Cancel();
             _dragCancellation?.Cancel();
             CancelDragWarmup();
             try { SaveBrowserState(); }
@@ -991,7 +996,23 @@ internal sealed partial class MainWindow : Window
         };
         Grid.SetColumn(_permissionBadge, 4);
         bar.Children.Add(_permissionBadge);
+        _statusBar = bar;
+        bar.SizeChanged += (_, _) => UpdateTransferStatusLayout();
         return bar;
+    }
+
+    private void UpdateTransferStatusLayout()
+    {
+        if (_statusBar is not { ActualWidth: > 0 } bar) return;
+        var compact = _statusIsProgress && _transferProgress.Visibility == Visibility.Visible
+            && bar.ActualWidth < CompactStatusWidth;
+        // At the minimum window width with a wide sidebar, the summary and fixed-width
+        // gauge would leave too little room even for the numbers without any filename.
+        _summary.Visibility = compact ? Visibility.Collapsed : Visibility.Visible;
+        bar.ColumnSpacing = compact ? 6 : 12;
+        _transferProgress.Width = compact
+            ? Math.Clamp(bar.ActualWidth - (CompactStatusWidth - TransferGaugeWidth), 0, TransferGaugeWidth)
+            : TransferGaugeWidth;
     }
 
     private void BuildContextMenus()
@@ -999,6 +1020,7 @@ internal sealed partial class MainWindow : Window
         _menuOpen.FontWeight = FontWeights.SemiBold;
         _itemMenu.Items.Add(_menuOpen);
         _itemMenu.Items.Add(_menuDownload);
+        _itemMenu.Items.Add(_menuRemoveCache);
         _itemMenu.Items.Add(_menuSaveAs);
         _itemMenu.Items.Add(_menuFavorite);
         _itemMenu.Items.Add(new MenuFlyoutSeparator());
@@ -1081,6 +1103,7 @@ internal sealed partial class MainWindow : Window
 
         _menuOpen.Click += (_, _) => RunItemMenuCommand(OpenItemsAsync);
         _menuDownload.Click += (_, _) => RunItemMenuCommand(HydrateItemsAsync);
+        _menuRemoveCache.Click += (_, _) => RunItemMenuCommand(RemoveCachedItemsAsync);
         _menuSaveAs.Click += (_, _) => RunItemMenuCommand(SaveItemsAsAsync);
         _menuFavorite.Click += (_, _) => RunItemMenuCommand(target =>
         {
@@ -2269,6 +2292,7 @@ internal sealed partial class MainWindow : Window
         var count = _itemMenuTarget?.Items.Count ?? 0;
         _menuOpen.IsEnabled = available && count == 1;
         _menuDownload.IsEnabled = available && Program.IsDragBackendAvailable;
+        _menuRemoveCache.IsEnabled = _menuDownload.IsEnabled;
         _menuSaveAs.IsEnabled = available;
         var favoriteTarget = available ? GetFavoriteTarget(_itemMenuTarget) : null;
         _menuFavorite.Visibility = favoriteTarget is null ? Visibility.Collapsed : Visibility.Visible;
@@ -2647,8 +2671,8 @@ internal sealed partial class MainWindow : Window
             throw new IOException("不支持此类型的拖放项目。");
         await using var stream = new FileStream(localFile.Path, FileMode.Open, FileAccess.Read, FileShare.Read,
             128 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan);
-        var shortName = ShortenFileName(localFile.Name);
-        SetTransferProgress($"正在计算校验值 · {shortName}", 0);
+        var fileName = localFile.Name;
+        SetTransferProgress("正在计算校验值", 0, fileName);
         _transferProgress.IsIndeterminate = true;
         var hash = await SHA256.HashDataAsync(stream, Program.ApplicationCancellationToken);
         stream.Position = 0;
@@ -2656,8 +2680,8 @@ internal sealed partial class MainWindow : Window
         // Progress arrives on pool threads; the UI samples the latest value on its own timer.
         var tracker = new BrowserUploadProgress(verify);
         var timer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(100) };
-        timer.Tick += (_, _) => ShowBrowserUploadProgress(tracker.Latest, shortName);
-        ShowBrowserUploadProgress(tracker.Latest, shortName);
+        timer.Tick += (_, _) => ShowBrowserUploadProgress(tracker.Latest, fileName);
+        ShowBrowserUploadProgress(tracker.Latest, fileName);
         timer.Start();
         try
         {
@@ -2672,19 +2696,19 @@ internal sealed partial class MainWindow : Window
         }
     }
 
-    private void ShowBrowserUploadProgress(BrowserUploadProgress.State state, string shortName)
+    private void ShowBrowserUploadProgress(BrowserUploadProgress.State state, string fileName)
     {
         if (_isClosed) return;
         string Bytes(long done) => $"{FormatSize(done)} / {FormatSize(state.TotalBytes)}";
         var text = state.Stage switch
         {
-            UploadStage.Preparing => $"正在准备上传 · {shortName}",
-            UploadStage.Uploading => $"正在上传 · {shortName} · {Percent(state.SentBytes):F2}% · {Bytes(state.SentBytes)}",
-            UploadStage.Confirming => $"已上传，正在等待云端确认 · {shortName}",
-            UploadStage.Verifying => $"正在下载校验 · {shortName} · {Percent(state.VerifiedBytes):F2}% · {Bytes(state.VerifiedBytes)}",
-            _ => state.Verifies ? $"校验通过，正在完成 · {shortName}" : $"正在完成 · {shortName}",
+            UploadStage.Preparing => "正在准备上传",
+            UploadStage.Uploading => $"正在上传 · {Percent(state.SentBytes):F2}% · {Bytes(state.SentBytes)}",
+            UploadStage.Confirming => "已上传，正在等待云端确认",
+            UploadStage.Verifying => $"正在下载校验 · {Percent(state.VerifiedBytes):F2}% · {Bytes(state.VerifiedBytes)}",
+            _ => state.Verifies ? "校验通过，正在完成" : "正在完成",
         };
-        SetTransferProgress(text, state.OverallPercent);
+        SetTransferProgress(text, state.OverallPercent, fileName);
         _transferProgress.IsIndeterminate = state.Stage is UploadStage.Preparing or UploadStage.Confirming;
 
         double Percent(long done) => state.TotalBytes <= 0 ? 100 : Math.Clamp(done * 100.0 / state.TotalBytes, 0, 100);
@@ -2939,8 +2963,9 @@ internal sealed partial class MainWindow : Window
             var completed = Interlocked.Read(ref receivedBytes);
             if (completed == lastReportedBytes) return;
             lastReportedBytes = completed;
-            SetTransferProgress($"正在下载“{item.Name}”… {FormatSize(completed)} / {FormatSize(probe.Size)}",
-                probe.Size <= 0 ? 100 : completed * 100d / probe.Size);
+            var percent = probe.Size <= 0 ? 100 : completed * 100d / probe.Size;
+            SetTransferProgress($"正在下载 · {percent:F2}% · {FormatSize(completed)} / {FormatSize(probe.Size)}",
+                percent, item.Name);
             SetBrowserDownloadProgress(item.Id, completed, probe.Size);
         }
         // HTTP callbacks run off the UI thread. Sample their latest byte count rather than
@@ -3064,25 +3089,31 @@ internal sealed partial class MainWindow : Window
         _statusClearTimer.Stop();
         _statusIsProgress = false;
         _status.Text = text;
+        ToolTipService.SetToolTip(_status, null);
+        UpdateTransferStatusLayout();
         if (text.Length > 0) _statusClearTimer.Start();
     }
 
     /// <summary>Shows an in-progress message; it stays until the operation finishes.</summary>
-    private void SetProgressStatus(string text)
+    private void SetProgressStatus(string text, string? toolTip = null)
     {
         _statusClearTimer.Stop();
         _statusIsProgress = true;
         _status.Text = text;
+        ToolTipService.SetToolTip(_status, toolTip);
     }
 
     private static string JoinFailures(IReadOnlyList<string> failures, string separator)
         => string.Join(separator, failures.Take(3)) + (failures.Count > 3 ? $" 等 {failures.Count} 项" : "");
 
-    private void SetTransferProgress(string text, double percent)
+    private void SetTransferProgress(string text, double percent, string? fileName = null)
     {
-        SetProgressStatus(text);
+        // The status uses end ellipsis: keep the stage, percentage and byte counts ahead of the name.
+        if (string.IsNullOrEmpty(fileName)) SetProgressStatus(text);
+        else SetProgressStatus($"{text} · {ShortenFileName(fileName)}", $"{text} · {fileName}");
         _transferProgress.Value = Math.Clamp(percent, 0, 100);
         _transferProgress.Visibility = Visibility.Visible;
+        UpdateTransferStatusLayout();
     }
 
     private void ShowInfo(InfoBarSeverity severity, string title, string message,

@@ -25,6 +25,8 @@ internal static class TrayHost
     private static PopupMenuItem? _mainWindowMenuItem;
     private static PopupMenuItem? _aboutMenuItem;
     private static PopupMenuItem? _refreshFilesMenuItem;
+    private static PopupMenuItem? _cleanupCacheMenuItem;
+    private static bool _cacheCleanupActive; // WinUI dispatcher only; includes the modal confirmation.
     private static IntPtr _trayIconHandle;
     private static IntPtr _trayUpdateIconHandle;
     private static IntPtr _activeTrayIconHandle;
@@ -38,6 +40,7 @@ internal static class TrayHost
     private static Guid? _trayIdOverride;
 
     internal static bool IsTrayCreated => Volatile.Read(ref _trayCreated);
+    internal static bool IsCacheCleanupMenuEnabled => _cleanupCacheMenuItem is { Enabled: true };
 
     private const int ShellWaitTimeoutMs = 90_000;
     private const int ShellPollIntervalMs = 1_000;
@@ -58,6 +61,9 @@ internal static class TrayHost
 
     [DllImport("user32.dll", SetLastError = true)]
     private static extern bool SetForegroundWindow(IntPtr window);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, ExactSpelling = true)]
+    private static extern int MessageBoxW(IntPtr window, string text, string caption, uint type);
 
     [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
     private static extern IntPtr LoadImage(IntPtr instance, string name, uint type, int width, int height, uint loadFlags);
@@ -210,6 +216,7 @@ internal static class TrayHost
             _trayContextMenu = null;
             _mainWindowMenuItem = null;
             _refreshFilesMenuItem = null;
+            _cleanupCacheMenuItem = null;
             Volatile.Write(ref _trayCreated, false);
             if (_trayIconHandle != IntPtr.Zero)
             {
@@ -271,7 +278,12 @@ internal static class TrayHost
         _refreshFilesMenuItem = new PopupMenuItem("立即刷新文件", (_, _) => RefreshFilesNow());
         menu.Items.Add(_refreshFilesMenuItem);
         menu.Items.Add(new PopupMenuItem("打开日志目录", (_, _) => AfterTrayMenu(OpenLogFolder)));
-        menu.Items.Add(new PopupMenuItem("清理已缓存文件", (_, _) => AfterTrayMenu(() => _ = ConfirmAndDehydrateCacheAsync())));
+        _cleanupCacheMenuItem = new PopupMenuItem("清理已缓存文件", (_, _) =>
+            AfterTrayMenu(() => _ = ConfirmAndDehydrateCacheAsync()))
+        {
+            Enabled = !_cacheCleanupActive,
+        };
+        menu.Items.Add(_cleanupCacheMenuItem);
         menu.Items.Add(new PopupMenuItem("设置", (_, _) => AfterTrayMenu(OnSettingsMenuSelected)));
         _aboutMenuItem = new PopupMenuItem(
             UpdateService.CurrentState.IsAvailable ? "关于 - 可更新" : "关于",
@@ -640,33 +652,45 @@ internal static class TrayHost
         catch (Exception ex) { Log.Warning(ex, "打开日志目录失败"); }
     }
 
-    private static void DehydrateCache()
+    private static Task ConfirmAndDehydrateCacheAsync() => RunCacheCleanupOnceAsync(async () =>
     {
-        _ = Task.Run(() =>
-        {
-            try
-            {
-                var result = PlaceholderUpdater.DehydrateTree(Program.SyncRootPath,
-                    message => Log.Information("{Message}", message));
-                var megabytes = result.FreedBytes / 1024.0 / 1024.0;
-                Notify("缓存清理完成", $"已释放 {megabytes:F1} MB（清理 {result.Dehydrated} 个文件，跳过 {result.Skipped} 个）");
-            }
-            catch (Exception ex)
-            {
-                Log.Error(ex, "本地缓存脱水失败");
-                Notify("缓存清理失败", ex.Message);
-            }
-        });
-    }
+        // Disable the menu first, then let the native tray callback unwind before showing a modal dialog.
+        await Task.Yield();
+        if (TrayLifetime.IsCancellationRequested || _tray is not { } tray) return false;
+        // Repeatedly constructing and closing a WinUI/Mica prompt can hit native composition
+        // teardown. The tray already has a Win32 owner; keep confirmation off that XAML path.
+        const uint okCancel = 0x0001, setForeground = 0x10000;
+        const int confirmed = 1; // IDOK
+        return MessageBoxW(tray.WindowHandle, "确定清理已缓存文件？",
+            $"{ProductIdentity.DisplayNameZh} - 清理", okCancel | setForeground) == confirmed;
+    }, () => Task.Run(() =>
+    {
+        var result = PlaceholderUpdater.DehydrateTree(Program.SyncRootPath,
+            message => Log.Information("{Message}", message), cancellationToken: Program.ApplicationCancellationToken);
+        var megabytes = result.FreedBytes / 1024.0 / 1024.0;
+        Notify("缓存清理完成", $"已释放 {megabytes:F1} MB（清理 {result.Dehydrated} 个文件，跳过 {result.Skipped} 个）");
+    }));
 
-    private static async Task ConfirmAndDehydrateCacheAsync()
+    internal static async Task RunCacheCleanupOnceAsync(Func<Task<bool>> confirm, Func<Task> cleanup)
     {
+        if (_cacheCleanupActive || TrayLifetime.IsCancellationRequested) return;
+        _cacheCleanupActive = true;
         try
         {
-            if (await WinUiUiHost.ConfirmCacheCleanupAsync())
-                DehydrateCache();
+            if (_cleanupCacheMenuItem is { } item) item.Enabled = false;
+            if (await confirm() && !TrayLifetime.IsCancellationRequested) await cleanup();
         }
-        catch (Exception ex) { Log.Error(ex, "缓存清理确认对话框失败"); }
+        catch (OperationCanceledException) when (Program.ApplicationCancellationToken.IsCancellationRequested) { }
+        catch (Exception ex)
+        {
+            Log.Error(ex, "托盘缓存清理失败");
+            Notify("缓存清理失败", ex.Message);
+        }
+        finally
+        {
+            _cacheCleanupActive = false;
+            if (_cleanupCacheMenuItem is { } item) item.Enabled = !TrayLifetime.IsCancellationRequested;
+        }
     }
 
     private static void OpenSettings()

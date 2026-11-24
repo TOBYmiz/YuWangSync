@@ -3,6 +3,7 @@ using Microsoft.UI.Xaml.Automation;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Media;
 using YuWangCloudSync.CloudFiles;
+using YuWangCloudSync.Core;
 using YuWangCloudSync.Models;
 using YuWangCloudSync.Net;
 
@@ -10,7 +11,7 @@ namespace YuWangCloudSync.Tray;
 
 internal sealed partial class MainWindow
 {
-    private CancellationTokenSource? _syncDownloadCancellation;
+    private CancellationTokenSource? _syncTransferCancellation;
     private readonly DispatcherTimer _fileStatusTimer = new() { Interval = TimeSpan.FromSeconds(1) };
     private readonly HashSet<(YuWangItem Item, Border Cell)> _availabilityRows = [];
     private bool _availabilityPending;
@@ -251,17 +252,17 @@ internal sealed partial class MainWindow
             var client = Client ?? throw new IOException("尚未连接到云端。");
             using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(Program.ApplicationCancellationToken);
             cancellation.CancelAfter(TimeSpan.FromMinutes(Math.Clamp(_config.DownloadTimeoutMinutes, 1, 120)));
-            _syncDownloadCancellation = cancellation;
+            _syncTransferCancellation = cancellation;
             var token = cancellation.Token;
             var progress = new DragProgressState();
             var timer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(100) };
             timer.Tick += (_, _) =>
             {
                 var current = progress.Latest;
-                var text = current.FileName is { Length: > 0 } name ? $"{current.Stage} · {ShortenFileName(name)}" : current.Stage;
+                var text = current.Stage;
                 if (current.Percent is { } percent)
                     text += $" · {percent:F2}% · {FormatSize(current.CompletedBytes)} / {FormatSize(current.TotalBytes)}";
-                SetTransferProgress(text, current.Percent ?? 0);
+                SetTransferProgress(text, current.Percent ?? 0, current.FileName);
                 _transferProgress.IsIndeterminate = current.Percent is null;
             };
             timer.Start();
@@ -280,10 +281,66 @@ internal sealed partial class MainWindow
             {
                 timer.Stop();
                 _transferProgress.IsIndeterminate = false;
-                _syncDownloadCancellation = null;
+                _syncTransferCancellation = null;
                 RefreshFileAvailability();
             }
         }, "下载失败");
+    }
+
+    private async Task RemoveCachedItemsAsync(ItemActionTarget? target)
+    {
+        if (target is null || !IsItemTargetAvailable(target) || !Program.IsDragBackendAvailable) return;
+        var client = Client;
+        var root = Program.SyncRootPath;
+        await RunBusyAsync("正在移除缓存…", async () =>
+        {
+            using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(Program.ApplicationCancellationToken);
+            _syncTransferCancellation = cancellation;
+            var token = cancellation.Token;
+            try
+            {
+                var (removed, skipped, freed) = await Task.Run(() =>
+                {
+                    void CheckConnection()
+                    {
+                        token.ThrowIfCancellationRequested();
+                        if (!Program.IsDragBackendAvailable || !ReferenceEquals(client, Program.ClientForUi)
+                            || !string.Equals(root, Program.SyncRootPath, StringComparison.OrdinalIgnoreCase))
+                            throw new IOException("同步引擎未连接或同步目录已更改，请稍后重试。");
+                    }
+
+                    var disk = target.Parent.Disk.Id;
+                    var parent = target.Parent.Id;
+                    var removed = 0;
+                    var skipped = 0;
+                    var freed = 0L;
+                    foreach (var item in target.Items)
+                    {
+                        CheckConnection();
+                        var path = Program.ResolveLocalItemPath(disk, parent, item);
+                        if (path is null) continue;
+                        var identity = new FileIdentity(disk, parent, item.Id, item.IsFolder ? (byte)0 : (byte)1);
+                        var result = PlaceholderUpdater.RemoveCachedContent(path, identity, CheckConnection,
+                            Callbacks.IsWriteMutationPending, message => Serilog.Log.Information("{Message}", message));
+                        removed += result.Removed;
+                        skipped += result.Skipped;
+                        freed += result.FreedBytes;
+                    }
+                    return (removed, skipped, freed);
+                }, token);
+                if (_isClosed) return;
+                var detail = removed > 0 ? $"已移除 {removed} 个文件的缓存，释放 {FormatSize(freed)}。"
+                    : skipped == 0 ? "所选项目没有需要移除的本地缓存。" : "未移除本地缓存。";
+                if (skipped > 0) detail += $" 已跳过 {skipped} 项（可能已固定、正在使用、尚未同步或无法访问）。";
+                ShowInfo(skipped > 0 ? InfoBarSeverity.Warning : InfoBarSeverity.Success,
+                    skipped > 0 ? "部分项目未清理" : "缓存移除完成", detail);
+            }
+            finally
+            {
+                _syncTransferCancellation = null;
+                RefreshFileAvailability();
+            }
+        }, "移除缓存失败");
     }
 
     private static async Task HydrateSyncRootEntryAsync(YuWangClient client, ulong disk, ulong parent, YuWangItem item,
