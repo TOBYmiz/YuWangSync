@@ -193,6 +193,59 @@ internal sealed partial class MainWindow
             }
             if (browser._isClosed) return checks;
 
+            var infoBarAnimationsEnabled = browser._uiSettings.AnimationsEnabled;
+            browser.ShowInfo(InfoBarSeverity.Success, "动画测试", "成功提示应平滑展开。");
+            await Task.Delay(350);
+            Check("Success InfoBar entrance settles", browser._infoBar.IsOpen
+                && browser._infoBarHost.Visibility == Microsoft.UI.Xaml.Visibility.Visible
+                && browser._infoBarHost.Opacity == 1 && double.IsNaN(browser._infoBarHost.Height)
+                && !browser._infoBarAnimating,
+                "The notification ends fully visible at its natural height.");
+            Check("Success countdown uses continuous animation", !infoBarAnimationsEnabled
+                || browser._infoBarCountdownAnimation is { Target: "Scale" } countdown
+                    && countdown.Duration == browser._infoBarCloseTimer.Interval,
+                "A compositor scale animation spans the entire auto-close interval rather than stepping on timer ticks.");
+            browser._infoBar.IsOpen = false;
+            Check("Success InfoBar defers closing for exit", !infoBarAnimationsEnabled
+                || browser._infoBarAnimating && !browser._infoBarAnimationShowing
+                    && browser._infoBarCountdown.Visibility == Microsoft.UI.Xaml.Visibility.Visible,
+                "The green countdown stays with the bar while it fades and collapses.");
+            await Task.Delay(60);
+            browser.ShowInfo(InfoBarSeverity.Success, "替换成功提示", "正在收起时重新显示。");
+            await Task.Delay(350);
+            Check("Success InfoBar reverses an interrupted close", browser._infoBar.IsOpen
+                && browser._infoBar.Title == "替换成功提示" && browser._infoBarHost.Opacity == 1
+                && double.IsNaN(browser._infoBarHost.Height) && browser._infoBarCloseTimer.IsEnabled,
+                "A new notification cancels the previous exit and receives a fresh countdown.");
+            browser._infoBar.IsOpen = false;
+            await Task.Delay(350);
+            Check("Success InfoBar exit cleans up", !browser._infoBar.IsOpen && !browser._infoBarAnimating
+                && browser._infoBarHost.Visibility == Microsoft.UI.Xaml.Visibility.Collapsed
+                && browser._infoBarCountdown.Visibility == Microsoft.UI.Xaml.Visibility.Collapsed
+                && !browser._infoBarCloseTimer.IsEnabled,
+                "Manual closing releases the notification row, countdown and rendering handler.");
+            var closeInterval = browser._infoBarCloseTimer.Interval;
+            try
+            {
+                browser._infoBarCloseTimer.Interval = TimeSpan.FromMilliseconds(300);
+                browser.ShowInfo(InfoBarSeverity.Success, "自动关闭", "倒计时结束后平滑消失。");
+                await Task.Delay(800);
+                Check("Success InfoBar auto-close animates and settles", !browser._infoBar.IsOpen
+                    && browser._infoBarHost.Visibility == Microsoft.UI.Xaml.Visibility.Collapsed
+                    && !browser._infoBarAnimating && browser._infoBarCountdownAnimation is null,
+                    "The timeout follows the same exit and cleanup path as manual closing.");
+            }
+            finally { browser._infoBarCloseTimer.Interval = closeInterval; }
+            browser.ShowInfo(InfoBarSeverity.Success, "旧成功提示", "即将被警告替换。");
+            browser._infoBar.IsOpen = false;
+            browser.ShowInfo(InfoBarSeverity.Warning, "新警告", "应保持显示。");
+            await Task.Delay(350);
+            Check("InfoBar replacement cancels stale success dismissal", browser._infoBar.IsOpen
+                && browser._infoBar.Severity == InfoBarSeverity.Warning
+                && !browser._infoBarCloseTimer.IsEnabled && browser._infoBarCountdownAnimation is null,
+                "A warning replacing an exiting success notification remains visible without its countdown.");
+            browser._infoBar.IsOpen = false;
+            await Task.Delay(350);
             browser._savedState.FavoritesExpanded = true;
             browser.ConstrainFavoritesHeight();
             browser._root.UpdateLayout();

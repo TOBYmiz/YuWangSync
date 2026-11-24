@@ -406,6 +406,8 @@ internal sealed partial class MainWindow : Window
         {
             _isClosed = true;
             StopFavoritesAnimation();
+            StopInfoBarAnimation();
+            StopInfoBarCountdown();
             _statusClearTimer.Stop();
             _infoBarCloseTimer.Stop();
             _dragIntentTimer.Stop();
@@ -596,12 +598,18 @@ internal sealed partial class MainWindow : Window
         Grid.SetRow(commands, 1);
         grid.Children.Add(commands);
 
-        Grid.SetRow(_infoBar, 2);
-        grid.Children.Add(_infoBar);
+        Grid.SetRow(_infoBarHost, 2);
+        grid.Children.Add(_infoBarHost);
+        _infoBarHost.RenderTransform = _infoBarTranslation;
+        _infoBarHost.SizeChanged += (_, _) => _infoBarHost.Clip = new RectangleGeometry
+        {
+            Rect = new Windows.Foundation.Rect(0, 0, _infoBarHost.ActualWidth, _infoBarHost.ActualHeight),
+        };
+        _infoBarHost.Children.Add(_infoBar);
         _infoBarCountdown.Margin = _infoBar.Margin;
-        Grid.SetRow(_infoBarCountdown, 2);
-        grid.Children.Add(_infoBarCountdown);
-        _infoBar.Closed += (_, _) => StopInfoBarCountdown();
+        _infoBarHost.Children.Add(_infoBarCountdown);
+        _infoBar.Closing += OnInfoBarClosing;
+        _infoBar.Closed += (_, _) => ResetClosedInfoBar();
 
         BuildColumnsHeader();
         _fileSurface.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
@@ -930,7 +938,6 @@ internal sealed partial class MainWindow : Window
         _infoBarCloseTimer.Tick += (_, _) =>
         {
             _infoBarCloseTimer.Stop();
-            StopInfoBarCountdown();
             if (!_isClosed && _infoBar.Severity == InfoBarSeverity.Success) _infoBar.IsOpen = false;
         };
 
@@ -2831,26 +2838,49 @@ internal sealed partial class MainWindow : Window
         Directory.CreateDirectory(folder);
         var finalPath = GetAvailablePath(folder, SafeFileName(item.Name), directory: false);
         var temporaryPath = finalPath + ".yw-download-" + Guid.NewGuid().ToString("N");
+        long receivedBytes = 0;
+        long lastReportedBytes = -1;
+        void ReportDownloadProgress()
+        {
+            if (_isClosed || cancellationToken.IsCancellationRequested) return;
+            var completed = Interlocked.Read(ref receivedBytes);
+            if (completed == lastReportedBytes) return;
+            lastReportedBytes = completed;
+            preparationProgress?.Invoke(item.Name, completed, probe.Size);
+            if (reportProgress) SetTransferProgress($"正在下载“{item.Name}”… {FormatSize(completed)} / {FormatSize(probe.Size)}",
+                probe.Size <= 0 ? 100 : completed * 100d / probe.Size);
+        }
+        // HTTP callbacks run off the UI thread. Sample their latest byte count rather than
+        // waiting for a complete 4 MB range or queuing one UI action for every network read.
+        var progressTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(100) };
+        progressTimer.Tick += (_, _) => ReportDownloadProgress();
         try
         {
             await using var output = new FileStream(temporaryPath, FileMode.CreateNew, FileAccess.Write, FileShare.None,
                 128 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan);
             long offset = 0;
-            if (reportProgress) SetTransferProgress($"正在下载“{item.Name}”…", 0);
-            preparationProgress?.Invoke(item.Name, 0, probe.Size);
+            ReportDownloadProgress();
+            progressTimer.Start();
             while (offset < probe.Size)
             {
                 cancellationToken.ThrowIfCancellationRequested();
+                var rangeOffset = offset;
                 var requested = Math.Min(4 * 1024 * 1024, probe.Size - offset);
-                var range = await client.DownloadRangeDirectAsync(probe.DirectUrl, offset, requested)
+                var range = await client.DownloadRangeDirectAsync(probe.DirectUrl, offset, requested,
+                    reportProgress: (_, completed) =>
+                    {
+                        // A retry may start this range again at zero. Keep displayed progress
+                        // monotonic and clamp whole-file fallback responses to this range.
+                        var received = rangeOffset + Math.Clamp(completed, 0, requested);
+                        Interlocked.Exchange(ref receivedBytes, Math.Max(Interlocked.Read(ref receivedBytes), received));
+                    })
                     .WaitAsync(cancellationToken);
                 if (range is null || range.Value.Data.Length == 0)
                     throw new EndOfStreamException($"“{item.Name}”下载提前结束。");
                 await output.WriteAsync(range.Value.Data, cancellationToken);
                 offset += range.Value.Data.Length;
-                preparationProgress?.Invoke(item.Name, offset, probe.Size);
-                if (reportProgress) SetTransferProgress($"正在下载“{item.Name}”… {FormatSize(offset)} / {FormatSize(probe.Size)}",
-                    probe.Size <= 0 ? 100 : offset * 100d / probe.Size);
+                Interlocked.Exchange(ref receivedBytes, offset);
+                ReportDownloadProgress();
             }
             await output.FlushAsync(cancellationToken);
             output.Close();
@@ -2863,6 +2893,10 @@ internal sealed partial class MainWindow : Window
         {
             try { if (File.Exists(temporaryPath)) File.Delete(temporaryPath); } catch { }
             throw;
+        }
+        finally
+        {
+            progressTimer.Stop();
         }
     }
 
@@ -2978,7 +3012,7 @@ internal sealed partial class MainWindow : Window
             _infoBar.ActionButton = button;
         }
         else _infoBar.ActionButton = null;
-        _infoBar.IsOpen = true;
+        OpenInfoBar();
         if (severity != InfoBarSeverity.Success) return;
         _infoBarCloseTimer.Start();
         StartInfoBarCountdown();

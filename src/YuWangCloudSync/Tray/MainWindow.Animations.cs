@@ -32,6 +32,107 @@ internal sealed partial class MainWindow
     };
 
     private Vector3KeyFrameAnimation? _infoBarCountdownAnimation;
+    private const double InfoBarTransitionMilliseconds = 200;
+    private readonly Grid _infoBarHost = new()
+    {
+        Name = "InfoBarHost", Visibility = Visibility.Collapsed, Height = 0, Opacity = 0,
+    };
+    private readonly TranslateTransform _infoBarTranslation = new() { Y = -6 };
+    private bool _infoBarAnimating;
+    private bool _infoBarAnimationShowing;
+    private bool _allowInfoBarClose;
+    private long _infoBarAnimationStarted;
+    private double _infoBarHeightFrom, _infoBarHeightTo, _infoBarOpacityFrom, _infoBarTranslationFrom;
+
+    private void OpenInfoBar()
+    {
+        var animate = !_infoBar.IsOpen || _infoBarAnimating;
+        _infoBar.IsOpen = true;
+        _infoBarHost.Visibility = Visibility.Visible;
+        _infoBarHost.IsHitTestVisible = true;
+        if (animate) AnimateInfoBar(show: true);
+    }
+
+    private void OnInfoBarClosing(InfoBar sender, InfoBarClosingEventArgs args)
+    {
+        _infoBarCloseTimer.Stop();
+        if (_allowInfoBarClose || _isClosed || !_uiSettings.AnimationsEnabled || _infoBarHost.XamlRoot is null) return;
+        // Keep the control and countdown visible until the exit transition finishes.
+        args.Cancel = true;
+        if (!_infoBarAnimating || _infoBarAnimationShowing) AnimateInfoBar(show: false);
+    }
+
+    private void AnimateInfoBar(bool show)
+    {
+        StopInfoBarAnimation();
+        _infoBarAnimationShowing = show;
+        _infoBarHeightFrom = double.IsNaN(_infoBarHost.Height) ? _infoBarHost.ActualHeight : _infoBarHost.Height;
+        _infoBarHeightTo = 0;
+        if (show)
+        {
+            // Measure the new content, including margins, independently of the host's
+            // current animated height so a replacement can reverse an in-flight close.
+            var width = _infoBarHost.ActualWidth > 0 ? _infoBarHost.ActualWidth : _root.ActualWidth;
+            _infoBar.Measure(new Windows.Foundation.Size(width, double.PositiveInfinity));
+            _infoBarHeightTo = _infoBar.DesiredSize.Height;
+        }
+        _infoBarOpacityFrom = _infoBarHost.Opacity;
+        _infoBarTranslationFrom = _infoBarTranslation.Y;
+        _infoBarHost.IsHitTestVisible = show;
+        if (!_uiSettings.AnimationsEnabled || _infoBarHost.XamlRoot is null)
+        {
+            FinishInfoBarAnimation();
+            return;
+        }
+        _infoBarHost.Height = _infoBarHeightFrom;
+        _infoBarAnimationStarted = Environment.TickCount64;
+        _infoBarAnimating = true;
+        CompositionTarget.Rendering += OnInfoBarRendering;
+    }
+
+    private void OnInfoBarRendering(object? sender, object args)
+    {
+        var progress = Math.Clamp((Environment.TickCount64 - _infoBarAnimationStarted)
+            / InfoBarTransitionMilliseconds, 0, 1);
+        var eased = 1 - Math.Pow(1 - progress, 3);
+        _infoBarHost.Height = _infoBarHeightFrom + (_infoBarHeightTo - _infoBarHeightFrom) * eased;
+        _infoBarHost.Opacity = _infoBarOpacityFrom + ((_infoBarAnimationShowing ? 1 : 0) - _infoBarOpacityFrom) * eased;
+        _infoBarTranslation.Y = _infoBarTranslationFrom + ((_infoBarAnimationShowing ? 0 : -6) - _infoBarTranslationFrom) * eased;
+        if (progress >= 1) FinishInfoBarAnimation();
+    }
+
+    private void FinishInfoBarAnimation()
+    {
+        StopInfoBarAnimation();
+        if (_infoBarAnimationShowing)
+        {
+            _infoBarHost.Height = double.NaN;
+            _infoBarHost.Opacity = 1;
+            _infoBarTranslation.Y = 0;
+            return;
+        }
+        _allowInfoBarClose = true;
+        try { _infoBar.IsOpen = false; }
+        finally { _allowInfoBarClose = false; }
+    }
+
+    private void StopInfoBarAnimation()
+    {
+        if (!_infoBarAnimating) return;
+        CompositionTarget.Rendering -= OnInfoBarRendering;
+        _infoBarAnimating = false;
+    }
+
+    private void ResetClosedInfoBar()
+    {
+        StopInfoBarAnimation();
+        _infoBarCloseTimer.Stop();
+        StopInfoBarCountdown();
+        _infoBarHost.Visibility = Visibility.Collapsed;
+        _infoBarHost.Height = 0;
+        _infoBarHost.Opacity = 0;
+        _infoBarTranslation.Y = -6;
+    }
 
     private void QueueNavigationExpandAnimation(TreeViewNode node)
     {
@@ -113,7 +214,7 @@ internal sealed partial class MainWindow
     /// </summary>
     private void StartInfoBarCountdown()
     {
-        if (_isClosed) return;
+        if (_isClosed || !_uiSettings.AnimationsEnabled) return;
         _infoBarCountdown.Background = WinUiUiHost.GetBrushResource("SystemFillColorSuccessBrush");
         _infoBarCountdown.Visibility = Visibility.Visible;
         var compositor = CompositionTarget.GetCompositorForCurrentThread();
