@@ -560,7 +560,7 @@ internal static class WinUiUiHost
         Check("Settings validation", settings.ValidateForSelfTest(),
             "Invalid TypeId is rejected by the same value validation used before applying settings.");
         Check("Settings automation options", settings.ValidateAutomationOptionsForSelfTest(),
-            "Cache cleanup has four intervals and follows the checkbox enabled state; automatic download is present.");
+            "Cache cleanup has four intervals and follows the checkbox enabled state; automatic download is present; metered upload verification is unavailable while upload verification is off.");
         Check("NativeAOT WinUI resource projections",
             GetStyleResource("DefaultButtonStyle") is not null
                 && GetStyleResource("DefaultContentDialogStyle") is not null

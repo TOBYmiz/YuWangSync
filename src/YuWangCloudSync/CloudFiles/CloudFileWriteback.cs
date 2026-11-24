@@ -779,7 +779,8 @@ internal sealed class CloudFileWriteback : IDisposable
         // read-sharing mode for hashing/upload; it blocks new writers while remaining compatible
         // with the later CFAPI placeholder conversion.
         await using var file = OpenUploadRead(path);
-        using var uploadProgress = new UploadProgressReporter(path, file.Length, _log, _stop.Token);
+        var verifyUpload = UploadVerificationPolicy.ShouldVerify(_log);
+        using var uploadProgress = new UploadProgressReporter(path, file.Length, _log, _stop.Token, verifyUpload);
         var modified = File.GetLastWriteTimeUtc(path);
         var hash = await SHA256.HashDataAsync(file, _stop.Token).ConfigureAwait(false);
         var hashText = Convert.ToHexString(hash);
@@ -832,12 +833,12 @@ internal sealed class CloudFileWriteback : IDisposable
         {
             remote = await _client.ReplaceRemoteFileAsync(disk, folder, oldId, name, backupName, file, modified, hash,
                 id => _cache.SaveWritebackReceipt(_user, path, hashText, disk, folder, backupName, id), _stop.Token, uploadProgress.Report,
-                attempt, RememberAttempt).ConfigureAwait(false);
+                attempt, RememberAttempt, verifyUpload).ConfigureAwait(false);
         }
         else
         {
             remote = await _client.UploadNewFileAsync(disk, folder, name, file, modified, hash, _stop.Token, uploadProgress.Report,
-                attempt, RememberAttempt).ConfigureAwait(false);
+                attempt, RememberAttempt, verifyUpload).ConfigureAwait(false);
             _cache.SaveWritebackReceipt(_user, path, hashText, disk, folder, backupName, remote.Id);
         }
         _cache.SaveFileMetadata(disk, folder, remote.Id, name, remote.UploadTime?.ToString("yyyy-MM-dd HH:mm:ss"), file.Length);
@@ -847,14 +848,14 @@ internal sealed class CloudFileWriteback : IDisposable
         else _cache.SetRealSize(remote.Id, file.Length);
         if (owned && identity.FileId != remote.Id) _cache.RemoveCachedItem(identity);
         if (!PlaceholderUpdater.TryBindIdentity(path, new(disk, folder, remote.Id, 1), true, _log))
-            throw new IOException("文件已上传并校验，本地身份绑定尚未完成。");
+            throw new IOException("文件已上传，本地身份绑定尚未完成。");
         _cache.RemoveWritebackReceipt(_user, path, hashText);
         _cache.MarkHydrated(remote.Id);
         _cache.InvalidateFolderListing(disk, folder);
         Callbacks.InvalidateFolderListing(disk, folder);
         ExplorerStateNotifier.NotifyItem(path);
         uploadProgress.Complete();
-        _log?.Invoke($"[WRITE] 文件上传并校验完成 file={remote.Id} bytes={file.Length} path={path}");
+        _log?.Invoke($"[WRITE] 文件上传完成 file={remote.Id} bytes={file.Length} verified={verifyUpload} path={path}");
     }
 
     public void Dispose()

@@ -85,6 +85,14 @@ internal sealed class SettingsWindow : Window
     private readonly CheckBox _automaticUpdateCheck = new() { Name = "AutomaticUpdateCheckCheckBox" };
     private readonly CheckBox _trayUpdateHint = new() { Name = "TrayUpdateHintCheckBox" };
     private readonly CheckBox _automaticUpdateDownload = new() { Name = "AutomaticUpdateDownloadCheckBox" };
+    private readonly CheckBox _verifyUploadedFiles = new() { Name = "VerifyUploadedFilesCheckBox" };
+    // Indented under its parent option; disabled (and shown as such) while the parent is off.
+    private readonly CheckBox _verifyUploadedFilesOnMetered = new()
+    {
+        Name = "VerifyUploadedFilesOnMeteredCheckBox",
+        Margin = new Thickness(28, 0, 0, 0),
+    };
+    private readonly TextBlock _verifyUploadedFilesOnMeteredNote;
     private readonly TextBox _containerTypeId = new()
     {
         Name = "ContainerTypeIdTextBox",
@@ -245,6 +253,17 @@ internal sealed class SettingsWindow : Window
         _fileCacheCleanupStatusTimer.Tick += (_, _) => RefreshFileCacheCleanupStatus();
         AddCard(content, "缓存与刷新", cacheGrid);
 
+        _verifyUploadedFiles.Content = "上传文件后下载校验";
+        _verifyUploadedFilesOnMetered.Content = "使用计费网络时启用";
+        _verifyUploadedFilesOnMeteredNote = NewNote("下载校验会额外消耗与文件大小相同的流量。");
+        _verifyUploadedFilesOnMeteredNote.Margin = new Thickness(28, 2, 0, 6);
+        var uploadGrid = NewGrid(RowHeight, 0, RowHeight, 0);
+        AddCheck(uploadGrid, _verifyUploadedFiles, 0);
+        Add(uploadGrid, NewNote("上传完成后下载云端文件并比对内容，确认一致后才标记为已同步。关闭后以服务器确认收到全部数据为准。"), 1, 0, 2);
+        AddCheck(uploadGrid, _verifyUploadedFilesOnMetered, 2);
+        Add(uploadGrid, _verifyUploadedFilesOnMeteredNote, 3, 0, 2);
+        AddCard(content, "上传", uploadGrid);
+
         _persist.Content = "退出后保留同步目录";
         var persistGrid = NewGrid(RowHeight);
         AddCheck(persistGrid, _persist, 0);
@@ -352,6 +371,9 @@ internal sealed class SettingsWindow : Window
         _fileCacheCleanupInterval.IsEnabled = snapshot.AutomaticFileCacheCleanup;
         _containerTypeId.Text = snapshot.RootContainerTypeId.ToString();
         _providerName.Text = snapshot.ProviderName;
+        _verifyUploadedFiles.IsChecked = snapshot.VerifyUploadedFiles;
+        _verifyUploadedFilesOnMetered.IsChecked = snapshot.VerifyUploadedFilesOnMeteredNetwork;
+        UpdateUploadVerificationEnabled();
         _persist.IsChecked = snapshot.PersistSyncRoot;
         _enableNavigationEntry.IsChecked = snapshot.EnableExplorerNavigationEntry;
         _enableMainWindow.IsChecked = snapshot.EnableMainWindow;
@@ -814,6 +836,9 @@ internal sealed class SettingsWindow : Window
             AutomaticUpdateCheck = _automaticUpdateCheck.IsChecked == true,
             TrayUpdateHintEnabled = _trayUpdateHint.IsChecked == true,
             AutomaticUpdateDownload = _automaticUpdateDownload.IsChecked == true,
+            VerifyUploadedFiles = _verifyUploadedFiles.IsChecked == true,
+            // Keep the sub-option's own value while the parent is off, so re-enabling restores it.
+            VerifyUploadedFilesOnMeteredNetwork = _verifyUploadedFilesOnMetered.IsChecked == true,
         };
         return null;
     }
@@ -853,6 +878,7 @@ internal sealed class SettingsWindow : Window
     internal bool ValidateAutomationOptionsForSelfTest()
     {
         var original = _automaticFileCacheCleanup.IsChecked;
+        var originalVerify = _verifyUploadedFiles.IsChecked;
         try
         {
             if (!_fileCacheCleanupInterval.Items.OfType<ComboBoxItem>().Select(item => (int)item.Tag)
@@ -861,9 +887,17 @@ internal sealed class SettingsWindow : Window
             _automaticFileCacheCleanup.IsChecked = false;
             if (_fileCacheCleanupInterval.IsEnabled) return false;
             _automaticFileCacheCleanup.IsChecked = true;
-            return _fileCacheCleanupInterval.IsEnabled;
+            if (!_fileCacheCleanupInterval.IsEnabled) return false;
+            _verifyUploadedFiles.IsChecked = false;
+            if (_verifyUploadedFilesOnMetered.IsEnabled) return false;
+            _verifyUploadedFiles.IsChecked = true;
+            return _verifyUploadedFilesOnMetered.IsEnabled;
         }
-        finally { _automaticFileCacheCleanup.IsChecked = original; }
+        finally
+        {
+            _automaticFileCacheCleanup.IsChecked = original;
+            _verifyUploadedFiles.IsChecked = originalVerify;
+        }
     }
 
     private async Task CommitAsync(bool close)
@@ -1186,6 +1220,18 @@ internal sealed class SettingsWindow : Window
         _trayUpdateHint.Unchecked += (_, _) => MarkDirty();
         _automaticUpdateDownload.Checked += (_, _) => MarkDirty();
         _automaticUpdateDownload.Unchecked += (_, _) => MarkDirty();
+        _verifyUploadedFiles.Checked += (_, _) => { UpdateUploadVerificationEnabled(); MarkDirty(); };
+        _verifyUploadedFiles.Unchecked += (_, _) => { UpdateUploadVerificationEnabled(); MarkDirty(); };
+        _verifyUploadedFilesOnMetered.Checked += (_, _) => MarkDirty();
+        _verifyUploadedFilesOnMetered.Unchecked += (_, _) => MarkDirty();
+    }
+
+    /// <summary>“使用计费网络时启用”只是“上传文件后下载校验”的附属项，父项关闭时不可用。</summary>
+    private void UpdateUploadVerificationEnabled()
+    {
+        var enabled = _verifyUploadedFiles.IsChecked == true;
+        _verifyUploadedFilesOnMetered.IsEnabled = enabled;
+        _verifyUploadedFilesOnMeteredNote.Opacity = enabled ? 1 : 0.5;
     }
 
     private void UpdateFileCacheCleanupEnabled()

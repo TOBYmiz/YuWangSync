@@ -49,13 +49,14 @@ internal sealed partial class MainWindow
                 if (_isClosed || version != _fileRenderVersion || !Equals(folder, _currentFolder)
                     || !ReferenceEquals(failures, Callbacks.DownloadFailures)) return;
                 for (var i = 0; i < rows.Length; ++i)
-                    if (_availabilityRows.Contains(rows[i])) SetAvailability(rows[i].Cell, states[i].Availability, states[i].Error);
+                    if (_availabilityRows.Contains(rows[i]))
+                        SetAvailability(rows[i].Cell, states[i].Availability, states[i].Error, states[i].Upload);
             }
             finally { _availabilityPending = false; }
         });
     }
 
-    private static (SyncRootAvailability Availability, FileSyncError Error) ReadFileSyncStatus(
+    private static (SyncRootAvailability Availability, FileSyncError Error, UploadActivitySnapshot? Upload) ReadFileSyncStatus(
         ulong disk, ulong folder, YuWangItem item, SyncRootDownloadFailures failures)
     {
         var identity = new FileIdentity(disk, folder, item.Id, 1);
@@ -64,19 +65,29 @@ internal sealed partial class MainWindow
         try
         {
             var path = Program.ResolveLocalItemPath(disk, folder, item);
+            // An active local-change upload (including a retry after an earlier failure) wins.
+            if (path is not null && UploadActivity.TryGet(path, out var upload))
+                return (SyncRootAvailability.Local, FileSyncError.None, upload);
             availability = path is null ? SyncRootAvailability.OnlineOnly : DragFilePreparation.ReadAvailability(path);
-            if (path is not null && Callbacks.HasWritebackFailure(path)) return (availability, FileSyncError.Writeback);
+            if (path is not null && Callbacks.HasWritebackFailure(path)) return (availability, FileSyncError.Writeback, null);
         }
         catch (Exception error) when (error is IOException or UnauthorizedAccessException or System.ComponentModel.Win32Exception)
         { /* Inaccessible metadata is not itself a transfer failure. */ }
-        return (availability, failures.HasFailure(identity, availability, observed) ? FileSyncError.Download : FileSyncError.None);
+        return (availability, failures.HasFailure(identity, availability, observed) ? FileSyncError.Download : FileSyncError.None, null);
     }
 
-    private void SetAvailability(Border cell, SyncRootAvailability state, FileSyncError error = FileSyncError.None)
+    private void SetAvailability(Border cell, SyncRootAvailability state, FileSyncError error = FileSyncError.None,
+        UploadActivitySnapshot? upload = null)
     {
-        if (cell.Tag is ValueTuple<SyncRootAvailability, FileSyncError> previous && previous == (state, error)) return;
-        cell.Tag = (state, error);
+        if (cell.Tag is ValueTuple<SyncRootAvailability, FileSyncError, UploadActivitySnapshot?> previous
+            && previous == (state, error, upload)) return;
+        cell.Tag = (state, error, upload);
         var dark = _root.ActualTheme == ElementTheme.Dark;
+        if (upload is { } active)
+        {
+            SetUploadActivity(cell, active, dark);
+            return;
+        }
         var green = new SolidColorBrush(dark ? Microsoft.UI.Colors.LightGreen : Windows.UI.Color.FromArgb(255, 16, 124, 16));
         var description = error switch
         {
@@ -115,6 +126,47 @@ internal sealed partial class MainWindow
                     ? new SolidColorBrush(dark ? Microsoft.UI.Colors.Black : Microsoft.UI.Colors.White) : green },
             },
             _ => null,
+        };
+    }
+
+    /// <summary>
+    /// Progress ring around a stage glyph: upload arrow, then download arrow while the uploaded
+    /// copy is read back and compared, then a check mark while the local identity is bound.
+    /// The ring spans upload and verification; it spins while waiting for the server.
+    /// </summary>
+    private static void SetUploadActivity(Border cell, UploadActivitySnapshot upload, bool dark)
+    {
+        var description = upload.Describe();
+        ToolTipService.SetToolTip(cell, description);
+        AutomationProperties.SetName(cell, description);
+        if (cell.Child is not Grid { Tag: "upload" } visual
+            || visual.Children is not [ProgressRing ring, FontIcon icon])
+        {
+            var accent = dark ? Microsoft.UI.Colors.DeepSkyBlue : Windows.UI.Color.FromArgb(255, 0, 120, 212);
+            ring = new ProgressRing
+            {
+                Width = 16, Height = 16, MinWidth = 16, MinHeight = 16, Minimum = 0, Maximum = 100,
+                IsActive = true, IsHitTestVisible = false,
+                Foreground = new SolidColorBrush(accent),
+                Background = new SolidColorBrush(Windows.UI.Color.FromArgb(56, accent.R, accent.G, accent.B)),
+            };
+            icon = new FontIcon
+            {
+                FontSize = 8, Foreground = new SolidColorBrush(accent),
+                HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center,
+            };
+            visual = new Grid { Tag = "upload", Width = 16, Height = 16 };
+            visual.Children.Add(ring);
+            visual.Children.Add(icon);
+            cell.Child = visual;
+        }
+        ring.IsIndeterminate = upload.Stage is UploadStage.Preparing or UploadStage.Confirming;
+        if (!ring.IsIndeterminate) ring.Value = upload.OverallPercent;
+        icon.Glyph = upload.Stage switch
+        {
+            UploadStage.Verifying => "\uE896",
+            UploadStage.Finalizing => "\uE73E",
+            _ => "\uE898",
         };
     }
 

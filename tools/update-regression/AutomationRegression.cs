@@ -59,6 +59,14 @@ internal static class AutomationRegression
                     restored.AutomaticFileCacheCleanup && restored.AutomaticUpdateDownload
                     && restored.FileCacheCleanupHours == hours);
             }
+            check("legacy config keeps upload verification on and skips it on metered networks",
+                defaults.VerifyUploadedFiles && !defaults.VerifyUploadedFilesOnMeteredNetwork);
+            defaults.VerifyUploadedFiles = false;
+            defaults.VerifyUploadedFilesOnMeteredNetwork = true;
+            ConfigurationStore.SaveEncrypted(defaults, path);
+            var verification = ConfigurationStore.Load(configurationPath: path, decryptPassword: false, migrate: false);
+            check("configuration round-trips upload verification options",
+                !verification.VerifyUploadedFiles && verification.VerifyUploadedFilesOnMeteredNetwork);
             check("invalid cache cleanup intervals fall back to daily",
                 new[] { 0, -1, 7, 999 }.All(value => SyncRootContext.NormalizeFileCacheCleanupHours(value) == 24));
         }

@@ -77,10 +77,12 @@ public sealed partial class YuWangClient
     /// Upload a stable, seekable local snapshot. A matching pre-existing name is accepted only
     /// after downloading and hashing it, so retry after a lost final reply cannot duplicate uploads.
     /// Different content is never overwritten through the unverified same-name Web branch.
+    /// <paramref name="verifyContent"/>=false only skips the re-download after this attempt sent
+    /// every byte itself and the server acknowledged the final offset; recovery stays verified.
     /// </summary>
     public async Task<YuWangItem> UploadNewFileAsync(ulong disk, ulong folder, string name, Stream source,
         DateTime modifiedUtc, byte[] sha256, CancellationToken ct = default, Action<UploadProgress>? progress = null,
-        UploadAttempt? attempt = null, Action<UploadAttempt>? rememberAttempt = null)
+        UploadAttempt? attempt = null, Action<UploadAttempt>? rememberAttempt = null, bool verifyContent = true)
     {
         ValidateRemoteName(name);
         if (!source.CanSeek || !source.CanRead || sha256.Length != 32)
@@ -90,14 +92,14 @@ public sealed partial class YuWangClient
         try
         {
             return await UploadNewFileCoreAsync(disk, folder, name, source, modifiedUtc, sha256, linked.Token, progress,
-                attempt, rememberAttempt).ConfigureAwait(false);
+                attempt, rememberAttempt, verifyContent).ConfigureAwait(false);
         }
         finally { _folderContextGate.Release(); }
     }
 
     private async Task<YuWangItem> UploadNewFileCoreAsync(ulong disk, ulong folder, string name, Stream source,
         DateTime modifiedUtc, byte[] sha256, CancellationToken ct, Action<UploadProgress>? progress,
-        UploadAttempt? attempt, Action<UploadAttempt>? rememberAttempt)
+        UploadAttempt? attempt, Action<UploadAttempt>? rememberAttempt, bool verifyContent)
     {
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, _lifetimeToken);
         {
@@ -194,16 +196,20 @@ public sealed partial class YuWangClient
                 position += count;
                 ReportUploadProgress(progress, new(UploadStage.Uploading, source.Length, position, position, ResumedBytes: resumed));
             }
+            // A server-resumed prefix may belong to different content with the same name/size,
+            // so only a transfer that this attempt sent from offset 0 may skip the re-download.
             return await WaitForUploadedFileAsync(disk, folder, name, source.Length, sha256,
-                attempt, rememberAttempt, linked.Token, progress, resumed).ConfigureAwait(false);
+                attempt, rememberAttempt, linked.Token, progress, resumed,
+                trustAcknowledged: !verifyContent && resumed == 0).ConfigureAwait(false);
         }
     }
 
     private async Task<YuWangItem> WaitForUploadedFileAsync(ulong disk, ulong folder, string name, long length,
         byte[] sha256, UploadAttempt attempt, Action<UploadAttempt>? rememberAttempt,
-        CancellationToken ct, Action<UploadProgress>? progress, long resumed)
+        CancellationToken ct, Action<UploadProgress>? progress, long resumed, bool trustAcknowledged = false)
     {
         const int checks = 10;
+        ReportUploadProgress(progress, new(UploadStage.Confirming, length, length, length, ResumedBytes: resumed));
         var previous = attempt.BeforeIds.ToHashSet();
         // A final byte ACK precedes publication in the directory on this server. Retry only
         // fresh metadata reads here; never request a new token or re-send the final chunk.
@@ -217,7 +223,7 @@ public sealed partial class YuWangClient
             var diagnostic = string.Join("; ", added.Take(3).Select(i => $"{i.Id}:{i.Name.Replace('\r', ' ').Replace('\n', ' ')}"));
             _log($"[UPLOAD] 目录确认 poll={check + 1}/{checks} items={items.Count} newItems={added.Length} disk={disk} folder={folder} added=[{diagnostic}]");
             var result = await ResolveUploadedFileAsync(disk, folder, name, length, sha256,
-                items, attempt, rememberAttempt, ct, progress, resumed).ConfigureAwait(false);
+                items, attempt, rememberAttempt, ct, progress, resumed, trustAcknowledged).ConfigureAwait(false);
             if (result is not null) return result;
         }
         throw new IOException("上传已被服务器确认，但等待新鲜目录列表后仍未出现可确认的文件；保留上传记录，不再次发送文件。");
@@ -225,7 +231,8 @@ public sealed partial class YuWangClient
 
     private async Task<YuWangItem?> ResolveUploadedFileAsync(ulong disk, ulong folder, string name, long length,
         byte[] sha256, IReadOnlyList<YuWangItem> items, UploadAttempt attempt,
-        Action<UploadAttempt>? rememberAttempt, CancellationToken ct, Action<UploadProgress>? progress, long resumed = 0)
+        Action<UploadAttempt>? rememberAttempt, CancellationToken ct, Action<UploadProgress>? progress, long resumed = 0,
+        bool trustAcknowledged = false)
     {
         var previous = attempt.BeforeIds.ToHashSet();
         var suffixPattern = "^" + System.Text.RegularExpressions.Regex.Escape(Path.GetFileNameWithoutExtension(name))
@@ -248,7 +255,9 @@ public sealed partial class YuWangClient
         // The assigned name is not evidence of ownership/content. Require a new ID in this
         // attempt's directory delta and a full hash match before restoring the requested name.
         rememberAttempt?.Invoke(attempt with { CandidateId = candidate.Id, MayHaveCommitted = true });
-        if (!await VerifyRemoteContentAsync(candidate.Id, length, sha256, ct, progress, resumed).ConfigureAwait(false))
+        if (trustAcknowledged)
+            _log($"[UPLOAD] 按设置跳过上传后下载校验 file={candidate.Id} bytes={length} disk={disk} folder={folder}");
+        else if (!await VerifyRemoteContentAsync(candidate.Id, length, sha256, ct, progress, resumed).ConfigureAwait(false))
             throw new IOException($"上传内容未通过完整校验 file={candidate.Id}；保留本地内容，停止重复上传。");
         if (candidate.Name != name)
         {
@@ -273,7 +282,7 @@ public sealed partial class YuWangClient
     public async Task<YuWangItem> ReplaceRemoteFileAsync(ulong disk, ulong folder, ulong oldId, string name,
         string backupName, Stream source, DateTime modifiedUtc, byte[] sha256,
         Action<ulong> rememberNewId, CancellationToken ct = default, Action<UploadProgress>? progress = null,
-        UploadAttempt? attempt = null, Action<UploadAttempt>? rememberAttempt = null)
+        UploadAttempt? attempt = null, Action<UploadAttempt>? rememberAttempt = null, bool verifyContent = true)
     {
         ValidateRemoteName(name);
         ValidateRemoteName(backupName);
@@ -317,7 +326,7 @@ public sealed partial class YuWangClient
                 }
                 linked.Token.ThrowIfCancellationRequested();
                 replacement = await UploadNewFileCoreAsync(disk, folder, name, source, modifiedUtc, sha256, linked.Token, progress,
-                    attempt, rememberAttempt)
+                    attempt, rememberAttempt, verifyContent)
                     .ConfigureAwait(false);
                 // Persist the new ID before deleting the old item. A local metadata failure can
                 // then finish binding this same upload after restart instead of uploading again.

@@ -1,6 +1,10 @@
 namespace YuWangCloudSync.Net;
 
-public enum UploadStage { Preparing, Uploading, Verifying, Finalizing }
+/// <summary>
+/// Preparing → Uploading → Confirming (waiting for the directory entry) → Verifying (full
+/// download and SHA-256 comparison, unless skipped by policy) → Finalizing.
+/// </summary>
+public enum UploadStage { Preparing, Uploading, Verifying, Finalizing, Confirming }
 
 /// <summary>
 /// Sent/confirmed counters include the server's resumed prefix. Subtract ResumedBytes for

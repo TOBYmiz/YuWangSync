@@ -52,11 +52,11 @@ static async Task Fails(Func<Task> action)
 }
 static YuWangClient Client(WebServer server) => new("http://localhost", "test-user", "unused", _ => { }, httpHandler: server);
 static async Task<YuWangItem> Upload(YuWangClient client, byte[] data, string name = "新建 & 测试.pptx", Action<UploadProgress>? progress = null,
-    UploadAttempt? attempt = null, Action<UploadAttempt>? rememberAttempt = null)
+    UploadAttempt? attempt = null, Action<UploadAttempt>? rememberAttempt = null, bool verifyContent = true)
 {
     using var source = new MemoryStream(data);
     return await client.UploadNewFileAsync(7, 10, name, source, DateTime.UtcNow, SHA256.HashData(data), progress: progress,
-        attempt: attempt, rememberAttempt: rememberAttempt);
+        attempt: attempt, rememberAttempt: rememberAttempt, verifyContent: verifyContent);
 }
 static async Task<YuWangItem> Replace(YuWangClient client, byte[] data, Action<ulong>? remember = null, CancellationToken ct = default)
 {
@@ -90,6 +90,34 @@ await Test("new file: exact 10 MiB raw chunks, encoded name, verified bytes", as
     Check(sent.SequenceEqual(sent.Order()), "upload progress moved backwards");
     Check(progress.Any(p => p.Stage == UploadStage.Verifying && p.VerifiedBytes == data.Length)
         && progress[^1].Stage == UploadStage.Finalizing, "upload completed before hash verification");
+});
+await Test("verification disabled: fully acknowledged upload binds without a download", async () =>
+{
+    using var web = new WebServer();
+    using var client = Client(web);
+    var progress = new List<UploadProgress>();
+    var item = await Upload(client, newBytes, progress: progress.Add, verifyContent: false);
+    Check(web.Items[item.Id].Bytes.SequenceEqual(newBytes), "upload content changed");
+    Check(!web.Events.Contains("download:" + item.Id), "disabled verification still downloaded the upload");
+    Check(progress.Any(p => p.Stage == UploadStage.Confirming) && !progress.Any(p => p.Stage == UploadStage.Verifying)
+        && progress[^1].Stage == UploadStage.Finalizing, "disabled verification reported the wrong stages");
+});
+await Test("verification disabled: a server-resumed prefix is still fully verified", async () =>
+{
+    var stale = newBytes[..1];
+    stale[0] ^= 1;
+    using (var web = new WebServer { InitialOffset = 1, InitialBytes = stale })
+    using (var client = Client(web))
+    {
+        await Fails(() => Upload(client, newBytes, verifyContent: false));
+        Check(web.Items.Count == 1, "stale resumed prefix was accepted without verification");
+    }
+    using (var web = new WebServer { InitialOffset = newBytes.Length, InitialBytes = newBytes })
+    using (var client = Client(web))
+    {
+        var item = await Upload(client, newBytes, verifyContent: false);
+        Check(web.Events.Contains("download:" + item.Id), "completed token bypassed verification when disabled");
+    }
 });
 await Test("zero-byte new file receives a final confirmation", async () =>
 {

@@ -206,4 +206,13 @@ public sealed class SyncRootContext
     /// <summary>有更新时，是否在托盘图标显示角标。</summary>
     public bool TrayUpdateHintEnabled { get; set; } = true;
 
+    /// <summary>上传完成后完整下载云端文件并比对 SHA-256，确认内容无误后才标记为已同步。</summary>
+    public bool VerifyUploadedFiles { get; set; } = true;
+
+    /// <summary>
+    /// 使用计费网络时是否仍执行上传后下载校验（会额外消耗与文件大小相同的流量）。
+    /// 仅在 <see cref="VerifyUploadedFiles"/> 为 true 时生效。
+    /// </summary>
+    public bool VerifyUploadedFilesOnMeteredNetwork { get; set; }
+
 }

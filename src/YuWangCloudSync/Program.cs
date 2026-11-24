@@ -967,6 +967,7 @@ internal static class Program
         Callbacks.ContainerTypeId = _ctx.RootContainerTypeId;
         _ctx.FileCacheCleanupHours = SyncRootContext.NormalizeFileCacheCleanupHours(_ctx.FileCacheCleanupHours);
         _fileCacheCleanup?.Configure(_ctx.AutomaticFileCacheCleanup, _ctx.FileCacheCleanupHours);
+        UploadVerificationPolicy.Configure(_ctx.VerifyUploadedFiles, _ctx.VerifyUploadedFilesOnMeteredNetwork);
         Callbacks.UserKey = CurrentUserKey();
         foreach (var account in _ctx.Accounts ?? [])
         {
@@ -2924,7 +2925,7 @@ internal static class Program
 
     /// <summary>
     /// 把 <see cref="_ctx"/> 中支持热生效的项下发到运行时的 Callbacks 静态字段。
-    /// 覆盖：保持目录刷新周期、按需填充策略、SyncRootPath、UserKey 和容器 TypeId。
+    /// 覆盖：保持目录刷新周期、按需填充策略、SyncRootPath、UserKey、容器 TypeId 和上传校验策略。
     /// </summary>
     internal static void ApplyHotConfig()
     {
@@ -2936,6 +2937,7 @@ internal static class Program
         Callbacks.ContainerTypeId = _ctx.RootContainerTypeId;
         _ctx.FileCacheCleanupHours = SyncRootContext.NormalizeFileCacheCleanupHours(_ctx.FileCacheCleanupHours);
         _fileCacheCleanup?.Configure(_ctx.AutomaticFileCacheCleanup, _ctx.FileCacheCleanupHours);
+        UploadVerificationPolicy.Configure(_ctx.VerifyUploadedFiles, _ctx.VerifyUploadedFilesOnMeteredNetwork);
     }
 
     private static bool _navigationEntryConfigurationPending;

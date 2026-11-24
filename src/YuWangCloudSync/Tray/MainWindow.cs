@@ -2647,17 +2647,72 @@ internal sealed partial class MainWindow : Window
             throw new IOException("不支持此类型的拖放项目。");
         await using var stream = new FileStream(localFile.Path, FileMode.Open, FileAccess.Read, FileShare.Read,
             128 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan);
+        var shortName = ShortenFileName(localFile.Name);
+        SetTransferProgress($"正在计算校验值 · {shortName}", 0);
+        _transferProgress.IsIndeterminate = true;
         var hash = await SHA256.HashDataAsync(stream, Program.ApplicationCancellationToken);
         stream.Position = 0;
-        SetTransferProgress($"正在上传“{localFile.Name}”…", 0);
-        await client.UploadNewFileAsync(diskId, folderId, localFile.Name, stream,
-            File.GetLastWriteTimeUtc(localFile.Path), hash, Program.ApplicationCancellationToken,
-            progress: progress =>
+        var verify = UploadVerificationPolicy.ShouldVerify(message => Serilog.Log.Information("{Msg}", message));
+        // Progress arrives on pool threads; the UI samples the latest value on its own timer.
+        var tracker = new BrowserUploadProgress(verify);
+        var timer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(100) };
+        timer.Tick += (_, _) => ShowBrowserUploadProgress(tracker.Latest, shortName);
+        ShowBrowserUploadProgress(tracker.Latest, shortName);
+        timer.Start();
+        try
+        {
+            await client.UploadNewFileAsync(diskId, folderId, localFile.Name, stream,
+                File.GetLastWriteTimeUtc(localFile.Path), hash, Program.ApplicationCancellationToken,
+                progress: tracker.Report, verifyContent: verify);
+        }
+        finally
+        {
+            timer.Stop();
+            _transferProgress.IsIndeterminate = false;
+        }
+    }
+
+    private void ShowBrowserUploadProgress(BrowserUploadProgress.State state, string shortName)
+    {
+        if (_isClosed) return;
+        string Bytes(long done) => $"{FormatSize(done)} / {FormatSize(state.TotalBytes)}";
+        var text = state.Stage switch
+        {
+            UploadStage.Preparing => $"正在准备上传 · {shortName}",
+            UploadStage.Uploading => $"正在上传 · {shortName} · {Percent(state.SentBytes):F2}% · {Bytes(state.SentBytes)}",
+            UploadStage.Confirming => $"已上传，正在等待云端确认 · {shortName}",
+            UploadStage.Verifying => $"正在下载校验 · {shortName} · {Percent(state.VerifiedBytes):F2}% · {Bytes(state.VerifiedBytes)}",
+            _ => state.Verifies ? $"校验通过，正在完成 · {shortName}" : $"正在完成 · {shortName}",
+        };
+        SetTransferProgress(text, state.OverallPercent);
+        _transferProgress.IsIndeterminate = state.Stage is UploadStage.Preparing or UploadStage.Confirming;
+
+        double Percent(long done) => state.TotalBytes <= 0 ? 100 : Math.Clamp(done * 100.0 / state.TotalBytes, 0, 100);
+    }
+
+    /// <summary>Thread-safe latest-value holder for a main-window upload.</summary>
+    private sealed class BrowserUploadProgress(bool verifies)
+    {
+        internal readonly record struct State(UploadStage Stage, long TotalBytes, long SentBytes, long VerifiedBytes,
+            double OverallPercent, bool Verifies);
+
+        private readonly object _gate = new();
+        private State _latest = new(UploadStage.Preparing, 0, 0, 0, 0, verifies);
+
+        public State Latest { get { lock (_gate) return _latest; } }
+
+        public void Report(UploadProgress progress)
+        {
+            lock (_gate)
             {
-                var percent = progress.TotalBytes <= 0 ? 0 : (int)(progress.SentBytes * 100 / progress.TotalBytes);
-                percent = Math.Clamp(percent, 0, 100);
-                SetTransferProgress($"正在上传“{localFile.Name}”… {percent}%", percent);
-            });
+                var verifying = _latest.Verifies || progress.Stage == UploadStage.Verifying;
+                var sent = Math.Max(_latest.SentBytes, progress.SentBytes);
+                var verified = Math.Max(_latest.VerifiedBytes, progress.VerifiedBytes);
+                var overall = UploadProgressReporter.OverallFraction(progress.TotalBytes, sent, verified, verifying) * 100;
+                _latest = new(progress.Stage, progress.TotalBytes, sent, verified,
+                    Math.Max(_latest.OverallPercent, overall), verifying);
+            }
+        }
     }
 
     #endregion
