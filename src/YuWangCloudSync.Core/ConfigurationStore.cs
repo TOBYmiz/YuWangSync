@@ -210,7 +210,7 @@ public static class ConfigurationStore
         WriteAtomic(path, document.ToJsonString(Options));
     }
 
-    private static void WriteAtomic(string path, string json)
+    internal static void WriteAtomic(string path, string json)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
         var temporaryPath = path + "." + Guid.NewGuid().ToString("N") + ".tmp";

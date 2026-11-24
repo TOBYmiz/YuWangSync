@@ -205,9 +205,9 @@ internal sealed partial class MainWindow : Window
         VerticalScrollBarVisibility = ScrollBarVisibility.Disabled,
     };
     // A zero name width means fill the available space until explicitly resized.
-    private readonly double[] _fileColumnWidths = [0, 140, 110, 90];
-    private static readonly double[] MinimumFileColumnWidths = [160, 100, 90, 70];
-    private static readonly double[] MaximumFileColumnWidths = [1600, 480, 640, 400];
+    private readonly double[] _fileColumnWidths = [0, 62, 140, 110, 90];
+    private static readonly double[] MinimumFileColumnWidths = [160, 46, 100, 90, 70];
+    private static readonly double[] MaximumFileColumnWidths = [1600, 200, 480, 640, 400];
     private readonly List<Grid> _fileRows = [];
     private readonly List<SortHeader> _sortHeaders = [];
     private readonly ListView _items = new()
@@ -300,7 +300,8 @@ internal sealed partial class MainWindow : Window
     private readonly MenuFlyout _itemMenu = new();
     private readonly MenuFlyout _backgroundMenu = new();
     private readonly MenuFlyoutItem _menuOpen = NewMenuItem("\uE8E5", "打开");
-    private readonly MenuFlyoutItem _menuDownload = NewMenuItem("\uE896", "下载…");
+    private readonly MenuFlyoutItem _menuDownload = NewMenuItem("\uE896", "下载");
+    private readonly MenuFlyoutItem _menuSaveAs = NewMenuItem("\uE792", "另存为…");
     private readonly MenuFlyoutItem _menuFavorite = NewMenuItem("\uE734", "添加到收藏");
     private readonly MenuFlyoutItem _menuRename = NewMenuItem("\uE8AC", "重命名");
     private readonly MenuFlyoutItem _menuMove = NewMenuItem("\uE8DE", "移动到…");
@@ -325,7 +326,6 @@ internal sealed partial class MainWindow : Window
     private readonly Dictionary<string, Task<BitmapImage?>> _systemFileIconTasks = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, string> _systemFileTypes = new(StringComparer.OrdinalIgnoreCase);
     private string _systemFolderType = "文件夹";
-    private bool _typeSortQueued;
     private Task<BitmapImage?>? _systemFolderIconTask;
     private List<DiskTreeNode> _diskTree = [];
     private List<YuWangItem> _currentItems = [];
@@ -364,7 +364,9 @@ internal sealed partial class MainWindow : Window
         TraceUiStage("开始构造主界面");
         _config = config;
         _savedState = MainWindowStateStore.Load(config);
-        if (_savedState.ColumnWidths is { Length: 4 } widths)
+        var widths = _savedState.ColumnWidths;
+        if (widths.Length == 4) widths = [widths[0], 0, widths[1], widths[2], widths[3]]; // Pre-status-column layout.
+        if (widths.Length == _fileColumnWidths.Length)
             for (var index = 0; index < widths.Length; index++)
                 if (double.IsFinite(widths[index]) && widths[index] > 0)
                     _fileColumnWidths[index] = Math.Clamp(widths[index],
@@ -411,6 +413,9 @@ internal sealed partial class MainWindow : Window
             _statusClearTimer.Stop();
             _infoBarCloseTimer.Stop();
             _dragIntentTimer.Stop();
+            _fileSortTimer.Stop();
+            _fileStatusTimer.Stop();
+            _syncDownloadCancellation?.Cancel();
             _dragCancellation?.Cancel();
             CancelDragWarmup();
             try { SaveBrowserState(); }
@@ -617,8 +622,12 @@ internal sealed partial class MainWindow : Window
         _fileSurface.Children.Add(_columnsHeader);
 
         _items.Name = "CloudFileListView";
+        _fileSortTimer.Tick += (_, _) => ApplyPendingFileSort();
+        _fileStatusTimer.Tick += (_, _) => RefreshFileAvailability();
+        _fileStatusTimer.Start();
         _items.SelectionChanged += (_, _) =>
         {
+            if (_replacingFileRows) return;
             UpdateCommandStates();
             QueueDragPreparation();
         };
@@ -765,9 +774,17 @@ internal sealed partial class MainWindow : Window
         AddFileColumns(_columnsHeader);
         UpdateColumnsHeaderMargin();
         AddSortHeader(SortColumn.Name, "名称", 0, HorizontalAlignment.Left);
-        AddSortHeader(SortColumn.Modified, "修改时间", 1, HorizontalAlignment.Left);
-        AddSortHeader(SortColumn.Type, "类型", 2, HorizontalAlignment.Left);
-        AddSortHeader(SortColumn.Size, "大小", 3, HorizontalAlignment.Right);
+        var statusHeader = new TextBlock
+        {
+            Text = "状态", VerticalAlignment = VerticalAlignment.Center,
+            Style = WinUiUiHost.GetStyleResource("YuWangCaptionTextBlockStyle"),
+        };
+        Grid.SetColumn(statusHeader, 1);
+        _columnsHeader.Children.Add(statusHeader);
+        AddFileColumnGrip("状态", 1);
+        AddSortHeader(SortColumn.Modified, "修改时间", 2, HorizontalAlignment.Left);
+        AddSortHeader(SortColumn.Type, "类型", 3, HorizontalAlignment.Left);
+        AddSortHeader(SortColumn.Size, "大小", 4, HorizontalAlignment.Right);
         UpdateSortHeaders();
     }
 
@@ -816,10 +833,16 @@ internal sealed partial class MainWindow : Window
                 _sortAscending = column is SortColumn.Name or SortColumn.Type;
             }
             UpdateSortHeaders();
-            RenderItems();
+            QueueFileSort();
         };
         Grid.SetColumn(button, gridColumn);
         _columnsHeader.Children.Add(button);
+        AddFileColumnGrip(text, gridColumn);
+        _sortHeaders.Add(new SortHeader { Column = column, Chevron = chevron });
+    }
+
+    private void AddFileColumnGrip(string text, int gridColumn)
+    {
         var grip = new ResizeGrip(InputSystemCursorShape.SizeWestEast)
         {
             Name = $"FileColumnResizeGrip{gridColumn}",
@@ -862,7 +885,6 @@ internal sealed partial class MainWindow : Window
         grip.PointerCanceled += (_, _) => dragging = false;
         Grid.SetColumn(grip, gridColumn);
         _columnsHeader.Children.Add(grip);
-        _sortHeaders.Add(new SortHeader { Column = column, Chevron = chevron });
     }
 
     private void UpdateSortHeaders()
@@ -885,24 +907,24 @@ internal sealed partial class MainWindow : Window
 
     private void AddFileColumns(Grid grid)
     {
-        for (var index = 0; index < 4; index++)
+        for (var index = 0; index < _fileColumnWidths.Length; index++)
             grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(EffectiveFileColumnWidth(index)) });
         if (!ReferenceEquals(grid, _columnsHeader)) _fileRows.Add(grid);
     }
 
     private double FileColumnChromeWidth => ListHorizontalMargin * 2 + ItemContentLeftPadding
-        + ItemContentRightPadding + 36 + 20
+        + ItemContentRightPadding + _columnsHeader.ColumnSpacing * (_fileColumnWidths.Length - 1) + 20
         + (_items.SelectionMode == ListViewSelectionMode.Multiple ? MultiSelectContentOffset : 0);
 
     private double EffectiveFileColumnWidth(int index) => index == 0 && _fileColumnWidths[0] == 0
         ? Math.Max(MinimumFileColumnWidths[0], _fileScroller.ActualWidth - FileColumnChromeWidth
-            - _fileColumnWidths[1] - _fileColumnWidths[2] - _fileColumnWidths[3])
+            - _fileColumnWidths.Skip(1).Sum())
         : _fileColumnWidths[index];
 
     private void UpdateFileColumnWidths()
     {
-        if (_isClosed || _columnsHeader.ColumnDefinitions.Count != 4) return;
-        var widths = Enumerable.Range(0, 4).Select(EffectiveFileColumnWidth).ToArray();
+        if (_isClosed || _columnsHeader.ColumnDefinitions.Count != _fileColumnWidths.Length) return;
+        var widths = Enumerable.Range(0, _fileColumnWidths.Length).Select(EffectiveFileColumnWidth).ToArray();
         _fileSurface.Width = Math.Max(_fileScroller.ActualWidth, widths.Sum() + FileColumnChromeWidth);
         for (var index = 0; index < widths.Length; index++)
         {
@@ -977,6 +999,7 @@ internal sealed partial class MainWindow : Window
         _menuOpen.FontWeight = FontWeights.SemiBold;
         _itemMenu.Items.Add(_menuOpen);
         _itemMenu.Items.Add(_menuDownload);
+        _itemMenu.Items.Add(_menuSaveAs);
         _itemMenu.Items.Add(_menuFavorite);
         _itemMenu.Items.Add(new MenuFlyoutSeparator());
         _itemMenu.Items.Add(_menuRename);
@@ -1057,7 +1080,8 @@ internal sealed partial class MainWindow : Window
         _search.TextChanged += (_, _) => RenderItems();
 
         _menuOpen.Click += (_, _) => RunItemMenuCommand(OpenItemsAsync);
-        _menuDownload.Click += (_, _) => RunItemMenuCommand(DownloadItemsAsync);
+        _menuDownload.Click += (_, _) => RunItemMenuCommand(HydrateItemsAsync);
+        _menuSaveAs.Click += (_, _) => RunItemMenuCommand(SaveItemsAsAsync);
         _menuFavorite.Click += (_, _) => RunItemMenuCommand(target =>
         {
             if (GetFavoriteTarget(target) is { } folder) ToggleFavorite(folder);
@@ -1800,14 +1824,37 @@ internal sealed partial class MainWindow : Window
         return _sortColumn == SortColumn.Name ? sorted : sorted.ThenBy(item => item.Name, comparer);
     }
 
-    private void RenderItems()
+    private readonly DispatcherTimer _fileSortTimer = new() { Interval = TimeSpan.FromMilliseconds(100) };
+    private int _fileRenderVersion;
+    private bool _replacingFileRows;
+
+    private void QueueFileSort()
     {
         if (_isClosed) return;
+        _fileSortTimer.Stop();
+        _fileSortTimer.Start();
+    }
+
+    private void ApplyPendingFileSort()
+    {
+        if (_busyNow && !_isClosed) return;
+        _fileSortTimer.Stop();
+        if (_isClosed) return;
+        RunUi(() => { RenderItems(preserveSelection: true); return Task.CompletedTask; });
+    }
+
+    private void RenderItems(bool preserveSelection = false)
+    {
+        if (_isClosed) return;
+        _fileSortTimer.Stop();
         CancelDragWarmup();
         TraceUiStage($"开始更新文件列表：Items={_currentItems.Count}");
-        _items.Items.Clear();
+        var selected = preserveSelection ? _items.SelectedItems.OfType<ListViewItem>().Select(row => row.Tag).ToHashSet() : null;
+        _fileRenderVersion++;
         _fileRows.Clear();
+        ResetFileAvailabilityRows();
         var filter = _search.Text?.Trim() ?? "";
+        ListViewItem[] rows;
         if (_currentFolder is null && _currentNode is { } grouping)
         {
             var children = grouping.Children.Where(node => (node.Content?.ToString() ?? "")
@@ -1815,23 +1862,32 @@ internal sealed partial class MainWindow : Window
             children = _sortAscending
                 ? children.OrderBy(node => node.Content?.ToString(), StringComparer.CurrentCultureIgnoreCase)
                 : children.OrderByDescending(node => node.Content?.ToString(), StringComparer.CurrentCultureIgnoreCase);
-            foreach (var child in children) _items.Items.Add(CreateGroupingRow(child));
-            _visibleCount = _items.Items.Count;
-            UpdateEmptyState(filter);
-            UpdateCommandStates();
-            return;
+            rows = children.Select(CreateGroupingRow).ToArray();
         }
-        var visible = SortItems(_currentItems
-                .Where(item => filter.Length == 0 || item.Name.Contains(filter, StringComparison.CurrentCultureIgnoreCase)))
-            .ToList();
+        else
+        {
+            rows = SortItems(_currentItems
+                    .Where(item => filter.Length == 0 || item.Name.Contains(filter, StringComparison.CurrentCultureIgnoreCase)))
+                .Select(CreateItemRow).ToArray();
+        }
 
-        foreach (var item in visible)
-            _items.Items.Add(CreateItemRow(item));
-
-        _visibleCount = visible.Count;
+        // Publish one snapshot. Clear + one WinUI collection change per row churns the native
+        // visual tree and raises selection callbacks during a partially rebuilt file list.
+        _replacingFileRows = true;
+        try
+        {
+            _items.ItemsSource = rows;
+            if (selected is not null)
+                foreach (var row in rows.Where(row => selected.Contains(row.Tag)))
+                    if (_items.SelectionMode == ListViewSelectionMode.Multiple) _items.SelectedItems.Add(row);
+                    else { _items.SelectedItem = row; break; }
+        }
+        finally { _replacingFileRows = false; }
+        _visibleCount = rows.Length;
         UpdateEmptyState(filter);
         UpdateCommandStates();
-        TraceUiStage($"文件列表更新完成：Visible={visible.Count}");
+        QueueDragPreparation();
+        TraceUiStage($"文件列表更新完成：Visible={rows.Length}");
     }
 
     private ListViewItem CreateGroupingRow(TreeViewNode node)
@@ -1855,7 +1911,7 @@ internal sealed partial class MainWindow : Window
         };
         Grid.SetColumn((FrameworkElement)namePanel.Children[1], 1);
         row.Children.Add(namePanel);
-        AddRowCell(row, 2, _folderNodes.ContainsKey(node) ? "云端磁盘" : "磁盘分组",
+        AddRowCell(row, 3, _folderNodes.ContainsKey(node) ? "云端磁盘" : "磁盘分组",
             WinUiUiHost.GetBrushResource("TextFillColorSecondaryBrush"), TextAlignment.Left);
         var container = new ListViewItem
         {
@@ -1910,11 +1966,12 @@ internal sealed partial class MainWindow : Window
         Grid.SetColumn((FrameworkElement)namePanel.Children[1], 1);
         row.Children.Add(namePanel);
 
-        AddRowCell(row, 1, item.UploadTime?.ToLocalTime().ToString("yyyy-MM-dd HH:mm") ?? "", secondary, TextAlignment.Left);
-        var typeCell = AddRowCell(row, 2, GetTypeLabel(item), secondary, TextAlignment.Left);
+        AddAvailabilityCell(row, item);
+        AddRowCell(row, 2, item.UploadTime?.ToLocalTime().ToString("yyyy-MM-dd HH:mm") ?? "", secondary, TextAlignment.Left);
+        var typeCell = AddRowCell(row, 3, GetTypeLabel(item), secondary, TextAlignment.Left);
         _ = LoadSystemIconIntoAsync(iconHost,
-            item.IsFolder ? GetSystemFolderIconAsync() : GetSystemFileIconAsync(item.Name), 20, item, typeCell);
-        AddRowCell(row, 3, item.IsFolder ? "" : FormatSize(item.Size), secondary, TextAlignment.Right);
+            item.IsFolder ? GetSystemFolderIconAsync() : GetSystemFileIconAsync(item.Name), 20, item, typeCell, _fileRenderVersion);
+        AddRowCell(row, 4, item.IsFolder ? "" : FormatSize(item.Size), secondary, TextAlignment.Right);
 
         var listItem = new ListViewItem
         {
@@ -1983,10 +2040,10 @@ internal sealed partial class MainWindow : Window
     }
 
     private async Task LoadSystemIconIntoAsync(Border iconHost, Task<BitmapImage?> iconTask, double size,
-        YuWangItem item, TextBlock typeCell)
+        YuWangItem item, TextBlock typeCell, int renderVersion)
     {
         var icon = await iconTask;
-        if (_isClosed) return;
+        if (_isClosed || renderVersion != _fileRenderVersion) return;
         typeCell.Text = GetTypeLabel(item);
         ToolTipService.SetToolTip(typeCell, typeCell.Text);
         if (icon is null) return;
@@ -2017,12 +2074,7 @@ internal sealed partial class MainWindow : Window
 
     private void QueueSystemTypeSort()
     {
-        if (_typeSortQueued || _sortColumn != SortColumn.Type || _isClosed) return;
-        _typeSortQueued = DispatcherQueue.TryEnqueue(() =>
-        {
-            _typeSortQueued = false;
-            if (!_isClosed && _sortColumn == SortColumn.Type) RenderItems();
-        });
+        if (_sortColumn == SortColumn.Type) QueueFileSort();
     }
 
     private Task<BitmapImage?> GetSystemFolderIconAsync()
@@ -2122,7 +2174,7 @@ internal sealed partial class MainWindow : Window
         _newFolder.IsEnabled = canWrite;
         _open.IsEnabled = idle && (selected.Count == 1
             || (_items.SelectedItem as ListViewItem)?.Tag is TreeViewNode);
-        _download.IsEnabled = idle && selected.Count > 0;
+        _download.IsEnabled = idle && selected.Count > 0 && Program.IsDragBackendAvailable;
         _rename.IsEnabled = canWrite && selected.Count == 1;
         _move.IsEnabled = canWrite && selected.Count > 0;
         _delete.IsEnabled = canWrite && selected.Count > 0;
@@ -2216,7 +2268,8 @@ internal sealed partial class MainWindow : Window
         var canWrite = CanWriteItems(_itemMenuTarget);
         var count = _itemMenuTarget?.Items.Count ?? 0;
         _menuOpen.IsEnabled = available && count == 1;
-        _menuDownload.IsEnabled = available;
+        _menuDownload.IsEnabled = available && Program.IsDragBackendAvailable;
+        _menuSaveAs.IsEnabled = available;
         var favoriteTarget = available ? GetFavoriteTarget(_itemMenuTarget) : null;
         _menuFavorite.Visibility = favoriteTarget is null ? Visibility.Collapsed : Visibility.Visible;
         _menuFavorite.IsEnabled = favoriteTarget is not null;
@@ -2760,33 +2813,23 @@ internal sealed partial class MainWindow : Window
 
     #region Download
 
-    // Opening and dragging resolve the same file. Hydration belongs to the caller:
-    // opening lets the application read on demand; virtual dragging prepares content when its stream is read.
+    // Opening uses the actual placeholder when present; the associated app hydrates on demand.
     private async Task<string> PrepareLocalItemPathAsync(RemoteFolder folder, YuWangItem item,
-        string fallbackDirectory, CancellationToken token, bool reportProgress = true,
-        Action<string, long, long>? preparationProgress = null)
+        string fallbackDirectory, CancellationToken token)
     {
         token.ThrowIfCancellationRequested();
         _downloadedPaths.TryGetValue((folder.Disk.Id, item.Id), out var downloaded);
-        var path = await Task.Run(() =>
-        {
-            var local = Program.ResolveLocalItemPath(folder.Disk.Id, folder.Id, item);
-            var hasDownload = downloaded is not null
-                && (item.IsFolder ? Directory.Exists(downloaded) : File.Exists(downloaded));
-            // Reuse a completed download rather than hydrating the same remote data again.
-            // A complete sync-root file still wins so opening/dragging preserves local edits.
-            if (hasDownload && (local is null || (!item.IsFolder
-                    && ((uint)File.GetAttributes(local) & 0x00441000) != 0))) return downloaded;
-            return local;
-        }, token);
-        token.ThrowIfCancellationRequested();
+        var path = await Task.Run(() => Program.ResolveLocalItemPath(folder.Disk.Id, folder.Id, item)
+            ?? (downloaded is not null && File.Exists(downloaded) ? downloaded : null), token);
         if (path is not null) return path;
-        return await DownloadEntryAsync(folder.Disk.Id, item, fallbackDirectory, token, reportProgress, preparationProgress);
+        path = await DownloadEntryAsync(folder.Disk.Id, item, fallbackDirectory, token);
+        _downloadedPaths[(folder.Disk.Id, item.Id)] = path;
+        return path;
     }
 
-    private Task DownloadSelectionAsync() => DownloadItemsAsync(GetSelectionTarget());
+    private Task DownloadSelectionAsync() => HydrateItemsAsync(GetSelectionTarget());
 
-    private async Task DownloadItemsAsync(ItemActionTarget? target)
+    private async Task SaveItemsAsAsync(ItemActionTarget? target)
     {
         if (target is null || !IsItemTargetAvailable(target)) return;
         var selected = target.Items;
@@ -2795,40 +2838,35 @@ internal sealed partial class MainWindow : Window
         var userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
         var downloadsFolder = Path.Combine(userProfile, "Downloads");
         if (!Directory.Exists(downloadsFolder)) downloadsFolder = userProfile;
-        var destination = await FolderPicker.PickAsync(owner, "选择下载位置", downloadsFolder);
+        var destination = await FolderPicker.PickAsync(owner, "选择另存为位置", downloadsFolder);
         if (string.IsNullOrWhiteSpace(destination) || !IsItemTargetAvailable(target)) return;
-        await RunBusyAsync($"正在下载 {selected.Count} 项…", async () =>
+        await RunBusyAsync($"正在另存 {selected.Count} 项…", async () =>
         {
             foreach (var item in selected)
                 await DownloadEntryAsync(parent.Disk.Id, item, destination);
             SetStatus("");
-            ShowInfo(InfoBarSeverity.Success, "下载完成", $"已下载 {selected.Count} 项到“{destination}”。",
+            ShowInfo(InfoBarSeverity.Success, "另存为完成", $"已保存 {selected.Count} 项到“{destination}”。",
                 "打开文件夹", () => Process.Start(new ProcessStartInfo(destination) { UseShellExecute = true }));
-        }, "下载失败");
+        }, "另存为失败");
     }
 
     private async Task<string> DownloadEntryAsync(ulong diskId, YuWangItem item, string destination,
-        CancellationToken cancellationToken = default, bool reportProgress = true,
-        Action<string, long, long>? preparationProgress = null)
+        CancellationToken cancellationToken = default)
     {
         if (!cancellationToken.CanBeCanceled) cancellationToken = Program.ApplicationCancellationToken;
         cancellationToken.ThrowIfCancellationRequested();
         if (!item.IsFolder)
-            return await DownloadFileAsync(diskId, item, destination, cancellationToken, reportProgress, preparationProgress);
+            return await DownloadFileAsync(item, destination, cancellationToken);
         var folderPath = GetAvailablePath(destination, SafeFileName(item.Name), directory: true);
         Directory.CreateDirectory(folderPath);
         var children = await Client!.ListFolderAsync(diskId, item.Id).WaitAsync(cancellationToken);
         foreach (var child in children)
-            await DownloadEntryAsync(diskId, child, folderPath, cancellationToken, reportProgress, preparationProgress);
-        // A partially downloaded directory must never be advertised as ready for the next drag.
+            await DownloadEntryAsync(diskId, child, folderPath, cancellationToken);
         cancellationToken.ThrowIfCancellationRequested();
-        _downloadedPaths[(diskId, item.Id)] = folderPath;
         return folderPath;
     }
 
-    private async Task<string> DownloadFileAsync(ulong diskId, YuWangItem item, string destination,
-        CancellationToken cancellationToken = default, bool reportProgress = true,
-        Action<string, long, long>? preparationProgress = null)
+    private async Task<string> DownloadFileAsync(YuWangItem item, string destination, CancellationToken cancellationToken)
     {
         if (!cancellationToken.CanBeCanceled) cancellationToken = Program.ApplicationCancellationToken;
         var client = Client ?? throw new InvalidOperationException("尚未连接到云端。");
@@ -2846,8 +2884,7 @@ internal sealed partial class MainWindow : Window
             var completed = Interlocked.Read(ref receivedBytes);
             if (completed == lastReportedBytes) return;
             lastReportedBytes = completed;
-            preparationProgress?.Invoke(item.Name, completed, probe.Size);
-            if (reportProgress) SetTransferProgress($"正在下载“{item.Name}”… {FormatSize(completed)} / {FormatSize(probe.Size)}",
+            SetTransferProgress($"正在下载“{item.Name}”… {FormatSize(completed)} / {FormatSize(probe.Size)}",
                 probe.Size <= 0 ? 100 : completed * 100d / probe.Size);
         }
         // HTTP callbacks run off the UI thread. Sample their latest byte count rather than
@@ -2886,7 +2923,6 @@ internal sealed partial class MainWindow : Window
             output.Close();
             File.Move(temporaryPath, finalPath);
             if (item.UploadTime is { } modified) File.SetLastWriteTimeUtc(finalPath, modified.ToUniversalTime());
-            _downloadedPaths[(diskId, item.Id)] = finalPath;
             return finalPath;
         }
         catch

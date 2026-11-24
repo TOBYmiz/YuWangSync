@@ -247,7 +247,7 @@ internal static class WinUiUiHost
         {
             if (ReferenceEquals(_mainWindow, window)) _mainWindow = null;
         };
-        window.Activate();
+        ActivateWindow(window);
     }
 
     internal static void ShowAbout()
@@ -274,12 +274,8 @@ internal static class WinUiUiHost
                             if (ReferenceEquals(_cacheCleanupConfirmation, window))
                                 _cacheCleanupConfirmation = null;
                         };
-                        window.Activate();
                     }
-                    else
-                    {
-                        ActivateWindow(window);
-                    }
+                    ActivateWindow(window);
                     queued.TrySetResult(window);
                 }
                 catch (Exception error)
@@ -312,7 +308,7 @@ internal static class WinUiUiHost
         {
             if (ReferenceEquals(_about, window)) _about = null;
         };
-        window.Activate();
+        ActivateWindow(window);
         window.OnEnteredAbout();
     }
 
@@ -320,7 +316,7 @@ internal static class WinUiUiHost
     {
         if (_settings is not null)
         {
-            ActivateWindow(_settings);
+            if (activate) ActivateWindow((Window?)_accountManager ?? _settings);
             return _settings;
         }
 
@@ -335,7 +331,7 @@ internal static class WinUiUiHost
         {
             if (ReferenceEquals(_settings, window)) _settings = null;
         };
-        if (activate) window.Activate();
+        if (activate) ActivateWindow(window);
         return window;
     }
 
@@ -854,7 +850,7 @@ internal static class WinUiUiHost
         try
         {
             var handle = WindowNative.GetWindowHandle(window);
-            _ = ShowWindow(handle, 9); // SW_RESTORE
+            if (IsIconic(handle)) _ = ShowWindow(handle, 9); // SW_RESTORE only when minimized
             window.Activate();
             _ = SetForegroundWindow(handle);
         }
@@ -1009,6 +1005,8 @@ internal static class WinUiUiHost
     private static extern bool EnableWindow(IntPtr window, [MarshalAs(UnmanagedType.Bool)] bool enable);
     [DllImport("user32.dll")]
     private static extern bool SetForegroundWindow(IntPtr window);
+    [DllImport("user32.dll")]
+    private static extern bool IsIconic(IntPtr window);
     [DllImport("user32.dll")]
     private static extern bool ShowWindow(IntPtr window, int command);
 

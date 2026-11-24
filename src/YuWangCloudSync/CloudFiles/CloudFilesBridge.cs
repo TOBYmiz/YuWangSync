@@ -768,7 +768,22 @@ public static class Callbacks
     public static Net.YuWangClient? Client;
     public static Storage.SqliteCache? Cache;
     public static Action<string>? Log;
-    public static string SyncRootPath = Environment.CurrentDirectory;
+    private sealed record SyncRootStatusScope(string Path, SyncRootDownloadFailures Failures);
+    private static SyncRootStatusScope _statusScope = new(Environment.CurrentDirectory, new());
+
+    public static string SyncRootPath
+    {
+        get => Volatile.Read(ref _statusScope).Path;
+        set
+        {
+            if (!string.Equals(SyncRootPath, value, StringComparison.OrdinalIgnoreCase))
+                Volatile.Write(ref _statusScope, new(value, new()));
+        }
+    }
+
+    internal static SyncRootDownloadFailures DownloadFailures => Volatile.Read(ref _statusScope).Failures;
+
+    internal static bool HasWritebackFailure(string path) => Volatile.Read(ref _writeback)?.HasCurrentFailure(path) == true;
     public static volatile bool SuppressDeleteRecovery;
 
     /// <summary>磁盘树入口映射值（来自 SyncRootContext.RootContainerTypeId）</summary>
@@ -1247,11 +1262,13 @@ public static class Callbacks
         }
         var offset = fetch.RequiredFileOffset;
         IntPtr buffer = IntPtr.Zero;
+        var failures = DownloadFailures;
+        FileIdentity identity = default;
         HydrationActivity? activity = null;
         (long FileId, long Offset)? inFlightKey = null;
         try
         {
-            var identity = ReadIdentity(info);
+            identity = ReadIdentity(info);
             if (identity.Type != 1) throw new InvalidDataException("FETCH_DATA 收到的身份不是文件");
             var pinState = "unknown";
             try
@@ -1403,7 +1420,7 @@ public static class Callbacks
         {
             // 输出完整堆栈：只打 Message 无法定位（本次就是靠堆栈才找到 SQLite 并发）
             Log?.Invoke($"FETCH_DATA 失败: {ex}");
-            Execute(info, CF_OPERATION_TYPE.CF_OPERATION_TYPE_TRANSFER_DATA,
+            var failure = Execute(info, CF_OPERATION_TYPE.CF_OPERATION_TYPE_TRANSFER_DATA,
                 new CF_OPERATION_PARAMETERS.TRANSFERDATA
                 {
                     CompletionStatus = NTStatus.STATUS_UNSUCCESSFUL,
@@ -1411,6 +1428,8 @@ public static class Callbacks
                     Offset = offset,
                     Length = fetch.RequiredLength
                 });
+            // A rejected completion can mean the request was already cancelled by the receiver.
+            if (!failure.Failed && ex is not OperationCanceledException) failures.Record(identity);
         }
         finally
         {

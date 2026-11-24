@@ -1,7 +1,6 @@
 using System.Text.Json.Serialization;
 using YuWangCloudSync.CloudFiles;
 using YuWangCloudSync.Models;
-using YuWangCloudSync.Net;
 using YuWangCloudSync.Tray;
 using YuWangCloudSync.Updates;
 
@@ -14,7 +13,6 @@ namespace YuWangCloudSync;
 [JsonSerializable(typeof(SyncRootContext))]
 [JsonSerializable(typeof(PersistedUpdateState))]
 [JsonSerializable(typeof(FileCacheCleanupRecord))]
-[JsonSerializable(typeof(SessionCookie[]))]
 [JsonSerializable(typeof(UiSelfTestCheck[]))]
 [JsonSerializable(typeof(UiSelfTestReport))]
 [JsonSerializable(typeof(UiSelfTestErrorReport))]

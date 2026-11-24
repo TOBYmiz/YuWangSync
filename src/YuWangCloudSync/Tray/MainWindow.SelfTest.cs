@@ -99,6 +99,70 @@ internal sealed partial class MainWindow
             var draggedItem = new YuWangItem { Id = 31, Name = "实际拖拽.txt", Type = 'F' };
             browser._currentItems = [oldItem, draggedItem];
             browser.RenderItems();
+            await Task.Delay(200); // Let initial shell type metadata arrive before the sort stress.
+            var beforeSort = browser._fileRenderVersion;
+            browser._items.SelectedIndex = 0;
+            var selectedBeforeSort = (browser._items.SelectedItem as ListViewItem)?.Tag;
+            for (var i = 0; i < 40; ++i)
+            {
+                browser._sortColumn = (SortColumn)(i % 4);
+                browser._sortAscending = i % 2 == 0;
+                browser.UpdateSortHeaders();
+                browser.QueueFileSort();
+            }
+            await Task.Delay(350);
+            Check("Rapid file sorts publish one snapshot", browser._fileRenderVersion == beforeSort + 1
+                && browser._items.Items.Count == 2 && selectedBeforeSort is not null
+                && ReferenceEquals(selectedBeforeSort, (browser._items.SelectedItem as ListViewItem)?.Tag),
+                "Forty rapid sort requests are coalesced and selection survives the reordered list.");
+            Check("SyncRoot file availability column and menu commands", browser._columnsHeader.ColumnDefinitions.Count == 5
+                && browser._columnsHeader.Children.OfType<Microsoft.UI.Xaml.Controls.TextBlock>().Any(cell => cell.Text == "状态")
+                && browser._menuDownload.Text == "下载" && browser._menuSaveAs.Text == "另存为…",
+                "Availability is next to the filename; hydration and export are separate commands.");
+            var errors = new SyncRootDownloadFailures();
+            var file = new FileIdentity(10, 20, oldItem.Id, 1);
+            var beforeFailure = errors.Observe(file);
+            errors.Record(file);
+            var downloadStatus = ReadFileSyncStatus(10, 20, oldItem, errors);
+            var independentStatus = ReadFileSyncStatus(10, 21, oldItem, errors);
+            var cell = new Border();
+            browser.SetAvailability(cell, downloadStatus.Availability, downloadStatus.Error);
+            var downloadIcon = cell.Child is Border { Child: FontIcon { Glyph: "\uE711" } }
+                && ToolTipService.GetToolTip(cell) is string downloadHint && downloadHint.Contains("下载失败");
+            browser.SetAvailability(cell, SyncRootAvailability.Local, FileSyncError.Writeback);
+            var writebackIcon = cell.Child is Border { Child: FontIcon { Glyph: "\uE711" } }
+                && ToolTipService.GetToolTip(cell) is string uploadHint && uploadHint.Contains("同步错误");
+            browser.SetAvailability(cell, SyncRootAvailability.Local);
+            Check("SyncRoot error state is distinct from availability", downloadIcon && writebackIcon
+                && independentStatus.Error == FileSyncError.None && cell.Child is Border { Child: FontIcon { Glyph: "\uE73E" } },
+                "Only the failing file shows a red X; tooltips distinguish download and writeback failures.");
+            Check("SyncRoot download error clears only on verified recovery",
+                errors.HasFailure(file, SyncRootAvailability.Local, beforeFailure)
+                && errors.HasFailure(file, SyncRootAvailability.OnlineOnly, errors.Observe(file))
+                && !errors.HasFailure(file, SyncRootAvailability.Pinned, errors.Observe(file)) && errors.Observe(file) == 0,
+                "A stale scan or partial download cannot clear an error; a verified complete file can.");
+            browser._currentItems = Enumerable.Range(1, 15).Select(i => new YuWangItem
+            {
+                Id = (ulong)(100 + i), Name = $"排序测试 {16 - i}.pptx", Type = 'F', Size = i * 1024L,
+                UploadTime = new DateTime(2020, 1, i),
+            }).ToList();
+            browser.RenderItems();
+            var completedSorts = 0;
+            for (var i = 0; i < 8; ++i)
+            {
+                var before = browser._fileRenderVersion;
+                browser._sortColumn = (SortColumn)(i % 4);
+                browser._sortAscending = i >= 4;
+                browser.UpdateSortHeaders();
+                browser.QueueFileSort();
+                for (var attempt = 0; attempt < 20 && browser._fileRenderVersion == before; attempt++)
+                    await Task.Delay(25);
+                if (browser._fileRenderVersion > before && browser._items.Items.Count == 15) completedSorts++;
+            }
+            Check("Repeated file sort renders complete", completedSorts == 8,
+                "Eight separate WinUI reorder passes complete for a fifteen-item folder.");
+            browser._currentItems = [oldItem, draggedItem];
+            browser.RenderItems();
             var oldRow = browser._items.Items.OfType<ListViewItem>().Single(row => ReferenceEquals(row.Tag, oldItem));
             var draggedRow = browser._items.Items.OfType<ListViewItem>().Single(row => ReferenceEquals(row.Tag, draggedItem));
             browser._items.SelectedItem = oldRow;
@@ -122,7 +186,8 @@ internal sealed partial class MainWindow
 
             var originalBackend = browser._dragBackendAvailable;
             browser._dragBackendAvailable = static () => true;
-            browser._downloadedPaths[(browser._currentFolder!.Disk.Id, draggedItem.Id)] = path;
+            browser._dragFixturePaths = [];
+            browser._dragFixturePaths[(browser._currentFolder!.Disk.Id, draggedItem.Id)] = path;
             var manifest = await browser.BuildDragManifestAsync(browser._currentFolder, [draggedItem], CancellationToken.None);
             browser._dragBackendAvailable = originalBackend;
             Check("Drag metadata preparation does not hydrate", manifest.Entries.Count == 1

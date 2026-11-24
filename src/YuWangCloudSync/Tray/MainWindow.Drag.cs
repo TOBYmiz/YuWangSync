@@ -1,5 +1,6 @@
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
+using Microsoft.UI.Xaml.Media;
 using Microsoft.UI.Xaml.Media.Imaging;
 using Microsoft.UI.Input;
 using Windows.Security.Cryptography;
@@ -134,24 +135,28 @@ internal sealed partial class MainWindow
             TaskContinuationOptions.OnlyOnFaulted, TaskScheduler.Default);
     }
 
+    // Used only by the isolated UI/receiver tests, which have no live sync root.
+    private Dictionary<(ulong Disk, ulong Item), string>? _dragFixturePaths;
+
     private async Task<DragManifest> BuildDragManifestAsync(RemoteFolder folder, YuWangItem[] items, CancellationToken token)
     {
         var manifest = new DragManifest();
         var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var client = Client;
+        var ancestors = new HashSet<ulong> { folder.Id };
         foreach (var item in items)
         {
             token.ThrowIfCancellationRequested(); EnsureDragBackendAvailable();
-            _downloadedPaths.TryGetValue((folder.Disk.Id, item.Id), out var downloaded);
-            var local = await Task.Run(() =>
-            {
-                var path = Program.ResolveLocalItemPath(folder.Disk.Id, folder.Id, item);
-                var hasDownload = downloaded is not null && (item.IsFolder ? Directory.Exists(downloaded) : File.Exists(downloaded));
-                if (hasDownload && (path is null || (!item.IsFolder && ((uint)File.GetAttributes(path) & 0x00441000) != 0))) return downloaded;
-                return path;
-            }, token);
             var name = UniqueDragName(item.Name, names);
-            if (local is not null) await AddLocalDragEntriesAsync(manifest, local, name, token);
-            else await AddRemoteDragEntriesAsync(manifest, folder.Disk.Id, item, name, token);
+            if (_dragFixturePaths?.TryGetValue((folder.Disk.Id, item.Id), out var fixture) == true)
+                await AddDragFileAsync(manifest, item, name, fixture, async (report, cancellation) =>
+                {
+                    var lease = await DragFilePreparation.CreateAsync([fixture], _dragBackendAvailable, _ => { }, cancellation, report);
+                    return new(fixture, lease);
+                }, token);
+            else
+                await AddSyncRootDragEntriesAsync(manifest, client ?? throw new IOException("尚未连接到云端。"),
+                    folder.Disk.Id, folder.Id, item, name, ancestors, token);
         }
         if (manifest.Entries.Count == 0) throw new IOException("没有可拖放的文件。");
         return manifest;
@@ -164,76 +169,44 @@ internal sealed partial class MainWindow
         return result;
     }
 
-    private async Task AddLocalDragEntriesAsync(DragManifest manifest, string path, string name, CancellationToken token)
+    private async Task AddSyncRootDragEntriesAsync(DragManifest manifest, YuWangClient client, ulong disk,
+        ulong parent, YuWangItem item, string name, HashSet<ulong> ancestors, CancellationToken token)
     {
-        var metadata = await Task.Run(() =>
-        {
-            var attributes = File.GetAttributes(path);
-            var directory = (attributes & FileAttributes.Directory) != 0;
-            if (directory && (attributes & FileAttributes.ReparsePoint) != 0 && !ProviderIdentity.OwnsPlaceholder(path))
-                throw new IOException($"无法拖放指向其他位置的目录：{path}");
-            var readiness = directory ? (Size: 0L, ReadyBytes: (long?)null, IsReady: false) : DragFilePreparation.ReadMetadata(path);
-            return (Directory: directory, Size: directory ? (long?)null : readiness.Size,
-                ReadyBytes: readiness.ReadyBytes, IsReady: readiness.IsReady, Modified: File.GetLastWriteTimeUtc(path));
-        }, token);
-        if (name.Length >= 260) throw new IOException("文件路径过长（超过 259 个字符）。");
-        if (metadata.Directory)
-        {
-            manifest.Entries.Add(new(name, true, null, metadata.Modified));
-            var children = await Task.Run(() => Directory.GetFileSystemEntries(path), token);
-            foreach (var child in children) await AddLocalDragEntriesAsync(manifest, child, Path.Combine(name, Path.GetFileName(child)), token);
-        }
-        else
-        {
-            var report = manifest.AddFile(name, metadata.Size, metadata.ReadyBytes, metadata.IsReady);
-            manifest.Entries.Add(new(name, false, metadata.Size, metadata.Modified, async cancellation =>
-            {
-                EnsureDragBackendAvailable();
-                var lease = await DragFilePreparation.CreateAsync([path], _dragBackendAvailable, _ => { }, cancellation, report);
-                return new(path, lease);
-            }));
-        }
-    }
-
-    private async Task AddRemoteDragEntriesAsync(DragManifest manifest, ulong disk, YuWangItem item, string name, CancellationToken token)
-    {
-        token.ThrowIfCancellationRequested();
+        token.ThrowIfCancellationRequested(); EnsureDragBackendAvailable();
         if (name.Length >= 260) throw new IOException("文件路径过长（超过 259 个字符）。");
         if (item.IsFolder)
         {
-            manifest.Entries.Add(new(name, true, null, item.UploadTime));
-            var children = await Client!.ListFolderAsync(disk, item.Id).WaitAsync(token);
-            var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            foreach (var child in children)
-                await AddRemoteDragEntriesAsync(manifest, disk, child, Path.Combine(name, UniqueDragName(child.Name, names)), token);
-        }
-        else
-        {
-            // The HTML listing rounds sizes. Omit FD_FILESIZE until a precise probe is available;
-            // the eventual IStream::Stat reports the real downloaded size.
-            var report = manifest.AddFile(name, null);
-            manifest.Entries.Add(new(name, false, null, item.UploadTime, async cancellation =>
+            if (!ancestors.Add(item.Id)) throw new IOException("云端目录层级成环。");
+            try
             {
-                EnsureDragBackendAvailable();
-                var staging = Path.Combine(Path.GetTempPath(), ProductIdentity.Identifier, "dragged-files", Guid.NewGuid().ToString("N"));
-                var path = await OnDragUiAsync(() => DownloadFileAsync(disk, item, staging, cancellation, reportProgress: false,
-                    preparationProgress: (_, done, total) => report(new("正在下载文件", name, done, total))), cancellation);
-                var lease = await DragFilePreparation.CreateAsync([path], _dragBackendAvailable, _ => { }, cancellation, report);
-                return new(path, lease);
-            }));
+                manifest.Entries.Add(new(name, true, null, item.UploadTime));
+                var children = await ListSyncRootFolderChildrenAsync(client, disk, parent, item, token);
+                var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                foreach (var child in children)
+                    await AddSyncRootDragEntriesAsync(manifest, client, disk, item.Id, child,
+                        Path.Combine(name, UniqueDragName(child.Name, names)), ancestors, token);
+            }
+            finally { ancestors.Remove(item.Id); }
+            return;
         }
+        var local = await Task.Run(() => Program.ResolveLocalItemPath(disk, parent, item), token);
+        await AddDragFileAsync(manifest, item, name, local,
+            (report, cancellation) => HydrateSyncRootFileAsync(client, disk, parent, item, report, cancellation), token);
     }
 
-    private Task<T> OnDragUiAsync<T>(Func<Task<T>> action, CancellationToken token)
+    private async Task AddDragFileAsync(DragManifest manifest, YuWangItem item, string name, string? local,
+        Func<Action<DragPreparationProgress>, CancellationToken, Task<VirtualFileContent>> prepareContent, CancellationToken token)
     {
-        var completion = new TaskCompletionSource<T>(TaskCreationOptions.RunContinuationsAsynchronously);
-        if (!DispatcherQueue.TryEnqueue(async () =>
+        var metadata = local is null ? default : await Task.Run(() => DragFilePreparation.ReadMetadata(local), token);
+        // An online placeholder may still hold a padded, provisional length. Omit FD_FILESIZE
+        // until the stream is prepared, instead of promising a rounded length to the receiver.
+        long? size = metadata.IsReady ? metadata.Size : null;
+        var report = manifest.AddFile(name, size, metadata.ReadyBytes, metadata.IsReady);
+        manifest.Entries.Add(new(name, false, size, item.UploadTime, async cancellation =>
         {
-            try { token.ThrowIfCancellationRequested(); completion.TrySetResult(await action()); }
-            catch (OperationCanceledException) { completion.TrySetCanceled(token); }
-            catch (Exception error) { completion.TrySetException(error); }
-        })) completion.TrySetException(new IOException("主界面已关闭，无法继续准备文件。"));
-        return completion.Task.WaitAsync(token);
+            EnsureDragBackendAvailable();
+            return await prepareContent(report, cancellation);
+        }));
     }
 
     private void CancelDragWarmup()
@@ -268,11 +241,30 @@ internal sealed partial class MainWindow
     {
         try
         {
+            row.UpdateLayout();
             var bitmap = new RenderTargetBitmap();
             await bitmap.RenderAsync(row);
             var buffer = await bitmap.GetPixelsAsync(); CryptographicBuffer.CopyToByteArray(buffer, out var pixels);
-            // Keep the selected row's complete visual. Only apply the normal drag translucency.
-            for (var i = 0; i < pixels.Length; i++) pixels[i] = (byte)(pixels[i] * 0.85);
+            // Rendering the row alone omits the file pane behind its translucent selection
+            // fill. Composite that themed surface beneath the premultiplied BGRA pixels
+            // before applying drag opacity, so the background follows the item too.
+            var background = Project<SolidColorBrush>(WinUiUiHost.GetBrushResource("SolidBackgroundFillColorBaseBrush"))?.Color
+                ?? (_root.ActualTheme == ElementTheme.Dark ? Microsoft.UI.Colors.Black : Microsoft.UI.Colors.White);
+            if (Project<SolidColorBrush>(WinUiUiHost.GetBrushResource("LayerFillColorDefaultBrush")) is { } layer)
+            {
+                var alpha = layer.Color.A / 255d * layer.Opacity;
+                background.R = (byte)Math.Round(layer.Color.R * alpha + background.R * (1 - alpha));
+                background.G = (byte)Math.Round(layer.Color.G * alpha + background.G * (1 - alpha));
+                background.B = (byte)Math.Round(layer.Color.B * alpha + background.B * (1 - alpha));
+            }
+            for (var i = 0; i < pixels.Length; i += 4)
+            {
+                var uncovered = 1 - pixels[i + 3] / 255d;
+                pixels[i] = (byte)((pixels[i] + background.B * uncovered) * 0.85);
+                pixels[i + 1] = (byte)((pixels[i + 1] + background.G * uncovered) * 0.85);
+                pixels[i + 2] = (byte)((pixels[i + 2] + background.R * uncovered) * 0.85);
+                pixels[i + 3] = (byte)(255 * 0.85);
+            }
             var point = _dragPointer?.Position;
             var origin = row.TransformToVisual(_items).TransformPoint(new Windows.Foundation.Point());
             var scale = _root.XamlRoot?.RasterizationScale ?? 1;

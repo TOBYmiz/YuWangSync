@@ -90,7 +90,8 @@ internal sealed partial class MainWindow
             PointerTestSetForegroundWindow(window);
             await Task.Delay(200);
             _root.UpdateLayout();
-            _downloadedPaths[(_currentFolder!.Disk.Id, ((Net.YuWangItem)source.Tag).Id)] = path;
+            _dragFixturePaths = [];
+            _dragFixturePaths[(_currentFolder!.Disk.Id, ((Net.YuWangItem)source.Tag).Id)] = path;
             // Every visible fixture is a complete local file. Manual tests must not
             // accidentally exercise the fake account's unavailable network client.
             foreach (var row in _items.Items.OfType<ListViewItem>())
@@ -98,7 +99,7 @@ internal sealed partial class MainWindow
                 {
                     var otherPath = Path.Combine(testRoot, item.Name);
                     await File.WriteAllTextAsync(otherPath, "browser secondary drag fixture");
-                    _downloadedPaths[(_currentFolder.Disk.Id, item.Id)] = otherPath;
+                    _dragFixturePaths[(_currentFolder.Disk.Id, item.Id)] = otherPath;
                 }
             _dragBackendAvailable = static () => true;
             _items.SelectedItem = source;

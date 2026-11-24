@@ -21,6 +21,7 @@ internal static class TrayHost
     private static bool _started;
     private static TrayIcon? _tray;
     private static PopupMenu? _trayContextMenu;
+    private static Action? _afterTrayMenu;
     private static PopupMenuItem? _mainWindowMenuItem;
     private static PopupMenuItem? _aboutMenuItem;
     private static PopupMenuItem? _refreshFilesMenuItem;
@@ -261,20 +262,20 @@ internal static class TrayHost
     private static void BuildTrayIcon()
     {
         var menu = new PopupMenu();
-        _mainWindowMenuItem = new PopupMenuItem("打开主界面", (_, _) => OpenMainWindow())
+        _mainWindowMenuItem = new PopupMenuItem("打开主界面", (_, _) => AfterTrayMenu(OpenMainWindow))
         {
             Enabled = Volatile.Read(ref _mainWindowEnabled),
         };
         menu.Items.Add(_mainWindowMenuItem);
-        menu.Items.Add(new PopupMenuItem("打开同步目录", (_, _) => OpenSyncDirectory()));
+        menu.Items.Add(new PopupMenuItem("打开同步目录", (_, _) => AfterTrayMenu(OpenSyncDirectory)));
         _refreshFilesMenuItem = new PopupMenuItem("立即刷新文件", (_, _) => RefreshFilesNow());
         menu.Items.Add(_refreshFilesMenuItem);
-        menu.Items.Add(new PopupMenuItem("打开日志目录", (_, _) => OpenLogFolder()));
-        menu.Items.Add(new PopupMenuItem("清理已缓存文件", (_, _) => _ = ConfirmAndDehydrateCacheAsync()));
-        menu.Items.Add(new PopupMenuItem("设置", (_, _) => OnSettingsMenuSelected()));
+        menu.Items.Add(new PopupMenuItem("打开日志目录", (_, _) => AfterTrayMenu(OpenLogFolder)));
+        menu.Items.Add(new PopupMenuItem("清理已缓存文件", (_, _) => AfterTrayMenu(() => _ = ConfirmAndDehydrateCacheAsync())));
+        menu.Items.Add(new PopupMenuItem("设置", (_, _) => AfterTrayMenu(OnSettingsMenuSelected)));
         _aboutMenuItem = new PopupMenuItem(
             UpdateService.CurrentState.IsAvailable ? "关于 - 可更新" : "关于",
-            (_, _) => OnAboutMenuSelected());
+            (_, _) => AfterTrayMenu(OnAboutMenuSelected));
         menu.Items.Add(_aboutMenuItem);
         menu.Items.Add(new PopupMenuSeparator());
         menu.Items.Add(new PopupMenuItem("退出", (_, _) => RequestExit()));
@@ -561,13 +562,23 @@ internal static class TrayHost
             }
             SetForegroundWindow(tray.WindowHandle);
             menu.Show(tray.WindowHandle, point.X, point.Y);
-            tray.SetFocus();
+            // Do not give focus back to the notification area when the command opens a window.
+            if (_afterTrayMenu is null) tray.SetFocus();
         }
         catch (Exception ex)
         {
             Log.Warning(ex, "托盘菜单显示失败（忽略）");
         }
         finally { _showingTrayMenu = false; }
+        var command = _afterTrayMenu;
+        _afterTrayMenu = null;
+        command?.Invoke();
+    }
+
+    private static void AfterTrayMenu(Action command)
+    {
+        if (_showingTrayMenu) _afterTrayMenu = command;
+        else command();
     }
 
     private static void OpenSyncDirectory()

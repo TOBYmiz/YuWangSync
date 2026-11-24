@@ -268,6 +268,25 @@ public static class PlaceholderUpdater
         }
     }
 
+    internal static bool TryAllowLocalCache(string localPath)
+    {
+        if (!TryGetPlaceholderDataState(localPath, out var state)) return false;
+        if (state.PinState != CF_PIN_STATE.CF_PIN_STATE_UNPINNED) return true;
+        var handle = CreateFileW(localPath, WRITE_DAC, FILE_SHARE_ALL, IntPtr.Zero, OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT, IntPtr.Zero);
+        if (handle == IntPtr.Zero || handle == new IntPtr(-1)) return false;
+        try
+        {
+            // Explicit Download/drag is a new request for local content. Remove the old
+            // online-only request, but don't pin the item (or touch an existing pin).
+            if (!TryGetPlaceholderDataState(localPath, out var current) || current.FileId != state.FileId) return false;
+            if (current.PinState != CF_PIN_STATE.CF_PIN_STATE_UNPINNED) return true;
+            return CfSetPinState(new HFILE(handle), CF_PIN_STATE.CF_PIN_STATE_UNSPECIFIED,
+                CF_SET_PIN_FLAGS.CF_SET_PIN_FLAG_NONE, IntPtr.Zero).Succeeded;
+        }
+        finally { CloseHandle(handle); }
+    }
+
     public static bool TryHydratePlaceholder(string localPath, Action<string>? log = null)
     {
         if (string.IsNullOrEmpty(localPath) || !File.Exists(localPath)) return false;
@@ -479,8 +498,12 @@ public static class PlaceholderUpdater
     /// 返回是否脱水成功；freedBytes 为释放的磁盘字节数（失败时为 0）。
     /// </summary>
     public static bool TryDehydrate(string localPath, out long freedBytes, Action<string>? log = null)
+        => TryDehydrate(localPath, out freedBytes, out _, log);
+
+    internal static bool TryDehydrate(string localPath, out long freedBytes, out bool lockConflict, Action<string>? log)
     {
         freedBytes = 0;
+        lockConflict = false;
         if (string.IsNullOrEmpty(localPath) || !File.Exists(localPath)) return false;
 
         var alloc = GetAllocationSize(localPath);
@@ -494,6 +517,7 @@ public static class PlaceholderUpdater
             CF_OPEN_FILE_FLAGS.CF_OPEN_FILE_FLAG_EXCLUSIVE, out var h);
         if (open.Failed)
         {
+            lockConflict = IsDehydrateLockConflict(open);
             // 拿不到独占（正被其它进程打开、或正在水化中）→ 跳过，不算错误
             log?.Invoke($"[DEHY] 跳过（无法独占打开）: {Path.GetFileName(localPath)} {open}");
             return false;
@@ -505,6 +529,7 @@ public static class PlaceholderUpdater
                 CF_DEHYDRATE_FLAGS.CF_DEHYDRATE_FLAG_NONE, IntPtr.Zero);
             if (hr.Failed)
             {
+                lockConflict = IsDehydrateLockConflict(hr);
                 log?.Invoke($"[DEHY] CfDehydratePlaceholder 失败: {hr} path={localPath}");
                 return false;
             }
@@ -530,6 +555,9 @@ public static class PlaceholderUpdater
     /// 递归脱水目录下所有已水化文件，返回 (处理数, 成功数, 释放字节, 跳过数)。
     /// 跳过两类：磁盘上本就没数据的（已是占位）、正在被其它进程占用的（打不开）。
     /// </summary>
+    private static bool IsDehydrateLockConflict(HRESULT result) => unchecked((uint)(int)result) is
+        0x80070322 or 0x80070020 or 0x80070021; // CANNOT_BREAK_OPLOCK / SHARING_VIOLATION / LOCK_VIOLATION
+
     public static (int Total, int Dehydrated, long FreedBytes, int Skipped) DehydrateTree(
         string rootDir, Action<string>? log = null, bool automatic = false,
         CancellationToken cancellationToken = default)

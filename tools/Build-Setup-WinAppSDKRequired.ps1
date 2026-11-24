@@ -139,7 +139,12 @@ try {
     }
     if ($legacyUiAssemblies) { throw '主程序载荷包含已移除的 WPF/WinForms UI 程序集。' }
     Copy-Item -LiteralPath (Join-Path $repository ('src\YuWangCloudSync.ShellExt\bin\Release\' + $productIdentifier + 'ShellExt.dll')) -Destination $shellExtensionPath
-    $privateFiles = Get-ChildItem -LiteralPath $publish -Recurse -File | Where-Object { $_.Name -in @('appsettings.json', 'cookies.json', 'captcha.png') -or $_.Extension -in @('.db', '.log') }
+    $privateFiles = Get-ChildItem -LiteralPath $publish -Recurse -File | Where-Object {
+        $_.Name -in @('appsettings.json', 'cookies.json', 'captcha.png') -or
+        $_.Name -like 'setup-login-session.txt*' -or $_.Name -like 'cookies-*.json*' -or
+        $_.Name -like 'session-*.dpapi*' -or $_.FullName.Substring($publish.Length) -match '[\\/]credentials[\\/]' -or
+        $_.Extension -in @('.db', '.log')
+    }
     if ($privateFiles) { throw 'The publish directory contains private user data. Packaging stopped.' }
     $payloadFiles = @(Get-ChildItem -LiteralPath $publish -Recurse -File)
     $shellExtensionBytes = (Get-Item -LiteralPath $shellExtensionPath).Length

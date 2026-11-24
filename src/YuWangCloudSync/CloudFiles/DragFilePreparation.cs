@@ -17,6 +17,8 @@ internal sealed record DragPreparationProgress(string Stage, string? FileName = 
 }
 
 /// <summary>Owns the read handles until OLE returns. No work here runs inside DoDragDrop.</summary>
+internal enum SyncRootAvailability { Unknown, OnlineOnly, Local, Pinned }
+
 internal sealed class DragFilePreparation : IDisposable
 {
     private sealed class Entry(string path, SafeFileHandle handle, long size)
@@ -217,10 +219,22 @@ internal sealed class DragFilePreparation : IDisposable
         return (size, partial ? ReadHydratedBytes(new Entry(path, handle, size)) : size, !partial);
     }
 
-    private static bool NeedsHydration(SafeFileHandle handle)
+    internal static SyncRootAvailability ReadAvailability(string path)
+    {
+        using var handle = CreateFileW(path, 0x80 /* FILE_READ_ATTRIBUTES */, 7, 0, 3, 0x00200000, 0);
+        if (handle.IsInvalid) return SyncRootAvailability.Unknown;
+        if (NeedsHydration(handle, out var attributes)) return SyncRootAvailability.OnlineOnly;
+        const uint pinned = 0x00080000; // FILE_ATTRIBUTE_PINNED, independent of hydration
+        return (attributes & pinned) != 0 ? SyncRootAvailability.Pinned : SyncRootAvailability.Local;
+    }
+
+    private static bool NeedsHydration(SafeFileHandle handle) => NeedsHydration(handle, out _);
+
+    private static bool NeedsHydration(SafeFileHandle handle, out uint attributes)
     {
         if (!GetFileInformationByHandleEx(handle, 9 /* FileAttributeTagInfo */, out var info, 8))
             throw new Win32Exception(Marshal.GetLastWin32Error());
+        attributes = info.Attributes;
         var state = CfGetPlaceholderStateFromAttributeTag((Vanara.PInvoke.FileFlagsAndAttributes)info.Attributes, info.ReparseTag);
         if (state == CF_PLACEHOLDER_STATE.CF_PLACEHOLDER_STATE_INVALID)
             throw new IOException("无法读取文件的占位符状态。");

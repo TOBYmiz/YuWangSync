@@ -1,4 +1,4 @@
-; YuWangCloudSync installer implemented in NSIS with Modern UI 2.
+﻿; YuWangCloudSync installer implemented in NSIS with Modern UI 2.
 !include "LogicLib.nsh"
 !include "WinVer.nsh"
 !include "x64.nsh"
@@ -792,7 +792,7 @@ Function GetInstallerCaptcha
     Call ShowInstallerCaptchaError
     Return
   ${EndIf}
-  ; The helper may discover a non-default port; use that address for login and configuration.
+  ; The first line is the discovered server address; the rest is a DPAPI blob.
   StrCpy $R1 ""
   FileOpen $R0 "$PLUGINSDIR\setup-login-session.txt" r
   ${If} $R0 != ""
@@ -1645,6 +1645,7 @@ save_config_session_input_open_failed:
   StrCpy $R9 "41"
 save_config_session_failed:
   Delete "$PLUGINSDIR\setup-login-input.txt"
+  Delete "$PLUGINSDIR\setup-login-session.txt"
   StrCpy $SessionUsername ""
   DetailPrint "保存登录会话凭据失败，返回值：$R9"
   ${If} $R8 != ""
@@ -2444,9 +2445,13 @@ uninstall_shell_done:
   ${EndIf}
 
   Call un.RemoveDesktopShortcuts
+  StrCpy $R4 "legacy"
   StrCpy $R5 "$LOCALAPPDATA\${PRODUCT_IDENTIFIER}"
   Call un.DeleteSessionFilesInDirectory
   StrCpy $R5 "$INSTDIR"
+  Call un.DeleteSessionFilesInDirectory
+  StrCpy $R4 "protected"
+  StrCpy $R5 "$LOCALAPPDATA\${PRODUCT_IDENTIFIER}\credentials"
   Call un.DeleteSessionFilesInDirectory
   ${If} $KeepUserConfiguration != "1"
     StrCpy $R0 "$LOCALAPPDATA\${PRODUCT_IDENTIFIER}"
@@ -2559,20 +2564,58 @@ un_session_files_loop:
   StrCmp $R7 "" un_session_files_done
   StrCmp $R7 "." un_session_files_next
   StrCmp $R7 ".." un_session_files_next
+  StrCmp $R4 "protected" un_session_protected_name
   StrCmp $R7 "cookies.json" un_session_file_delete
   StrCpy $R8 $R7 8
   StrCmp $R8 "cookies-" 0 un_session_files_next
   StrLen $R9 $R7
-  IntCmp $R9 13 un_session_file_name_long_enough un_session_file_name_long_enough un_session_files_next
-un_session_file_name_long_enough:
-  IntOp $R9 $R9 - 5
-  StrCpy $R8 $R7 5 $R9
-  StrCmp $R8 ".json" un_session_file_delete un_session_files_next
+  IntCmp $R9 33 un_session_legacy_account_name un_session_files_next
+  IntCmp $R9 52 un_session_legacy_backup_name un_session_files_next
+  IntCmp $R9 70 0 un_session_files_next un_session_files_next
+  StrCpy $R8 $R7 6 28
+  StrCmp $R8 ".json." 0 un_session_files_next
+  StrCpy $R8 $R7 4 -4
+  StrCmp $R8 ".tmp" 0 un_session_files_next
+  StrCpy $R3 $R7 32 34
+  Goto un_session_validate_temporary_id
+un_session_legacy_account_name:
+  StrCpy $R8 $R7 5 -5
+  StrCmp $R8 ".json" un_session_validate_account un_session_files_next
+un_session_legacy_backup_name:
+  StrCpy $R8 $R7 15
+  StrCmp $R8 "cookies-backup-" 0 un_session_files_next
+  StrCpy $R8 $R7 5 -5
+  StrCmp $R8 ".json" 0 un_session_files_next
+  StrCpy $R3 $R7 32 15
+  System::Call 'shlwapi::StrSpnW(w "$R3", w "0123456789ABCDEFabcdef") i.R2'
+  IntCmp $R2 32 un_session_file_delete un_session_files_next un_session_files_next
+un_session_protected_name:
+  StrCpy $R8 $R7 8
+  StrCmp $R8 "session-" 0 un_session_files_next
+  StrCpy $R8 $R7 6 28
+  StrCmp $R8 ".dpapi" 0 un_session_files_next
+  StrLen $R9 $R7
+  IntCmp $R9 34 un_session_validate_account un_session_files_next
+  IntCmp $R9 71 0 un_session_files_next un_session_files_next
+  StrCpy $R8 $R7 1 34
+  StrCmp $R8 "." 0 un_session_files_next
+  StrCpy $R8 $R7 4 -4
+  StrCmp $R8 ".tmp" un_session_protected_temporary_id
+  StrCmp $R8 ".bak" 0 un_session_files_next
+un_session_protected_temporary_id:
+  StrCpy $R3 $R7 32 35
+un_session_validate_temporary_id:
+  System::Call 'shlwapi::StrSpnW(w "$R3", w "0123456789ABCDEFabcdef") i.R2'
+  IntCmp $R2 32 0 un_session_files_next un_session_files_next
+un_session_validate_account:
+  StrCpy $R3 $R7 20 8
+  System::Call 'shlwapi::StrSpnW(w "$R3", w "0123456789ABCDEFabcdef") i.R2'
+  IntCmp $R2 20 0 un_session_files_next un_session_files_next
 un_session_file_delete:
   System::Call 'kernel32::GetFileAttributesW(w "$R5\$R7") i.R0'
   IntCmp $R0 -1 un_session_files_next un_session_file_attributes_read un_session_file_attributes_read
 un_session_file_attributes_read:
-  IntOp $R1 $R0 & 0x10
+  IntOp $R1 $R0 & 0x410 ; directory or reparse point
   StrCmp $R1 "0" un_session_file_remove un_session_files_next
 un_session_file_remove:
   ClearErrors

@@ -266,7 +266,9 @@ public sealed class SqliteCache : IDisposable
     /// 规则：real_size 未知 → 探测；已知但记录的 upload_time 与当前列表不一致
     ///（文件在服务器上被替换过）→ 重新探测；否则跳过（一生只探一次，除非文件变了）。
     /// </summary>
-    public bool NeedsSizeProbe(ulong fileId, string uploadTime)
+    public bool NeedsSizeProbe(ulong fileId, string uploadTime) => GetProbedSize(fileId, uploadTime) is null;
+
+    internal long? GetProbedSize(ulong fileId, string uploadTime)
     {
         lock (_sync)
         {
@@ -274,12 +276,10 @@ public sealed class SqliteCache : IDisposable
             cmd.CommandText = "SELECT real_size, probed_upload_time FROM files WHERE file_id=@fid";
             cmd.Parameters.AddWithValue("@fid", (long)fileId);
             using var r = cmd.ExecuteReader();
-            if (!r.Read()) return true;                    // 还没入库 → 探测
-            if (r.IsDBNull(0)) return true;                // 大小未知 → 探测
-            var probed = r.IsDBNull(1) ? null : r.GetString(1);
-            if (!string.Equals(probed, uploadTime, StringComparison.Ordinal))
-                return true;                               // 文件被替换过 → 重新探测
-            return r.GetInt64(0) < 0;                      // 0 + 同版探测时间表示已确认没有内容对象
+            if (!r.Read() || r.IsDBNull(0) || r.IsDBNull(1)
+                || !string.Equals(r.GetString(1), uploadTime, StringComparison.Ordinal)) return null;
+            var size = r.GetInt64(0);
+            return size >= 0 ? size : null; // 0 表示已确认无内容
         }
     }
 
@@ -664,6 +664,19 @@ public sealed class SqliteCache : IDisposable
             cmd.Parameters.AddWithValue("@folder", (long)folderId);
             var value = cmd.ExecuteScalar() as string;
             return string.IsNullOrWhiteSpace(value) ? null : value;
+        }
+    }
+
+    internal (ulong Parent, string Name)? GetFolderRoute(ulong diskId, ulong folderId)
+    {
+        lock (_sync)
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = "SELECT parent_folder_id, name FROM folders WHERE disk_id=@disk AND folder_id=@folder";
+            cmd.Parameters.AddWithValue("@disk", (long)diskId);
+            cmd.Parameters.AddWithValue("@folder", (long)folderId);
+            using var reader = cmd.ExecuteReader();
+            return reader.Read() && !reader.IsDBNull(0) ? ((ulong)reader.GetInt64(0), reader.GetString(1)) : null;
         }
     }
 

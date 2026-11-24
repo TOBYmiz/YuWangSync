@@ -10,6 +10,54 @@
 $ErrorActionPreference = 'Stop'
 $saveSessionStage = 'script initialization'
 
+function Protect-SessionText([string]$Value) {
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($Value)
+    try {
+        return [Convert]::ToBase64String([System.Security.Cryptography.ProtectedData]::Protect(
+            $bytes, $null, [System.Security.Cryptography.DataProtectionScope]::CurrentUser))
+    }
+    finally { [Array]::Clear($bytes, 0, $bytes.Length) }
+}
+
+function Unprotect-SessionText([string]$Value) {
+    $bytes = [System.Security.Cryptography.ProtectedData]::Unprotect(
+        [Convert]::FromBase64String($Value), $null, [System.Security.Cryptography.DataProtectionScope]::CurrentUser)
+    try { return [System.Text.Encoding]::UTF8.GetString($bytes) }
+    finally { [Array]::Clear($bytes, 0, $bytes.Length) }
+}
+
+function Write-ProtectedSessionFile([string]$Path, [string]$Contents, [System.Text.Encoding]$Encoding) {
+    $temporaryPath = $Path + '.' + [Guid]::NewGuid().ToString('N') + '.tmp'
+    $backupPath = $Path + '.' + [Guid]::NewGuid().ToString('N') + '.bak'
+    try {
+        [System.IO.File]::WriteAllText($temporaryPath, $Contents, $Encoding)
+        if ([System.IO.File]::Exists($Path)) {
+            # .NET Framework File.Replace needs a real backup path on this installer path.
+            [System.IO.File]::Replace($temporaryPath, $Path, $backupPath)
+        }
+        else { [System.IO.File]::Move($temporaryPath, $Path) }
+    }
+    finally {
+        [System.IO.File]::Delete($temporaryPath)
+        [System.IO.File]::Delete($backupPath)
+    }
+}
+
+function Write-LoginSession([string]$Server, [string]$SessionId, [string]$CookieHeader, [string]$VerifiedAccount) {
+    # NSIS reads only the first line to discover the server port. No cookie is exposed to it.
+    $encrypted = Protect-SessionText "$Server`n$VerifiedAccount`n$SessionId`n$CookieHeader"
+    Write-ProtectedSessionFile $SessionPath "$Server`r`n$encrypted" ([System.Text.Encoding]::Unicode)
+}
+
+function Read-LoginSession {
+    $lines = [System.IO.File]::ReadAllLines($SessionPath, [System.Text.Encoding]::Unicode)
+    if ($lines.Length -ne 2 -or -not [Uri]::IsWellFormedUriString($lines[0], [UriKind]::Absolute)) { return $null }
+    $fields = (Unprotect-SessionText $lines[1]) -split "`n", 4
+    if ($fields.Length -ne 4 -or $fields[0] -cne $lines[0] -or
+        $fields[2] -notmatch '^[\x21-\x7E]{1,4096}\z' -or $fields[2] -match '[;,"\\]') { return $null }
+    return @{ Server = $fields[0]; VerifiedAccount = $fields[1]; Id = $fields[2]; Header = $fields[3] }
+}
+
 function Get-SessionId([System.Net.HttpWebResponse]$Response) {
     foreach ($header in $Response.Headers.GetValues('Set-Cookie')) {
         $match = [regex]::Match($header, '(?i)JSESSIONID=([^;,\s]+)')
@@ -190,6 +238,7 @@ $captchaGraphics = $null
 $captchaFailureCode = 27
 $loginFailureCode = 1
 try {
+    Add-Type -AssemblyName System.Security
     $inputLines = [System.IO.File]::ReadAllLines($InputPath, [System.Text.Encoding]::Unicode)
     Remove-Item -LiteralPath $InputPath -Force
 
@@ -259,10 +308,7 @@ try {
                 $captchaGraphics.DrawImage($image, 0, 0, $width, $height)
                 $captchaBitmap.Save($ImagePath, [System.Drawing.Imaging.ImageFormat]::Bmp)
 
-                [System.IO.File]::WriteAllLines(
-                    $SessionPath,
-                    [string[]]@($script:Server, $sessionId, $cookieHeader),
-                    [System.Text.Encoding]::Unicode)
+                Write-LoginSession $script:Server $sessionId $cookieHeader ''
                 exit 0
             }
             catch {
@@ -289,11 +335,11 @@ try {
             [Console]::Out.WriteLine('SaveSession validation failed: username or data directory is missing.')
             exit 41
         }
-        $saveSessionStage = 'read login session file'
-        $sessionLines = [System.IO.File]::ReadAllLines($SessionPath, [System.Text.Encoding]::Unicode)
-        if ($sessionLines.Length -lt 2 -or -not $sessionLines[1] -or
-            -not [Uri]::IsWellFormedUriString($sessionLines[0], [UriKind]::Absolute)) {
-            [Console]::Out.WriteLine('SaveSession validation failed: login session file is missing or invalid.')
+        $saveSessionStage = 'read protected login session'
+        $loginSession = Read-LoginSession
+        if (-not $loginSession -or -not $loginSession.VerifiedAccount -or
+            $loginSession.VerifiedAccount -cne $inputLines[0].Trim().ToLowerInvariant()) {
+            [Console]::Out.WriteLine('SaveSession validation failed: login session is missing or invalid.')
             exit 42
         }
         $usernameKey = $inputLines[0].Trim().ToLowerInvariant()
@@ -309,42 +355,21 @@ try {
         finally {
             $sha.Dispose()
         }
-        $serverUri = [Uri]$sessionLines[0]
-        $cookieObject = [ordered]@{
-            name = 'JSESSIONID'
-            value = $sessionLines[1]
-            domain = $serverUri.Host
-            path = '/'
+        $serverUri = [Uri]$loginSession.Server
+        $authority = $serverUri.GetLeftPart([UriPartial]::Authority)
+        $envelope = "$accountHash`n$authority`n$($loginSession.Id)"
+        $saveSessionStage = 'write protected credential'
+        $credentialDirectory = [System.IO.Path]::Combine($DataDirectory, 'credentials')
+        [System.IO.Directory]::CreateDirectory($credentialDirectory) | Out-Null
+        $credentialPath = [System.IO.Path]::Combine($credentialDirectory, "session-$accountHash.dpapi")
+        Write-ProtectedSessionFile $credentialPath (Protect-SessionText $envelope) ([System.Text.UTF8Encoding]::new($false))
+        $saveSessionStage = 'verify protected credential'
+        if ((Unprotect-SessionText ([System.IO.File]::ReadAllText($credentialPath))) -cne $envelope) {
+            throw 'Session credential could not be verified.'
         }
-        $cookieJson = '[' + (ConvertTo-Json -InputObject $cookieObject -Compress) + ']'
-        $saveSessionStage = 'create data directory'
-        [System.IO.Directory]::CreateDirectory($DataDirectory) | Out-Null
-        $saveSessionStage = 'construct cookie paths'
-        $cookiePath = [System.IO.Path]::Combine($DataDirectory, 'cookies-' + $accountHash + '.json')
-        $temporaryCookiePath = $cookiePath + '.' + [Guid]::NewGuid().ToString('N') + '.tmp'
-        $backupCookiePath = [System.IO.Path]::Combine(
-            $DataDirectory, 'cookies-backup-' + [Guid]::NewGuid().ToString('N') + '.json')
-        try {
-            $saveSessionStage = 'write temporary cookie file'
-            [System.IO.File]::WriteAllText($temporaryCookiePath, $cookieJson, [System.Text.UTF8Encoding]::new($false))
-            if ([System.IO.File]::Exists($cookiePath)) {
-                $saveSessionStage = 'replace existing cookie file'
-                [System.IO.File]::Replace($temporaryCookiePath, $cookiePath, $backupCookiePath)
-                $saveSessionStage = 'remove previous cookie backup'
-                [System.IO.File]::Delete($backupCookiePath)
-                if ([System.IO.File]::Exists($backupCookiePath)) {
-                    throw 'Previous cookie backup file could not be removed.'
-                }
-            }
-            else {
-                $saveSessionStage = 'move new cookie file into place'
-                [System.IO.File]::Move($temporaryCookiePath, $cookiePath)
-            }
-        }
-        finally {
-            Remove-Item -LiteralPath $temporaryCookiePath -Force -ErrorAction SilentlyContinue
-            Remove-Item -LiteralPath $backupCookiePath -Force -ErrorAction SilentlyContinue
-        }
+        $saveSessionStage = 'remove superseded plaintext credential'
+        [System.IO.File]::Delete([System.IO.Path]::Combine($DataDirectory, "cookies-$accountHash.json"))
+        [System.IO.File]::Delete([System.IO.Path]::Combine($DataDirectory, 'cookies.json'))
         exit 0
     }
 
@@ -353,19 +378,12 @@ try {
     $username = $inputLines[1]
     $password = $inputLines[2]
     $captcha = $inputLines[3]
-    $sessionLines = [System.IO.File]::ReadAllLines($SessionPath, [System.Text.Encoding]::Unicode)
-    if ($sessionLines.Length -lt 2 -or
-        -not [string]::Equals($sessionLines[0], $server, [StringComparison]::OrdinalIgnoreCase)) {
-        exit 1
-    }
-    $sessionId = $sessionLines[1]
-    if (-not $sessionId) { exit 1 }
-    $cookieHeader = if ($sessionLines.Length -ge 3 -and $sessionLines[2]) {
-        $sessionLines[2]
-    }
-    else {
-        'JSESSIONID=' + $sessionId
-    }
+    $loginFailureCode = 34
+    $loginSession = Read-LoginSession
+    if (-not $loginSession -or
+        -not [string]::Equals($loginSession.Server, $server, [StringComparison]::OrdinalIgnoreCase)) { exit 1 }
+    $sessionId = $loginSession.Id
+    $cookieHeader = if ($loginSession.Header) { $loginSession.Header } else { 'JSESSIONID=' + $sessionId }
 
     # Match Python urllib.parse.quote's default safe set, which leaves '/' unescaped.
     $quotedUsername = [Uri]::EscapeDataString($username).Replace('%2F', '/')
@@ -397,10 +415,7 @@ try {
         exit 1
     }
     $loginFailureCode = 34
-    [System.IO.File]::WriteAllLines(
-        $SessionPath,
-        [string[]]@($server, $sessionId, $cookieHeader),
-        [System.Text.Encoding]::Unicode)
+    Write-LoginSession $server $sessionId $cookieHeader $username.Trim().ToLowerInvariant()
     exit 0
 }
 catch {
@@ -443,11 +458,8 @@ catch {
     if ($Operation -eq 'SaveSession') {
         $failure = $_.Exception
         while ($failure.InnerException) { $failure = $failure.InnerException }
-        $message = ($failure.Message -replace '[\r\n]+', ' ').Trim()
-        $diagnosticDataDirectory = ($DataDirectory -replace '[\r\n\t]', '?')
-        [Console]::Out.WriteLine(('SaveSession stage={0}; dataDirectory=[{1}]; exception={2}, HRESULT 0x{3:X8}: {4}' -f
-            $saveSessionStage, $diagnosticDataDirectory, $failure.GetType().FullName,
-            [int]$failure.HResult, $message))
+        [Console]::Out.WriteLine(('SaveSession stage={0}; exception={1}, HRESULT 0x{2:X8}' -f
+            $saveSessionStage, $failure.GetType().FullName, [int]$failure.HResult))
         exit 40
     }
     exit 1

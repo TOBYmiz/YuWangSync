@@ -1,7 +1,6 @@
 using System.Net;
 using System.Net.Http.Headers;
 using System.Text;
-using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
 using YuWangCloudSync.Core;
 using YuWangCloudSync.Crypto;
@@ -1005,7 +1004,7 @@ public sealed partial class YuWangClient : IDisposable
     /// <summary>
     /// 注入已有的 JSESSIONID，用于**复用上次会话**、跳过验证码。
     /// 育网云的 session 有效期较长，每次启动都重新输验证码很麻烦，
-    /// 所以把上次的 JSESSIONID 存盘（cookies.json），启动时先试着续用。
+    /// 所以以当前用户凭据保存 JSESSIONID，启动时先试着续用。
     /// </summary>
     public void SetSession(string? jsessionid)
     {
@@ -1016,38 +1015,5 @@ public sealed partial class YuWangClient : IDisposable
     /// <summary>当前会话 ID（供存盘复用）</summary>
     public string? CurrentSessionId => _jsessionid;
 
-    /// <summary>从 cookies.json（[{"name":"JSESSIONID","value":"..."}]）里读出会话 ID</summary>
-    public static string? LoadSessionFrom(string cookiesJsonPath)
-    {
-        try
-        {
-            if (!File.Exists(cookiesJsonPath)) return null;
-            var json = File.ReadAllText(cookiesJsonPath);
-            var m = Regex.Match(json, "\"value\"\\s*:\\s*\"([^\"]+)\"");
-            return m.Success ? m.Groups[1].Value.Trim() : null;
-        }
-        catch { return null; }
-    }
-
-    /// <summary>把当前会话 ID 写回 cookies.json，供下次启动复用</summary>
-    public void SaveSessionTo(string cookiesJsonPath)
-    {
-        try
-        {
-            if (string.IsNullOrEmpty(_jsessionid)) return;
-            var json = System.Text.Json.JsonSerializer.Serialize(
-                new[] { new SessionCookie("JSESSIONID", _jsessionid, new Uri(Server).Host, "/") },
-                AppJsonSerializerContext.Default.SessionCookieArray);
-            File.WriteAllText(cookiesJsonPath, json);
-        }
-        catch { /* 存盘失败不影响运行 */ }
-    }
-
     public void Dispose() => _http.Dispose();
 }
-
-internal sealed record SessionCookie(
-    [property: JsonPropertyName("name")] string Name,
-    [property: JsonPropertyName("value")] string Value,
-    [property: JsonPropertyName("domain")] string Domain,
-    [property: JsonPropertyName("path")] string Path);

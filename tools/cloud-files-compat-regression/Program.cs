@@ -188,7 +188,7 @@ try
     // production attribute watcher/updater. No account, network, WinUI or shell registration.
     var root = Path.Combine(Path.GetTempPath(), "YuWangCompat-" + Guid.NewGuid().ToString("N"));
     Directory.CreateDirectory(root);
-    var path = Path.Combine(root, "pin-test.bin");
+    var path = Path.Combine(root, args.Contains("--pin-special") ? "固定+测试%2B & #.bin" : "pin-test.bin");
     var payload = Enumerable.Range(0, 128 * 1024).Select(i => (byte)(i % 251)).ToArray();
     var errors = new ConcurrentQueue<Exception>();
     var messages = new ConcurrentQueue<string>();
@@ -417,20 +417,39 @@ try
             return;
         }
         watcher.Start();
+        Check(DragFilePreparation.ReadAvailability(path) == SyncRootAvailability.OnlineOnly,
+            "availability metadata starts online-only");
         SetPin(CF_PIN_STATE.CF_PIN_STATE_PINNED);
         WaitFor(() => PlaceholderUpdater.TryGetPlaceholderDataState(path, out var state)
             && state.PinState == CF_PIN_STATE.CF_PIN_STATE_PINNED && state.OnDiskDataSize >= payload.Length,
             "Always keep on this device hydrates without callback failure");
         Check(requestCount > 0 && errors.IsEmpty, "native callback completed");
         Check(File.ReadAllBytes(path).AsSpan().SequenceEqual(payload), "hydrated content integrity");
-        SetPin(CF_PIN_STATE.CF_PIN_STATE_UNPINNED);
+        Check(DragFilePreparation.ReadAvailability(path) == SyncRootAvailability.Pinned,
+            "availability metadata distinguishes a pinned copy");
+        if (args.Contains("--hold-pin-lock"))
+        {
+            using var reader = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+            SetPin(CF_PIN_STATE.CF_PIN_STATE_UNPINNED);
+            WaitFor(() => messages.Any(m => m.Contains("无法独占打开", StringComparison.Ordinal)),
+                "a retained reader blocks the exclusive dehydration handle");
+            Thread.Sleep(4_500); // Beyond the old watcher retry window; no further pin gesture after release.
+            Check(PlaceholderUpdater.TryGetPlaceholderDataState(path, out var held) && held.OnDiskDataSize > 0,
+                "locked content is preserved while the reader is alive");
+        }
+        else SetPin(CF_PIN_STATE.CF_PIN_STATE_UNPINNED);
         WaitFor(() => PlaceholderUpdater.TryGetPlaceholderDataState(path, out var state) && state.OnDiskDataSize == 0,
             "Free up space dehydrates via production attribute watcher");
         Check(messages.Any(m => m.Contains("[PIN] 捕获占位属性变化")), "production pin watcher received attribute events");
-        SetPin(CF_PIN_STATE.CF_PIN_STATE_UNSPECIFIED);
+        Check(PlaceholderUpdater.TryAllowLocalCache(path), "a new explicit download clears the previous unpin request");
         Check(PlaceholderUpdater.TryGetPlaceholderDataState(path, out var unspecified)
             && unspecified.PinState == CF_PIN_STATE.CF_PIN_STATE_UNSPECIFIED && unspecified.OnDiskDataSize == 0,
-            "UNSPECIFIED does not hydrate");
+            "UNSPECIFIED does not hydrate on its own");
+        using (var downloaded = await DragFilePreparation.CreateAsync([path], () => true, _ => { }, CancellationToken.None))
+            downloaded.ValidateReady();
+        Thread.Sleep(400); // Let the real attribute watcher see the hydration.
+        Check(DragFilePreparation.ReadAvailability(path) == SyncRootAvailability.Local,
+            "explicit hydration stays cached locally, without pinning or a second dehydration");
         Console.WriteLine("PASS: native pin / hydrate / unpin / dehydrate cycle.");
     }
     finally

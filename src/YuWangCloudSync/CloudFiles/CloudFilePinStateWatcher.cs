@@ -13,9 +13,11 @@ internal sealed class CloudFilePinStateWatcher
     private readonly string _rootPrefix;
     private readonly Action<string> _log;
     private readonly ConcurrentDictionary<string, byte> _queued = new(StringComparer.OrdinalIgnoreCase);
-    private readonly ConcurrentDictionary<string, (CF_PIN_STATE PinState, long OnDiskDataSize)> _lastState =
+    private readonly ConcurrentDictionary<string, (long FileId, CF_PIN_STATE PinState, long OnDiskDataSize)> _lastState =
         new(StringComparer.OrdinalIgnoreCase);
     private readonly ManualResetEventSlim _idle = new(true);
+    private readonly CancellationTokenSource _stop = new();
+    private static readonly int[] UnpinRetryDelays = [0, 250, 500, 1_000, 2_000, 4_000, 8_000, 15_000, 30_000, 60_000, 60_000];
     private FileSystemWatcher? _watcher;
     private volatile bool _stopping;
     private int _active;
@@ -49,6 +51,7 @@ internal sealed class CloudFilePinStateWatcher
     public void Stop()
     {
         _stopping = true;
+        _stop.Cancel();
         var watcher = Interlocked.Exchange(ref _watcher, null);
         if (watcher != null)
         {
@@ -67,7 +70,10 @@ internal sealed class CloudFilePinStateWatcher
         try { fullPath = Path.GetFullPath(path); }
         catch { return; }
         if (!fullPath.StartsWith(_rootPrefix, StringComparison.OrdinalIgnoreCase)) return;
-        if (!_queued.TryAdd(fullPath, 0)) return;
+        while (!_queued.TryAdd(fullPath, 0))
+        {
+            if (_queued.TryUpdate(fullPath, 1, 0) || (_queued.TryGetValue(fullPath, out var pending) && pending == 1)) return;
+        }
 
         Interlocked.Increment(ref _active);
         _idle.Reset();
@@ -75,16 +81,17 @@ internal sealed class CloudFilePinStateWatcher
         {
             try
             {
-                await Task.Delay(100).ConfigureAwait(false);
+                await Task.Delay(100, _stop.Token).ConfigureAwait(false);
                 await ProcessPathAsync(fullPath).ConfigureAwait(false);
             }
+            catch (OperationCanceledException) when (_stopping) { }
             catch (Exception ex)
             {
                 _log($"[PIN] 属性变化处理异常: {ex.Message}");
             }
             finally
             {
-                _queued.TryRemove(fullPath, out _);
+                if (_queued.TryRemove(fullPath, out var pending) && pending != 0) Queue(fullPath);
                 if (Interlocked.Decrement(ref _active) == 0) _idle.Set();
             }
         });
@@ -105,7 +112,7 @@ internal sealed class CloudFilePinStateWatcher
         try { fileSize = new FileInfo(path).Length; }
         catch { return; }
 
-        var currentState = (state.PinState, state.OnDiskDataSize);
+        var currentState = (state.FileId, state.PinState, state.OnDiskDataSize);
         if (_lastState.TryGetValue(path, out var previousState) && previousState == currentState)
             return;
         _lastState[path] = currentState;
@@ -121,39 +128,42 @@ internal sealed class CloudFilePinStateWatcher
                 break;
 
             case CF_PIN_STATE.CF_PIN_STATE_UNPINNED:
-                await DehydrateUnpinnedFileAsync(path, state.FileId).ConfigureAwait(false);
+                if (!await DehydrateUnpinnedFileAsync(path, state.FileId).ConfigureAwait(false))
+                    _lastState.TryRemove(path, out _); // A failed attempt must not suppress a later request.
                 break;
         }
     }
 
-    private async Task DehydrateUnpinnedFileAsync(string path, long fileId)
+    private async Task<bool> DehydrateUnpinnedFileAsync(string path, long fileId)
     {
-        int[] retryDelaysMs = [0, 250, 500, 1_000, 2_000];
-        for (var attempt = 0; attempt < retryDelaysMs.Length; attempt++)
+        for (var attempt = 0; attempt < UnpinRetryDelays.Length; attempt++)
         {
-            if (_stopping) return;
-            if (retryDelaysMs[attempt] > 0)
-                await Task.Delay(retryDelaysMs[attempt]).ConfigureAwait(false);
+            if (_stopping) return false;
+            if (UnpinRetryDelays[attempt] > 0)
+                await Task.Delay(UnpinRetryDelays[attempt], _stop.Token).ConfigureAwait(false);
 
             if (!File.Exists(path)
                 || !PlaceholderUpdater.TryGetPlaceholderDataState(path, out var state)
-                || state.PinState != CF_PIN_STATE.CF_PIN_STATE_UNPINNED)
-                return;
-            if (state.OnDiskDataSize <= 0) return;
+                || state.FileId != fileId || state.PinState != CF_PIN_STATE.CF_PIN_STATE_UNPINNED)
+                return true;
+            if (state.OnDiskDataSize <= 0) return true;
             if (state.InSyncState != CF_IN_SYNC_STATE.CF_IN_SYNC_STATE_IN_SYNC)
             {
                 _log($"[PIN] 暂缓脱水 file={fileId}：当前不在同步状态 ({state.InSyncState})");
+                if (attempt >= 4) break;
                 continue;
             }
 
-            var dehydrated = PlaceholderUpdater.TryDehydrate(path, out var freedBytes, _log);
+            var dehydrated = PlaceholderUpdater.TryDehydrate(path, out var freedBytes, out var lockConflict, _log);
             if (dehydrated)
             {
                 _log($"[PIN] UNPINNED 脱水完成 file={fileId} freed={freedBytes}");
-                return;
+                return true;
             }
+            if (!lockConflict && attempt >= 4) break;
         }
 
-        _log($"[PIN] UNPINNED 脱水尚未完成 file={fileId}；稍后属性变化时会再次检查");
+        _log($"[PIN] UNPINNED 脱水尚未完成 file={fileId}；收到后续属性变化时会再次检查");
+        return false;
     }
 }

@@ -1,7 +1,6 @@
 ﻿using System.Diagnostics;
 using System.Runtime.Versioning;
 using System.Security.Principal;
-using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using Microsoft.Data.Sqlite;
@@ -999,26 +998,22 @@ internal static class Program
             DefaultDirectoryRefreshMinutes);
 
         // 4. 启动期：登录育网云
-        //    优先复用上次会话（cookies.json 里的 JSESSIONID），失效才走人工验证码。
+        //    优先复用 DPAPI 会话凭据，失效才走人工验证码。
         var captchaPath = AppPaths.ResolveDataPath("captcha.png");
-        var legacyCookiesPath = AppPaths.MigrateDataFile("cookies.json", AppContext.BaseDirectory);
-        var cookiesPath = AccountSessionPath(_ctx.Username);
-        if (!File.Exists(cookiesPath) && File.Exists(legacyCookiesPath))
+        var sessionStore = new AccountSessionStore(AppPaths.DataDirectory);
+        try
         {
-            Directory.CreateDirectory(Path.GetDirectoryName(cookiesPath)!);
-            File.Move(legacyCookiesPath, cookiesPath, overwrite: false);
-            Log.Information("已把旧会话凭据迁移为当前账户独立会话文件");
+            sessionStore.MigratePlaintext(_ctx.Username, _ctx.Server, AppContext.BaseDirectory,
+                () => Log.Warning("旧会话文件迁移未完成，将在下次启动时重试"));
         }
-        else if (File.Exists(cookiesPath) && File.Exists(legacyCookiesPath))
-        {
-            File.Delete(legacyCookiesPath);
-        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+        { Log.Warning("无法检查旧会话文件，将在下次启动时重试"); }
         Log.Information("正在登录育网云 {Server}", _ctx.Server);
         if (_accountSwitchRestart) WinUiUiHost.ReportAccountSwitch("正在登录新账户…", 65,
             "如需验证码，将弹出输入窗口。");
 
         var ok = false;
-        var sid = Net.YuWangClient.LoadSessionFrom(cookiesPath);
+        var sid = sessionStore.Load(_ctx.Username, _ctx.Server);
         if (!string.IsNullOrEmpty(sid))
         {
             _client.SetSession(sid);
@@ -1037,11 +1032,11 @@ internal static class Program
         if (!ok)
         {
             // --quiet 无头模式无法输入验证码：不能静默卡死，直接退出并提示。
-            // 自动化/无头运行应预先用普通模式登录一次（cookies.json 已落盘），或保证会话仍有效。
+            // 自动化/无头运行应预先用普通模式登录一次（会话凭据已保存），或保证会话仍有效。
             if (_quiet)
             {
-                Log.Error("--quiet 模式不进行交互登录（无法输入验证码）。请先用普通模式登录一次（会话存入 cookies.json），" +
-                          "或确保 cookies.json 中会话仍有效后再以 --quiet 运行");
+                Log.Error("--quiet 模式不进行交互登录（无法输入验证码）。请先用普通模式登录一次（保存会话凭据），" +
+                          "或确保已保存的会话仍有效后再以 --quiet 运行");
                 return;
             }
             // 验证码读取方式：仅显式 --console 才用控制台输入（开发调试）；
@@ -1090,7 +1085,10 @@ internal static class Program
             }
         }
         _cts.Token.ThrowIfCancellationRequested();
-        _client.SaveSessionTo(cookiesPath);
+        try { SaveAccountSession(_ctx.Username, _client); }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException
+            or System.ComponentModel.Win32Exception or InvalidOperationException or InvalidDataException)
+        { Log.Warning("本次登录的会话凭据未能保存，下次启动可能需要验证码"); }
         Log.Information("登录成功");
         if (_accountSwitchRestart) WinUiUiHost.ReportAccountSwitch("正在创建同步目录…", 80);
 
@@ -1764,23 +1762,11 @@ internal static class Program
         }
     }
 
-    private static string AccountSessionPath(string username)
-    {
-        var accountHash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(username.Trim().ToLowerInvariant())))[..20];
-        return AppPaths.ResolveDataPath($"cookies-{accountHash}.json");
-    }
-
     internal static void SaveAccountSession(string username, Net.YuWangClient client)
     {
-        if (string.IsNullOrWhiteSpace(client.CurrentSessionId))
+        if (client.CurrentSessionId is not { Length: > 0 } session)
             throw new InvalidOperationException("登录成功，但服务器没有返回会话。");
-
-        var path = AccountSessionPath(username);
-        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-        client.SaveSessionTo(path);
-        if (!string.Equals(Net.YuWangClient.LoadSessionFrom(path), client.CurrentSessionId,
-                StringComparison.Ordinal))
-            throw new IOException("登录成功，但账户会话未能写入本地配置目录。");
+        new AccountSessionStore(AppPaths.DataDirectory).Save(username, client.Server, session);
     }
 
     /// <summary>账号隔离键。旧版自定义 UserKey 仍作为命名空间前缀。</summary>
@@ -2444,14 +2430,114 @@ internal static class Program
     internal static string? ResolveLocalItemPath(ulong diskId, ulong parentId, YuWangItem item)
     {
         var parent = _cache?.GetFolderLocalPath(diskId, parentId);
-        if (string.IsNullOrWhiteSpace(parent) || Path.GetFileName(item.Name) != item.Name) return null;
+        if (string.IsNullOrWhiteSpace(parent) || string.IsNullOrWhiteSpace(_ctx.SyncRootPath)
+            || !IsSyncRootItemName(item.Name)) return null;
         var path = Path.GetFullPath(Path.Combine(parent, item.Name));
-        var root = Path.GetFullPath(_ctx.SyncRootPath).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
-        if (!path.StartsWith(root, StringComparison.OrdinalIgnoreCase)) return null;
-        return ProviderIdentity.TryReadPlaceholderIdentity(path, out var identity)
-            && identity.DiskId == diskId && identity.FileId == item.Id && identity.FolderId == parentId
-            && identity.Type == (item.IsFolder ? 0 : 1) ? path : null;
+        var root = Path.TrimEndingDirectorySeparator(Path.GetFullPath(_ctx.SyncRootPath));
+        var prefix = Path.EndsInDirectorySeparator(root) ? root : root + Path.DirectorySeparatorChar;
+        return path.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)
+            && MatchesSyncRootItem(path, diskId, parentId, item) ? path : null;
     }
+
+    private static bool IsSyncRootItemName(string name) => !string.IsNullOrWhiteSpace(name)
+        && name is not "." and not ".." && name.IndexOfAny(Path.GetInvalidFileNameChars()) < 0;
+
+    private static bool MatchesSyncRootItem(string path, ulong diskId, ulong parentId, YuWangItem item)
+        => ProviderIdentity.TryReadPlaceholderIdentity(path, out var identity)
+            && identity.DiskId == diskId && identity.FileId == item.Id && identity.FolderId == parentId
+            && identity.Type == (item.IsFolder ? 0 : 1);
+
+    internal static Task<string> PrepareSyncRootItemAsync(YuWangClient client, ulong diskId, ulong parentId,
+        YuWangItem item, CancellationToken token) => Task.Run(async () =>
+    {
+        var cache = _cache ?? throw new IOException("同步目录缓存尚未初始化。");
+        var context = _ctx;
+        void CheckConnection()
+        {
+            token.ThrowIfCancellationRequested();
+            if (!IsDragBackendAvailable || !ReferenceEquals(_client, client) || !ReferenceEquals(_cache, cache)
+                || !ReferenceEquals(_ctx, context))
+                throw new IOException("同步引擎未连接或同步目录已更改，请稍后重试。");
+        }
+
+        CheckConnection();
+        if (!IsSyncRootItemName(item.Name)) throw new IOException($"“{item.Name}”不能作为 Windows 文件名。");
+        var tree = new PlaceholderDirectoryTree(context.SyncRootPath, cache, CurrentUserKey(), context.RootContainerTypeId);
+        var parent = tree.EnsureDirectory(diskId, parentId, token);
+        var path = tree.ChildPath(parent, item.Name);
+        void CheckPath()
+        {
+            CheckConnection();
+            if (Callbacks.IsWriteMutationPending(path)) throw new IOException($"“{item.Name}”正在移动，请稍后重试。");
+            if (!MatchesSyncRootItem(path, diskId, parentId, item) && (File.Exists(path) || Directory.Exists(path)))
+                throw new IOException($"“{item.Name}”与同步目录中的已有内容冲突，未覆盖本地文件。");
+        }
+        CheckPath();
+        var exists = MatchesSyncRootItem(path, diskId, parentId, item);
+        if (exists && item.IsFolder)
+        {
+            cache.SetFolderLocalPath(diskId, item.Id, path);
+            return path;
+        }
+        if (exists && DragFilePreparation.ReadMetadata(path).IsReady)
+        {
+            AllowLocalCache();
+            return path;
+        }
+
+        // Prepare the exact logical length before CfHydratePlaceholder. The web listing is
+        // rounded; adjusting FileSize while FETCH_DATA is serving ranges is not safe.
+        long? size = null;
+        if (!item.IsFolder)
+        {
+            var uploadTime = item.UploadTime?.ToString("yyyy-MM-dd HH:mm:ss") ?? "";
+            var cached = cache.GetPlaceholderRestoreInfo(new FileIdentity(diskId, parentId, item.Id, 1));
+            if (cached is null || cached.Name != item.Name
+                || (cache.GetFileDownloadInfo(item.Id).UploadTime ?? "") != uploadTime)
+                throw new IOException($"“{item.Name}”的目录清单已变化，请刷新后重试。");
+            size = cache.GetProbedSize(item.Id, uploadTime);
+            if (size is null)
+            {
+                var probe = await client.ProbeRealSizeAsync(item.Id, item.Name, item.Size).WaitAsync(token).ConfigureAwait(false)
+                    ?? throw new IOException($"无法确认“{item.Name}”的真实大小，未开始水化。");
+                CheckPath();
+                // A refresh may have replaced the selected remote version during the probe.
+                var current = cache.GetFileDownloadInfo(item.Id);
+                if (current.Name != item.Name || (current.UploadTime ?? "") != uploadTime)
+                    throw new IOException($"“{item.Name}”已更新，请刷新后重试。");
+                cache.SaveDirectInfo(item.Id, probe.Size, probe.DirectUrl, uploadTime);
+                size = probe.Size;
+            }
+        }
+
+        CheckPath();
+        if (!MatchesSyncRootItem(path, diskId, parentId, item))
+            tree.PopulateDirectory(diskId, parentId, parent, [(item.Id, item.Name, item.IsFolder, size, item.UploadTime)], token);
+        if (!MatchesSyncRootItem(path, diskId, parentId, item))
+            throw new IOException($"无法建立“{item.Name}”的同步占位。");
+        if (size is { } exactSize)
+        {
+            var metadata = DragFilePreparation.ReadMetadata(path);
+            if (!metadata.IsReady && metadata.Size != exactSize
+                && (!Callbacks.IsHydrationQuiet(item.Id, 200)
+                    || !PlaceholderUpdater.TryGetPlaceholderDataState(path, out var state) || state.OnDiskDataSize != 0
+                    || state.InSyncState != Vanara.PInvoke.CldApi.CF_IN_SYNC_STATE.CF_IN_SYNC_STATE_IN_SYNC
+                    || !PlaceholderUpdater.TryUpdateFileSize(path, exactSize)))
+                throw new IOException($"无法安全校准“{item.Name}”的占位大小，已保留现有本地数据。");
+        }
+        CheckConnection();
+        if (item.IsFolder) cache.SetFolderLocalPath(diskId, item.Id, path);
+        else AllowLocalCache();
+        return path;
+
+        void AllowLocalCache()
+        {
+            CheckConnection();
+            if (!PlaceholderUpdater.TryAllowLocalCache(path))
+                throw new IOException($"无法设置“{item.Name}”的本地缓存状态，请稍后重试。");
+        }
+    }, token);
+
     internal static DirectoryPermission GetCachedDirectoryPermission(ulong diskId, ulong folderId)
         => _cache?.GetDirectoryPermission(CurrentUserKey(), diskId, folderId) ?? DirectoryPermission.Unknown;
 

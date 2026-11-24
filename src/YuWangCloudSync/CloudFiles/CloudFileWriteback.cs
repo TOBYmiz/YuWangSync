@@ -592,6 +592,15 @@ internal sealed class CloudFileWriteback : IDisposable
         }
     }
 
+    internal bool HasCurrentFailure(string path)
+    {
+        if (!_failedPaths.TryGetValue(path, out var failed)) return false;
+        var current = GetCurrentFingerprint(path);
+        return current != default && current == failed.Fingerprint
+            && PlaceholderUpdater.TryGetPlaceholderDataState(path, out var state)
+            && state.InSyncState == CF_IN_SYNC_STATE.CF_IN_SYNC_STATE_NOT_IN_SYNC;
+    }
+
     private void RecordFailure(string path, string reason, FileFingerprint fingerprint = default, int attempts = MaximumRetries)
     {
         if (fingerprint == default) fingerprint = GetCurrentFingerprint(path);

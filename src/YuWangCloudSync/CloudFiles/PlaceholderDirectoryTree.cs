@@ -66,6 +66,37 @@ public sealed class PlaceholderDirectoryTree
     public void EnsureDirectory(ulong disk, ulong folder, string path, CancellationToken ct = default)
         => EnsureDirectory(disk, folder, Path.GetFullPath(path), new HashSet<(ulong, ulong)>(), ct);
 
+    // The browser can know a folder before Explorer has populated any of its ancestors.
+    internal string EnsureDirectory(ulong disk, ulong folder, CancellationToken ct)
+        => EnsureDirectoryRoute(disk, folder, new HashSet<ulong>(), ct);
+
+    private string EnsureDirectoryRoute(ulong disk, ulong folder, HashSet<ulong> visiting, CancellationToken ct)
+    {
+        ct.ThrowIfCancellationRequested();
+        if (!visiting.Add(folder)) throw new IOException("缓存中的目录父子关系成环。");
+        var saved = _cache.GetFolderLocalPath(disk, folder);
+        if (saved is not null && Directory.Exists(saved))
+        {
+            EnsureDirectory(disk, folder, saved, ct);
+            return saved;
+        }
+        if (folder == 0)
+        {
+            var path = PrepareVirtualTree(ct).FirstOrDefault(d => d.diskId == disk).localPath;
+            return path ?? throw new DirectoryNotFoundException("磁盘占位尚未准备好。");
+        }
+        var route = _cache.GetFolderRoute(disk, folder)
+            ?? throw new DirectoryNotFoundException("同步目录的父级映射尚未准备好，请刷新后重试。");
+        var parent = EnsureDirectoryRoute(disk, route.Parent, visiting, ct);
+        var child = ChildPath(parent, route.Name);
+        if (Callbacks.IsWriteMutationPending(child)) throw new IOException("同步目录正在移动，请稍后重试。");
+        if (!Directory.Exists(child)) PlaceholderCreator.CreateBatch(parent, disk, route.Parent,
+            [(folder, route.Name, true, null, null)]);
+        RequireIdentity(child, new FileIdentity(disk, route.Parent, folder, 0));
+        _cache.SetFolderLocalPath(disk, folder, child);
+        return child;
+    }
+
     public List<(ulong diskId, string localPath)> PrepareCachedTree(CancellationToken ct = default)
     {
         var disks = PrepareVirtualTree(ct);
@@ -147,7 +178,7 @@ public sealed class PlaceholderDirectoryTree
         return count;
     }
 
-    private string ChildPath(string parent, string name)
+    internal string ChildPath(string parent, string name)
     {
         if (string.IsNullOrWhiteSpace(name) || name is "." or ".." || Path.GetFileName(name) != name
             || name.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0)
