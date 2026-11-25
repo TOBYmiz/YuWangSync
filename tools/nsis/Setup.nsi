@@ -511,7 +511,8 @@ FunctionEnd
 Function .onInstSuccess
   ${If} $QuickUpdateRequested == "1"
   ${AndIf} $IsInstalled == "1"
-    ExecShell "open" "$INSTDIR\${PRODUCT_IDENTIFIER}.exe" "--cleanup-update-temp -about"
+    Push "--cleanup-update-temp -about"
+    Call LaunchAppViaTask
   ${EndIf}
 FunctionEnd
 
@@ -1321,7 +1322,8 @@ Function FinishPageLeave
       ; The remaining pending file operations finish at the next logoff/reboot; do not let MUI reboot now.
       SetRebootFlag false
       ; Upgrades stopped the running app, and the reboot prompt replaced the launch checkbox.
-      ExecShell "open" "$INSTDIR\${PRODUCT_IDENTIFIER}.exe"
+      Push ""
+      Call LaunchAppViaTask
     ${EndIf}
   ${EndIf}
 FunctionEnd
@@ -1492,13 +1494,56 @@ Function FinishPageShow
   EnableWindow $mui.FinishPage.ShowReadme 1
 FunctionEnd
 
+; Launch the app through a one-shot scheduled task in the interactive user's context,
+; same as RestartExplorerNow, so it gets the user's standard token under UAC instead of
+; inheriting the elevated installer token. Falls back to ExecShell if the task fails.
+; Usage: Push "<arguments>" ; Call LaunchAppViaTask
+Function LaunchAppViaTask
+  Exch $1
+  Push $0
+  Push $2
+  StrCpy $2 "0"
+  Call GetExplorerInteractiveUser
+  ${If} $ExplorerInteractiveUser == ""
+    DetailPrint "无法确定交互用户，直接启动程序。"
+  ${Else}
+    DetailPrint "正在创建程序启动计划任务…"
+    ${If} $1 == ""
+      nsExec::ExecToLog '"$SYSDIR\schtasks.exe" /create /tn "TempLaunch${PRODUCT_IDENTIFIER}" /tr "\"$INSTDIR\${PRODUCT_IDENTIFIER}.exe\"" /sc once /st 00:00 /ru "$ExplorerInteractiveUser" /it /f'
+    ${Else}
+      nsExec::ExecToLog '"$SYSDIR\schtasks.exe" /create /tn "TempLaunch${PRODUCT_IDENTIFIER}" /tr "\"$INSTDIR\${PRODUCT_IDENTIFIER}.exe\" $1" /sc once /st 00:00 /ru "$ExplorerInteractiveUser" /it /f'
+    ${EndIf}
+    Pop $0
+    DetailPrint "程序启动任务 /create 返回码：$0"
+    ${If} $0 == "0"
+      nsExec::ExecToLog '"$SYSDIR\schtasks.exe" /run /tn "TempLaunch${PRODUCT_IDENTIFIER}"'
+      Pop $0
+      DetailPrint "程序启动任务 /run 返回码：$0"
+      ${If} $0 == "0"
+        StrCpy $2 "1"
+      ${EndIf}
+    ${EndIf}
+    nsExec::ExecToLog '"$SYSDIR\schtasks.exe" /delete /tn "TempLaunch${PRODUCT_IDENTIFIER}" /f'
+    Pop $0
+    DetailPrint "程序启动任务 /delete 返回码：$0"
+  ${EndIf}
+  ${If} $2 != "1"
+    DetailPrint "计划任务启动失败，改为直接启动程序。"
+    ExecShell "open" "$INSTDIR\${PRODUCT_IDENTIFIER}.exe" "$1"
+  ${EndIf}
+  Pop $2
+  Pop $0
+  Pop $1
+FunctionEnd
+
 Function LaunchAppOnFinish
   SendMessage $mui.FinishPage.ShowReadme ${BM_GETCHECK} 0 0 $R0
   ${If} $R0 == ${BST_CHECKED}
-    ExecShell "open" "$INSTDIR\${PRODUCT_IDENTIFIER}.exe" "--open-sync-folder"
+    Push "--open-sync-folder"
   ${Else}
-    ExecShell "open" "$INSTDIR\${PRODUCT_IDENTIFIER}.exe"
+    Push ""
   ${EndIf}
+  Call LaunchAppViaTask
 FunctionEnd
 
 Function FinishPageLaunchClicked
