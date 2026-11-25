@@ -2238,6 +2238,18 @@ Section "Install"
     IfFileExists "$INSTDIR\${PRODUCT_IDENTIFIER}.exe" 0 install_stop_done
     ExecWait '"$INSTDIR\${PRODUCT_IDENTIFIER}.exe" --stop' $R9
     ${If} $R9 != 0
+      ; Versions up to 1.0.2.2 cannot stop the tray from an elevated --stop (pipe owner check
+      ; mismatches the elevated token). Retry with this package's fixed executable.
+      DetailPrint "旧版程序停止失败（返回值：$R9），使用新版程序重试…"
+      SetOutPath "$PLUGINSDIR\syncroot-recovery"
+      ${If} $SyncRootRecoveryPayloadExtracted != "1"
+        File /r "${APP_PAYLOAD_DIRECTORY}\*"
+        StrCpy $SyncRootRecoveryPayloadExtracted "1"
+      ${EndIf}
+      SetOutPath "$PLUGINSDIR"
+      ExecWait '"$PLUGINSDIR\syncroot-recovery\${PRODUCT_IDENTIFIER}.exe" --stop' $R9
+    ${EndIf}
+    ${If} $R9 != 0
       MessageBox MB_OK|MB_ICONSTOP "进程未能安全退出，请手动退出程序后重试。"
       SetErrorLevel 1
       Abort
@@ -2318,11 +2330,17 @@ install_shell_file_done:
     ${EndIf}
   ${EndIf}
 
-  ${If} $IsInstalled != "1"
-    nsExec::ExecToStack /TIMEOUT=30000 '"$SYSDIR\schtasks.exe" /Create /TN "${PRODUCT_IDENTIFIER}-$UserSid" /SC ONLOGON /TR "\"$INSTDIR\${PRODUCT_IDENTIFIER}.exe\"" /F'
+  ; Always (re)write the task so upgrades also downgrade legacy HIGHEST tasks to LIMITED.
+  ; .onInit guarantees an upgrade runs as the original installing user ($UserSid).
+  ${If} $UserSid != ""
+    nsExec::ExecToStack /TIMEOUT=30000 '"$SYSDIR\schtasks.exe" /Create /TN "${PRODUCT_IDENTIFIER}-$UserSid" /SC ONLOGON /TR "\"$INSTDIR\${PRODUCT_IDENTIFIER}.exe\"" /RL LIMITED /F'
     Pop $R9
     Pop $R8
     ${If} $R9 != "0"
+    ${AndIf} $IsInstalled == "1"
+      ; Upgrade keeps the existing task; the app itself relaunches with Explorer's normal token.
+      DetailPrint "更新开机任务权限失败（保留原任务），schtasks.exe 返回值：$R9 $R8"
+    ${ElseIf} $R9 != "0"
       DetailPrint "创建开机任务失败，schtasks.exe 返回值：$R9"
       ${If} $R8 != ""
         DetailPrint "schtasks.exe 输出：$R8"

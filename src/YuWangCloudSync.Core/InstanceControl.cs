@@ -1,13 +1,48 @@
 using System.Diagnostics;
 using System.IO.Pipes;
+using System.Security.AccessControl;
 using System.Security.Principal;
 
 namespace YuWangCloudSync.Core;
 
 public static class InstanceControl
 {
-    private static string PipeName => ProductIdentity.ShutdownPipePrefix + WindowsIdentity.GetCurrent().User!.Value
+    private static string PipeName => ProductIdentity.ShutdownPipePrefix + CurrentUserSid.Value
         + "." + Process.GetCurrentProcess().SessionId;
+
+    // PipeOptions.CurrentUserOnly compares WindowsIdentity.Owner, which is BUILTIN\Administrators
+    // for an elevated admin token but the user SID for the normal tray process. The elevated
+    // installer/uninstaller then fails with UnauthorizedAccessException while sending --stop.
+    // Both sides therefore use the token user SID explicitly.
+    private static SecurityIdentifier CurrentUserSid
+    {
+        get
+        {
+            using var identity = WindowsIdentity.GetCurrent();
+            return identity.User!;
+        }
+    }
+
+    private static NamedPipeServerStream CreateServer()
+    {
+        var user = CurrentUserSid;
+        var security = new PipeSecurity();
+        security.AddAccessRule(new PipeAccessRule(user, PipeAccessRights.ReadWrite, AccessControlType.Allow));
+        security.SetOwner(user);
+        return NamedPipeServerStreamAcl.Create(PipeName, PipeDirection.InOut, 1,
+            PipeTransmissionMode.Byte, PipeOptions.Asynchronous, 0, 0, security);
+    }
+
+    private static NamedPipeClientStream CreateClient()
+        => new(".", PipeName, PipeDirection.InOut, PipeOptions.Asynchronous);
+
+    /// <summary>Reject a pipe squatted by another account; elevation of the same user is allowed.</summary>
+    private static void ValidateServerOwner(NamedPipeClientStream client)
+    {
+        var owner = client.GetAccessControl().GetOwner(typeof(SecurityIdentifier));
+        if (owner is null || !owner.Equals(CurrentUserSid))
+            throw new UnauthorizedAccessException("同步进程控制管道不属于当前用户。");
+    }
 
     public static async Task ListenAsync(Action stop, CancellationToken cancellationToken)
         => await ListenAsync(command => string.Equals(command, "stop", StringComparison.Ordinal)
@@ -20,8 +55,7 @@ public static class InstanceControl
         {
             try
             {
-                using var server = new NamedPipeServerStream(PipeName, PipeDirection.InOut, 1,
-                    PipeTransmissionMode.Byte, PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly);
+                using var server = CreateServer();
                 await server.WaitForConnectionAsync(cancellationToken);
                 using var reader = new StreamReader(server, leaveOpen: true);
                 using var writer = new StreamWriter(server, leaveOpen: true) { AutoFlush = true };
@@ -51,9 +85,9 @@ public static class InstanceControl
     {
         try
         {
-            using var client = new NamedPipeClientStream(".", PipeName, PipeDirection.InOut,
-                PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly);
+            using var client = CreateClient();
             client.Connect(timeoutMilliseconds);
+            ValidateServerOwner(client);
             using var deadline = new CancellationTokenSource(TimeSpan.FromMilliseconds(timeoutMilliseconds * 2));
             using var writer = new StreamWriter(client, leaveOpen: true) { AutoFlush = true };
             using var reader = new StreamReader(client, leaveOpen: true);
@@ -69,14 +103,14 @@ public static class InstanceControl
 
     public static async Task StopAsync()
     {
-        using var client = new NamedPipeClientStream(".", PipeName, PipeDirection.InOut,
-            PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly);
+        using var client = CreateClient();
         try { await client.ConnectAsync(2000); }
         catch (TimeoutException)
         {
             if (IsRunning()) throw new IOException("同步进程未响应停止命令，请重启应用后重试。");
             return;
         }
+        ValidateServerOwner(client);
         using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(60));
         using var writer = new StreamWriter(client, leaveOpen: true) { AutoFlush = true };
         using var reader = new StreamReader(client, leaveOpen: true);
