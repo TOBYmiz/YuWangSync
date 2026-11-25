@@ -9,7 +9,7 @@
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\..\src\YuWangCloudSync.Core\YuWangCloudSync.Core.csproj" />
-    <PackageReference Include="Serilog" Version="4.0.1" />
+    <PackageReference Include="Serilog" />
     <Compile Include="..\..\src\YuWangCloudSync\Tray\MainWindowState.cs" Link="MainWindowState.cs" />
   </ItemGroup>
 </Project>

@@ -65,23 +65,23 @@
   </Target>
 
   <ItemGroup>
-    <PackageReference Include="Microsoft.WindowsAppSDK" Version="2.5.1" />
+    <PackageReference Include="Microsoft.WindowsAppSDK" />
     <!-- Cloud Files API 绑定（按 cldapi.dll 命名，最新稳定版 5.0.7）-->
-    <PackageReference Include="Vanara.PInvoke.CldApi" Version="5.0.7" />
+    <PackageReference Include="Vanara.PInvoke.CldApi" />
     <!-- SQLite 元数据缓存 -->
-    <PackageReference Include="Microsoft.Data.Sqlite" Version="8.0.8" />
+    <PackageReference Include="Microsoft.Data.Sqlite" />
     <!-- Override the transitive 2.1.6 bundle so the native SQLite library and
          managed provider stay aligned beyond GHSA-2m69-gcr7-jv3q's affected range. -->
-    <PackageReference Include="SQLitePCLRaw.bundle_e_sqlite3" Version="2.1.14" />
+    <PackageReference Include="SQLitePCLRaw.bundle_e_sqlite3" />
     <!-- 日志 -->
-    <PackageReference Include="Serilog" Version="4.0.1" />
-    <PackageReference Include="Serilog.Sinks.Console" Version="6.0.0" />
-    <PackageReference Include="Serilog.Sinks.File" Version="6.0.0" />
+    <PackageReference Include="Serilog" />
+    <PackageReference Include="Serilog.Sinks.Console" />
+    <PackageReference Include="Serilog.Sinks.File" />
     <!-- 原生 Win32 托盘和 PopupMenu，继续与 WinUI STA 消息泵共用线程。 -->
-    <PackageReference Include="H.NotifyIcon" Version="2.3.2" />
+    <PackageReference Include="H.NotifyIcon" />
     <!-- 本程序只使用原生托盘和 PopupMenu，不使用 H.NotifyIcon 的图标生成 API。
          该传递包会带入 System.Drawing.Common；完全排除其传递资产，避免引入未使用的依赖。 -->
-    <PackageReference Include="H.GeneratedIcons.System.Drawing" Version="2.3.2"
+    <PackageReference Include="H.GeneratedIcons.System.Drawing"
                       ExcludeAssets="all" PrivateAssets="all" />
   </ItemGroup>
   <!-- TestRsa（RSA 加密验证用的临时子项目）已删除：结论已并入 Crypto/，无需保留 -->

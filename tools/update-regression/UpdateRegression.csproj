@@ -10,7 +10,7 @@
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\..\src\YuWangCloudSync.Core\YuWangCloudSync.Core.csproj" />
-    <PackageReference Include="Serilog" Version="4.0.1" />
+    <PackageReference Include="Serilog" />
     <Compile Include="..\..\src\YuWangCloudSync\Updates\GitHubReleaseClient.cs" Link="GitHubReleaseClient.cs" />
     <Compile Include="..\..\src\YuWangCloudSync\Updates\UpdateSchedule.cs" Link="UpdateSchedule.cs" />
     <Compile Include="..\..\src\YuWangCloudSync\Updates\UpdateStateStore.cs" Link="UpdateStateStore.cs" />

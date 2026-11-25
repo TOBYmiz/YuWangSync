@@ -1,0 +1,21 @@
+<Project>
+  <!-- Central Package Management: every PackageReference version is declared here only.
+       Applies to src/ and tools/ projects. -->
+  <PropertyGroup>
+    <ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>
+    <!-- Pin the CsWinRT Windows SDK projection instead of following the SDK's bundled default
+         (10.0.19041.57 is what SDK 10.0.401 selects for net10.0-windows10.0.19041.0). -->
+    <WindowsSdkPackageVersion>10.0.19041.57</WindowsSdkPackageVersion>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageVersion Include="H.GeneratedIcons.System.Drawing" Version="2.3.2" />
+    <PackageVersion Include="H.NotifyIcon" Version="2.3.2" />
+    <PackageVersion Include="Microsoft.Data.Sqlite" Version="8.0.8" />
+    <PackageVersion Include="Microsoft.WindowsAppSDK" Version="2.5.1" />
+    <PackageVersion Include="Serilog" Version="4.0.1" />
+    <PackageVersion Include="Serilog.Sinks.Console" Version="6.0.0" />
+    <PackageVersion Include="Serilog.Sinks.File" Version="6.0.0" />
+    <PackageVersion Include="SQLitePCLRaw.bundle_e_sqlite3" Version="2.1.14" />
+    <PackageVersion Include="Vanara.PInvoke.CldApi" Version="5.0.7" />
+  </ItemGroup>
+</Project>
