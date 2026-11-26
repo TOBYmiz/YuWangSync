@@ -34,7 +34,7 @@ internal sealed partial class MainWindow
         // A directory's own attributes do not tell us whether its descendants are available offline.
         if (item.IsFolder) return;
         var version = _fileRenderVersion;
-        var cell = new Border { Width = 16, Height = 16, HorizontalAlignment = HorizontalAlignment.Left,
+        var cell = new Border { Width = 16, Height = 16, HorizontalAlignment = HorizontalAlignment.Center,
             VerticalAlignment = VerticalAlignment.Center };
         var entry = (item, cell);
         cell.Loaded += (_, _) => { if (version == _fileRenderVersion) _availabilityRows.Add(entry); };

@@ -27,7 +27,7 @@ internal sealed partial class MainWindow
         Height = CollapsedFavoritesHeight,
         HorizontalAlignment = HorizontalAlignment.Stretch,
         HorizontalContentAlignment = HorizontalAlignment.Stretch,
-        Padding = new Thickness(10, 0, 4, 0),
+        Padding = new Thickness(SidebarInset, 0, 4, 0),
     };
     private readonly Button _favoriteCurrent = NewIconButton("\uE109", "收藏当前文件夹", 14);
     private readonly ResizeGrip _favoritesGrip = new(InputSystemCursorShape.SizeNorthSouth)
@@ -333,7 +333,7 @@ internal sealed partial class MainWindow
                 Style = WinUiUiHost.GetStyleResource("SubtleButtonStyle"),
                 HorizontalAlignment = HorizontalAlignment.Stretch,
                 HorizontalContentAlignment = HorizontalAlignment.Stretch,
-                Padding = new Thickness(10, 6, 10, 6),
+                Padding = new Thickness(SidebarInset, 6, SidebarInset, 6),
                 Foreground = WinUiUiHost.GetBrushResource(unavailable
                     ? "TextFillColorSecondaryBrush" : "TextFillColorPrimaryBrush"),
             };

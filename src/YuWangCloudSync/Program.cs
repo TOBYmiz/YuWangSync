@@ -1146,19 +1146,39 @@ internal static class Program
                 if (!string.IsNullOrWhiteSpace(registeredProviderName))
                 {
                     var configuredProviderName = _ctx.ProviderName;
-                    _ctx.ProviderName = registeredProviderName!;
-                    try { SaveConfig(); }
-                    catch (Exception ex)
+                    // Some older update paths leave the product identifier as the registered
+                    // ProviderName. Keep the persisted setting in that case so an upgrade does
+                    // not replace a user's existing SyncRoot name with "YuWangCloudSync".
+                    var registeredNameIsLegacyProductLabel = string.Equals(
+                        registeredProviderName.Trim(), ProductIdentity.DisplayNameEn,
+                        StringComparison.OrdinalIgnoreCase);
+                    var preserveConfiguredName = registeredNameIsLegacyProductLabel
+                        && !string.IsNullOrWhiteSpace(configuredProviderName)
+                        && !string.Equals(configuredProviderName, registeredProviderName,
+                            StringComparison.OrdinalIgnoreCase);
+
+                    if (!preserveConfiguredName)
                     {
-                        Log.Warning(ex, "保存继承的 SyncRoot Provider 名称失败，将在本次运行中继续使用：{Name}", registeredProviderName);
+                        _ctx.ProviderName = registeredProviderName;
+                        try { SaveConfig(); }
+                        catch (Exception ex)
+                        {
+                            Log.Warning(ex, "保存继承的 SyncRoot Provider 名称失败，将在本次运行中继续使用：{Name}", registeredProviderName);
+                        }
+                    }
+                    else
+                    {
+                        Log.Information("已注册 SyncRoot 名称为旧产品标识 {RegisteredName}，保留配置名称：{ConfiguredName}",
+                            registeredProviderName, configuredProviderName);
                     }
 
-                    if (!string.Equals(configuredProviderName, registeredProviderName, StringComparison.Ordinal))
+                    if (!string.Equals(_ctx.ProviderName, registeredProviderName, StringComparison.Ordinal))
                     {
                         try
                         {
-                            // 已注册根的显示名属于可自定义设置，接管时沿用系统记录的原值。
-                            // 占位和水化内容保持原样。
+                            // SyncRoot name metadata can be refreshed without touching placeholders
+                            // or hydrated content. For a legacy product label, restore the name from
+                            // the persisted configuration; otherwise inherit the registered custom name.
                             SyncRootRegistrar.Register(_ctx.SyncRootPath, _ctx.ProviderName,
                                 _ctx.RootContainerTypeId, update: true);
                         }
@@ -1166,11 +1186,12 @@ internal static class Program
                         {
                             // 元数据更新失败不应阻止对同一稳定身份的根目录继续连接；后续启动仍可重试。
                             Log.Warning(ex, "更新现有 SyncRoot Provider 元数据失败，将继续连接：{OldName} → {NewName}",
-                                configuredProviderName, _ctx.ProviderName);
+                                registeredProviderName, _ctx.ProviderName);
                         }
                     }
 
-                    Log.Information("已继承现有 SyncRoot Provider 名称：{Name}", _ctx.ProviderName);
+                    if (!preserveConfiguredName)
+                        Log.Information("已继承现有 SyncRoot Provider 名称：{Name}", _ctx.ProviderName);
                 }
             }
             // 已有注册的策略也需要随应用升级刷新（例如渐进水化和自动脱水策略）。

@@ -29,15 +29,22 @@ SilentInstall silent
 OutFile "@@OUTPUT@@"
 !include "LogicLib.nsh"
 Var ExplorerInteractiveUser
+Var ExplorerRestartStarted
 @@FUNCTIONS@@
 !insertmacro DEFINE_EXPLORER_RESTART_FUNCTIONS ""
 !insertmacro DEFINE_EXPLORER_RESTART_FUNCTIONS "un."
 Section
   Call RestartExplorerNow
+  FileOpen $0 "$EXEDIR\restart-started.txt" w
+  FileWrite $0 "$ExplorerRestartStarted"
+  FileClose $0
   WriteUninstaller "$EXEDIR\UninstallFixture.exe"
 SectionEnd
 Section "Uninstall"
   Call un.RestartExplorerNow
+  FileOpen $0 "$EXEDIR\restart-started.txt" w
+  FileWrite $0 "$ExplorerRestartStarted"
+  FileClose $0
 SectionEnd
 '@
     $executable = Join-Path $testRoot 'RestartFixture.exe'
@@ -63,6 +70,10 @@ SectionEnd
             $process = Start-Process -FilePath $target -ArgumentList $arguments -PassThru -WindowStyle Hidden
             if (-not $process.WaitForExit(30000)) { throw 'Restart fixture timed out.' }
             if ($process.ExitCode -ne 0) { throw "Fixture exited with $($process.ExitCode)." }
+            $expectedStarted = if ($scenario.Create -eq 0 -and $scenario.Run -eq 0) { '1' } else { '0' }
+            if ([IO.File]::ReadAllText((Join-Path $testRoot 'restart-started.txt')) -ne $expectedStarted) {
+                throw 'Incorrect Explorer restart-started state.'
+            }
             $commands = [Collections.Generic.List[object]]::new()
             foreach ($line in [IO.File]::ReadAllLines($env:EXPLORER_RESTART_TEST_LOG)) {
                 $commands.Add((ConvertFrom-Json -InputObject $line))

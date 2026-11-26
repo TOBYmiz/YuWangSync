@@ -1,6 +1,7 @@
 using System.Globalization;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
+using Microsoft.UI.Xaml.Input;
 using Microsoft.UI.Xaml.Media;
 using Microsoft.UI.Xaml.Media.Imaging;
 using Microsoft.UI.Input;
@@ -230,6 +231,7 @@ internal sealed partial class MainWindow
 
     private void CheckDragIntent()
     {
+        if (NativeFileDrag.IsTouchContactActive) return; // Touch drags start from OnTouchDragItemsStarting.
         if (_dragSourceRow is not { Tag: YuWangItem item } row || !NativeFileDrag.IsLeftButtonDown
             || NativeFileDrag.IsEscapeDown || _isClosed || _busyNow || _currentFolder is null)
         { _dragIntentTimer.Stop(); _dragSourceRow = null; return; }
@@ -240,6 +242,196 @@ internal sealed partial class MainWindow
         var items = row.IsSelected ? SelectedEntries().ToArray() : [item];
         RunUi(() => StartVirtualDragAsync(_currentFolder, items, row));
     }
+
+    #region Touch and pen
+
+    private Pointer? _touchPointer;
+    private Pointer? _touchCapturePointer;
+    private bool _touchCaptureLost;
+    private long _touchLastCaptureAttempt;
+    private bool _touchXamlMotionReported;
+    private bool? _touchOutsideWindow;
+    private long _touchLastPositionLog;
+
+    private static bool IsContactPointer(Pointer pointer) => pointer.PointerDeviceType != PointerDeviceType.Mouse;
+
+    private (int X, int Y) ToScreenPixels(PointerRoutedEventArgs args)
+    {
+        var position = args.GetCurrentPoint(null).Position;
+        var window = WinRT.Interop.WindowNative.GetWindowHandle(this);
+        var scale = TouchGetDpiForWindow(window) / 96d;
+        return NativeFileDrag.ClientToScreen(window, position.X * scale, position.Y * scale);
+    }
+
+    [System.Runtime.InteropServices.DllImport("user32.dll", EntryPoint = "GetDpiForWindow")]
+    private static extern uint TouchGetDpiForWindow(nint window);
+
+    private void BeginTouchContact(PointerRoutedEventArgs args)
+    {
+        _touchPointer = args.Pointer;
+        var state = TouchPointerHook.BindXamlPointer(args.Pointer.PointerId, out var nativePosition, out var detail);
+        var position = state == PointerContact.InContact ? nativePosition : ToScreenPixels(args);
+        NativeFileDrag.BeginTouchContact(position);
+        ReportDragDiagnostic($"Touch contact bound; pointer={args.Pointer.PointerId}; native={state}; {detail}; position={position}");
+    }
+
+    /// <summary>Mirrors the touch contact for OLE; returns true when the move belongs to it.</summary>
+    private bool TrackTouchContact(PointerRoutedEventArgs args)
+    {
+        if (_touchPointer is null || args.Pointer.PointerId != _touchPointer.PointerId) return false;
+        // OLE hit-tests drop targets at the cursor, which touch does not move.
+        if (!_touchPollOwnsContact)
+        {
+            var hasPointerPosition = TouchPointerHook.TryGetPosition(args.Pointer.PointerId, out var pointerPosition, out _);
+            var position = hasPointerPosition ? pointerPosition : ToScreenPixels(args);
+            NativeFileDrag.MoveTouchContact(position, moveCursor: _touchDragging);
+            if (_touchDragging) ReportTouchPosition(position, hasPointerPosition ? "current pointer sample" : "XAML/DPI fallback");
+            if (_touchDragging && !_touchXamlMotionReported)
+            {
+                _touchXamlMotionReported = true;
+                ReportDragDiagnostic($"Touch contact tracked by captured XAML pointer; at={position}");
+            }
+        }
+        return true;
+    }
+
+    private void ReleaseTouchPointerCapture()
+    {
+        if (_touchCapturePointer is not { } pointer) return;
+        _root.ReleasePointerCapture(pointer);
+        _items.ReleasePointerCapture(pointer);
+        _touchCapturePointer = null;
+        _touchCaptureLost = false;
+    }
+
+    private void OnTouchPointerCaptureLost(object sender, PointerRoutedEventArgs args)
+    {
+        if (!_touchDragging || _touchPointer is not { } pointer || args.Pointer.PointerId != pointer.PointerId) return;
+        _touchCapturePointer = null;
+        _touchCaptureLost = true;
+        _touchLastCaptureAttempt = 0;
+        ReportDragDiagnostic($"Touch pointer capture lost; pointer={pointer.PointerId}; sender={sender?.GetType().Name}");
+    }
+
+    private void RestoreTouchPointerCapture(Pointer pointer)
+    {
+        var captured = _root.CapturePointer(pointer);
+        var target = captured ? "window root" : "unavailable";
+        if (!captured && _items.CapturePointer(pointer))
+        {
+            captured = true;
+            target = "file list";
+        }
+        _touchCapturePointer = captured ? pointer : null;
+        _touchCaptureLost = !captured;
+        _touchLastCaptureAttempt = Environment.TickCount64;
+        ReportDragDiagnostic($"Touch pointer capture {(captured ? "restored" : "restore failed")}; pointer={pointer.PointerId}; target={target}");
+    }
+
+    private void EndTouchContact(Pointer pointer)
+    {
+        if (_touchPointer is null || pointer.PointerId != _touchPointer.PointerId) return;
+        _touchPointer = null;
+        _touchDragTracker.Stop();
+        ReleaseTouchPointerCapture();
+        if (!_touchDragging) { NativeFileDrag.ClearTouchContact(); return; }
+        ReportDragDiagnostic($"Touch contact {pointer.PointerId} released (pointer event)");
+        NativeFileDrag.EndTouchContact(); // Released: OLE drops; before OLE the drag cancels, as with a mouse.
+    }
+
+    // Capture on the window root keeps XAML updates and lift routed back to this window after the
+    // finger leaves the file list. The native hook is an additional source when WinUI's XAML capture
+    // does not expose a contact update; native tracking must not be required to start the drag.
+    private readonly DispatcherTimer _touchDragTracker = new() { Interval = TimeSpan.FromMilliseconds(8) };
+    private bool _touchDragging, _touchPollOwnsContact;
+    private PointerContact? _touchPollState;
+
+    private void ReportTouchWindowBoundary((int X, int Y) position)
+    {
+        var outside = TouchPointerHook.IsOutsideWindow(position);
+        if (_touchOutsideWindow == outside) return;
+        _touchOutsideWindow = outside;
+        ReportDragDiagnostic($"Touch contact window boundary; outside={outside}; at={position}");
+    }
+
+    private void ReportTouchPosition((int X, int Y) position, string source)
+    {
+        ReportTouchWindowBoundary(position);
+        var now = Environment.TickCount64;
+        if (now - _touchLastPositionLog < 500) return;
+        _touchLastPositionLog = now;
+        ReportDragDiagnostic($"Touch contact position; source={source}; at={position}; outside={_touchOutsideWindow}");
+    }
+
+    private void PollTouchDragContact()
+    {
+        if (_touchPointer is not { } pointer) { _touchDragTracker.Stop(); return; }
+        var state = TouchPointerHook.Read(out var position, out var detail);
+        if (state != _touchPollState)
+        {
+            _touchPollState = state;
+            ReportDragDiagnostic($"Touch contact {pointer.PointerId}: native={state}; {detail}; xamlCapture={_touchCapturePointer is not null}; nativeOwned={_touchPollOwnsContact}");
+        }
+        if (state == PointerContact.InContact)
+        {
+            _touchPollOwnsContact = true;
+            if (_touchCaptureLost && Environment.TickCount64 - _touchLastCaptureAttempt >= 50)
+                RestoreTouchPointerCapture(pointer);
+            ReportTouchPosition(position, "current pointer sample");
+            NativeFileDrag.MoveTouchContact(position, moveCursor: true);
+        }
+        else if (_touchPollOwnsContact)
+        {
+            _touchDragTracker.Stop();
+            _touchPointer = null;
+            ReleaseTouchPointerCapture();
+            NativeFileDrag.EndTouchContact();
+        }
+    }
+
+    private void StopTouchDragTracking()
+    {
+        _touchDragTracker.Stop();
+        TouchPointerHook.Stop();
+        ReleaseTouchPointerCapture();
+        _touchDragging = _touchPollOwnsContact = false;
+        _touchCaptureLost = false;
+        _touchLastCaptureAttempt = 0;
+        _touchXamlMotionReported = false;
+        _touchOutsideWindow = null;
+        _touchLastPositionLog = 0;
+        _touchPollState = null;
+        _touchPointer = null;
+        NativeFileDrag.ClearTouchContact();
+    }
+
+    // The list recognised a touch/pen drag gesture (hold, or swipe across the scroll direction).
+    // Its WinUI drag cannot carry virtual files, so hand the gesture to the OLE path instead.
+    private void OnTouchDragItemsStarting(object sender, DragItemsStartingEventArgs args)
+    {
+        args.Cancel = true;
+        if (_touchPointer is not { } pointer || !NativeFileDrag.IsTouchContactActive || !NativeFileDrag.IsLeftButtonDown
+            || _dragSourceRow is not { Tag: YuWangItem item } row || _isClosed || _busyNow || _currentFolder is null)
+            return;
+        _dragSourceRow = null;
+        _itemMenu.Hide();
+        _touchDragging = true; _touchPollOwnsContact = false; _touchPollState = null;
+        _touchCaptureLost = false;
+        RestoreTouchPointerCapture(pointer);
+        _touchXamlMotionReported = false;
+        _touchOutsideWindow = null;
+        _touchLastPositionLog = 0;
+        NativeFileDrag.EnableTouchDragBridge();
+        NativeFileDrag.MoveTouchContact(NativeFileDrag.CursorPosition, moveCursor: true);
+        ReportDragDiagnostic($"Touch drag recognised; pointer={pointer.PointerId}; device={pointer.PointerDeviceType}; capture={(_touchCapturePointer is null ? "unavailable" : "window root or file list")}");
+        _touchDragTracker.Start();
+        PollTouchDragContact();
+        if (!row.IsSelected) SelectDragSource(row);
+        var items = row.IsSelected ? SelectedEntries().ToArray() : [item];
+        RunUi(() => StartVirtualDragAsync(_currentFolder, items, row));
+    }
+
+    #endregion
 
     private async Task<DragItemVisual?> CaptureDragItemAsync(ListViewItem row)
     {
@@ -326,9 +518,16 @@ internal sealed partial class MainWindow
             using var data = new VirtualFileDataObject(manifest.Entries, cancellation.Token);
             ReportDragDiagnostic($"Entering virtual file drag; descriptors={manifest.Entries.Count}; no hydration started");
             enteredOle = true;
-            _items.ReleasePointerCaptures(); NativeFileDrag.ReleaseMouseCapture();
-            var copied = await NativeFileDrag.DropVirtualAsync(data, visual,
-                () => !cancellation.IsCancellationRequested && _dragBackendAvailable() && !data.HasFailure, ReportDragDiagnostic);
+            if (!_touchDragging)
+            {
+                _items.ReleasePointerCaptures();
+                NativeFileDrag.ReleaseMouseCapture();
+            }
+            var canContinue = () => !cancellation.IsCancellationRequested && _dragBackendAvailable() && !data.HasFailure;
+            // Keep the UI dispatcher available for PointerReleased after the finger leaves
+            // the source window. The worker's OLE loop receives the mirrored touch through
+            // OleMouseInput, while the source window retains touch pointer capture.
+            var copied = await NativeFileDrag.DropVirtualAsync(data, visual, canContinue, ReportDragDiagnostic);
             ReportDragDiagnostic($"OLE returned; copied={copied}; async extraction={data.InAsyncOperation}; streams={data.OpenStreams}; ended={data.OperationEnded.IsCompleted}");
             if (copied)
             {
@@ -363,6 +562,7 @@ internal sealed partial class MainWindow
             cancellation.Cancel(); session.TrySetResult(); monitor.Stop(); metadataPreview?.Dispose(); StopDragPreparationProgress();
             metadataCancellation?.Cancel(); metadataCancellation?.Dispose(); _dragCancellation = null;
             _outboundDragActive = _busyNow = false;
+            StopTouchDragTracking();
             if (!_isClosed)
             {
                 UpdateCommandStates(); QueueDragPreparation();

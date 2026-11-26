@@ -1,4 +1,4 @@
-﻿using System.Diagnostics;
+using System.Diagnostics;
 using System.Security.Cryptography;
 using Microsoft.UI.Input;
 using Microsoft.UI.Text;
@@ -10,9 +10,11 @@ using Microsoft.UI.Xaml.Media;
 using Microsoft.UI.Xaml.Media.Animation;
 using Microsoft.UI.Xaml.Media.Imaging;
 using Windows.ApplicationModel.DataTransfer;
+using Windows.Graphics.Imaging;
 using Windows.Storage;
 using Windows.Storage.FileProperties;
 using Windows.Storage.Pickers;
+using Windows.Storage.Streams;
 using Windows.System;
 using WinRT.Interop;
 using YuWangCloudSync.CloudFiles;
@@ -98,14 +100,22 @@ internal sealed partial class MainWindow : Window
     private const double MaximumSidebarWidth = 480;
     private const double MinimumContentWidth = 560;
     private const double SidebarGripWidth = 8;
+    private const double SurfaceInset = 16;
+    private const double SidebarInset = 12;
+    private const double ToolbarTopPadding = 10;
+    private const double ToolbarBottomPadding = 4;
+    private const double ToolbarControlHeight = 32;
+    private const double FooterMinHeight = 44;
     private const double ListHorizontalMargin = 8;
     private const double ItemContentLeftPadding = 16;
-    private const double ItemContentRightPadding = 12;
-    private const double MultiSelectContentOffset = 32;
+    private const double ItemContentRightPadding = 8;
+    // The ListViewItem presenter shifts its content by 28 DIP when it shows a checkbox.
+    private const double MultiSelectContentOffset = 28;
+    private const double FileColumnSpacing = 12;
+    private const double FileNameIconSpacing = 12;
     private const string RootGlyph = "\uE753";
     private const string FolderGlyph = "\uE8B7";
     private const string FileGlyph = "\uE8A5";
-    private const double StatusBarContentHeight = 22;
     private const double TransferGaugeWidth = 140;
     private const double CompactStatusWidth = 620;
 
@@ -195,9 +205,9 @@ internal sealed partial class MainWindow : Window
     {
         IsOpen = false,
         IsClosable = true,
-        Margin = new Thickness(16, 0, 16, 8),
+        Margin = new Thickness(SurfaceInset, 0, SurfaceInset, 8),
     };
-    private readonly Grid _columnsHeader = new() { ColumnSpacing = 12 };
+    private readonly Grid _columnsHeader = new() { UseLayoutRounding = true };
     private readonly Grid _fileSurface = new();
     private readonly ScrollViewer _fileScroller = new()
     {
@@ -212,6 +222,8 @@ internal sealed partial class MainWindow : Window
     private static readonly double[] MaximumFileColumnWidths = [1600, 200, 480, 640, 400];
     private readonly List<Grid> _fileRows = [];
     private readonly List<SortHeader> _sortHeaders = [];
+    private Button? _nameSortHeader;
+    private Button? _sizeSortHeader;
     private readonly ListView _items = new()
     {
         SelectionMode = ListViewSelectionMode.Single,
@@ -285,8 +297,6 @@ internal sealed partial class MainWindow : Window
         MinWidth = 0,
         MinHeight = 0,
         Padding = new Thickness(0),
-        // Overhang into the bar padding instead of growing the status row.
-        Margin = new Thickness(0, -2, 0, -2),
     };
     private readonly DispatcherTimer _statusClearTimer = new() { Interval = TimeSpan.FromSeconds(6) };
     private readonly DispatcherTimer _infoBarCloseTimer = new() { Interval = TimeSpan.FromSeconds(8) };
@@ -294,10 +304,10 @@ internal sealed partial class MainWindow : Window
     private readonly Border _permissionBadge = new()
     {
         CornerRadius = new CornerRadius(10),
-        Padding = new Thickness(8, 2, 10, 3),
+        Padding = new Thickness(8, 2, 8, 2),
         VerticalAlignment = VerticalAlignment.Center,
     };
-    private readonly FontIcon _permissionGlyph = new() { FontSize = 12 };
+    private readonly FontIcon _permissionGlyph = new() { FontSize = 12, VerticalAlignment = VerticalAlignment.Center };
     private readonly TextBlock _permissionText = new() { VerticalAlignment = VerticalAlignment.Center };
 
     // Context menus
@@ -305,7 +315,7 @@ internal sealed partial class MainWindow : Window
     private readonly MenuFlyout _backgroundMenu = new();
     private readonly MenuFlyoutItem _menuOpen = NewMenuItem("\uE8E5", "打开");
     private readonly MenuFlyoutItem _menuDownload = NewMenuItem("\uE896", "下载");
-    private readonly MenuFlyoutItem _menuRemoveCache = NewMenuItem("\uE8D4", "移除缓存");
+    private readonly MenuFlyoutItem _menuRemoveCache = NewMenuItem("\uE711", "移除缓存");
     private readonly MenuFlyoutItem _menuSaveAs = NewMenuItem("\uE792", "另存为…");
     private readonly MenuFlyoutItem _menuFavorite = NewMenuItem("\uE734", "添加到收藏");
     private readonly MenuFlyoutItem _menuRename = NewMenuItem("\uE8AC", "重命名");
@@ -328,10 +338,12 @@ internal sealed partial class MainWindow : Window
     private readonly Dictionary<(ulong Disk, ulong Item), string> _downloadedPaths = [];
     private ListViewItem? _dragSourceRow;
     private const string BrowserDragSource = "YuWangCloudSync.CloudBrowser";
-    private readonly Dictionary<string, Task<BitmapImage?>> _systemFileIconTasks = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<(string Extension, int PixelSize), Task<ImageSource?>> _systemFileIconTasks = [];
+    private readonly Dictionary<int, Task<ImageSource?>> _systemFolderIconTasks = [];
     private readonly Dictionary<string, string> _systemFileTypes = new(StringComparer.OrdinalIgnoreCase);
     private string _systemFolderType = "文件夹";
-    private Task<BitmapImage?>? _systemFolderIconTask;
+    private SystemFileIconMetrics _systemFileIconMetrics = SystemFileIconMetrics.FromRasterizationScale(1);
+    private XamlRoot? _iconRasterizationRoot;
     private List<DiskTreeNode> _diskTree = [];
     private List<YuWangItem> _currentItems = [];
     private RemoteFolder? _currentFolder;
@@ -407,11 +419,17 @@ internal sealed partial class MainWindow : Window
         WinUiWindowChrome.Attach(this, _root, Title, RootGlyph);
         WinUiUiHost.ConfigureWindow(this, 1180, 760, resizable: true,
             minimumWidthDip: 900, minimumHeightDip: 560);
+        AttachIconRasterizationScaleListener();
+        _root.Loaded += (_, _) => AttachIconRasterizationScaleListener();
+        TouchPointerHook.Install(WinRT.Interop.WindowNative.GetWindowHandle(this), ReportDragDiagnostic);
         if (loadDiskTree) _root.Loaded += (_, _) => RunUi(() => LoadDiskTreeAsync());
         _root.SizeChanged += (_, _) => ConstrainSidebarWidth();
         Closed += (_, _) =>
         {
             _isClosed = true;
+            if (_iconRasterizationRoot is { } iconRoot)
+                iconRoot.Changed -= OnIconRasterizationRootChanged;
+            _iconRasterizationRoot = null;
             StopFavoritesAnimation();
             StopInfoBarAnimation();
             StopInfoBarCountdown();
@@ -423,6 +441,8 @@ internal sealed partial class MainWindow : Window
             _syncTransferCancellation?.Cancel();
             _dragCancellation?.Cancel();
             CancelDragWarmup();
+            StopTouchDragTracking();
+            TouchPointerHook.Uninstall(WinRT.Interop.WindowNative.GetWindowHandle(this));
             try { SaveBrowserState(); }
             catch (Exception error) { Serilog.Log.Warning(error, "关闭主界面时保存浏览状态失败"); }
         };
@@ -431,6 +451,64 @@ internal sealed partial class MainWindow : Window
         UpdatePermissionBadge();
         RenderItems();
         TraceUiStage("主界面构造完成，等待 Loaded");
+    }
+
+    private void AttachIconRasterizationScaleListener()
+    {
+        var currentRoot = _root.XamlRoot;
+        if (!ReferenceEquals(currentRoot, _iconRasterizationRoot))
+        {
+            if (_iconRasterizationRoot is { } previousRoot)
+                previousRoot.Changed -= OnIconRasterizationRootChanged;
+            _iconRasterizationRoot = currentRoot;
+            if (currentRoot is not null)
+                currentRoot.Changed += OnIconRasterizationRootChanged;
+        }
+
+        UpdateIconRasterizationMetrics();
+    }
+
+    private void OnIconRasterizationRootChanged(XamlRoot sender, XamlRootChangedEventArgs args)
+    {
+        if (ReferenceEquals(sender, _iconRasterizationRoot))
+            UpdateIconRasterizationMetrics();
+    }
+
+    private void UpdateIconRasterizationMetrics()
+    {
+        var metrics = SystemFileIconMetrics.FromRasterizationScale(_root.XamlRoot?.RasterizationScale ?? 1);
+        if (metrics == _systemFileIconMetrics) return;
+
+        _systemFileIconMetrics = metrics;
+        UpdateNameSortHeaderIndent();
+        if (!_isClosed && _fileRenderVersion > 0)
+            RenderItems(preserveSelection: true);
+    }
+
+    private void SnapFileIconToPhysicalPixels(Border iconHost, TranslateTransform translation)
+    {
+        var xamlRoot = _root.XamlRoot;
+        if (xamlRoot is null || !ReferenceEquals(iconHost.XamlRoot, xamlRoot)) return;
+
+        var scale = xamlRoot.RasterizationScale;
+        if (!double.IsFinite(scale) || scale <= 0) return;
+
+        // The icon can be centered in a row whose physical height is odd. Round the final
+        // visual origin as well as its size so the bitmap never starts on a half pixel.
+        translation.X = 0;
+        translation.Y = 0;
+        try
+        {
+            var origin = iconHost.TransformToVisual(_root).TransformPoint(new Windows.Foundation.Point(0, 0));
+            translation.X = Math.Round(origin.X * scale, MidpointRounding.AwayFromZero) / scale - origin.X;
+            translation.Y = Math.Round(origin.Y * scale, MidpointRounding.AwayFromZero) / scale - origin.Y;
+        }
+        catch (InvalidOperationException)
+        {
+            // The item may be leaving the visual tree while it is being virtualized.
+            translation.X = 0;
+            translation.Y = 0;
+        }
     }
 
     #region Layout
@@ -491,12 +569,17 @@ internal sealed partial class MainWindow : Window
 
     private Grid BuildSidebar()
     {
-        var sidebar = new Grid { Padding = new Thickness(8, 0, 8, 10), RowSpacing = 4 };
+        var sidebar = new Grid { Padding = new Thickness(8, 0, 8, 0), RowSpacing = 4 };
         sidebar.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
         sidebar.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
         sidebar.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
 
-        var header = new Grid { Padding = new Thickness(12, 2, 0, 2) };
+        var header = new Grid
+        {
+            Name = "CloudDiskHeader",
+            // The content surface border contributes 1 DIP above the address bar.
+            Padding = new Thickness(SidebarInset, ToolbarTopPadding + 1, 0, ToolbarBottomPadding),
+        };
         header.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
         header.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
         header.Children.Add(new TextBlock
@@ -547,8 +630,10 @@ internal sealed partial class MainWindow : Window
     {
         var footer = new Grid
         {
+            Name = "CloudAccountFooter",
             ColumnSpacing = 10,
-            Padding = new Thickness(10, 10, 0, 0),
+            MinHeight = FooterMinHeight,
+            Padding = new Thickness(SidebarInset, 0, 0, 0),
             BorderThickness = new Thickness(0, 1, 0, 0),
             BorderBrush = WinUiUiHost.GetBrushResource("DividerStrokeColorDefaultBrush"),
         };
@@ -639,14 +724,33 @@ internal sealed partial class MainWindow : Window
         _items.DoubleTapped += (_, _) => RunUi(() => OpenSelectedAsync());
         _items.KeyDown += OnListKeyDown;
         _items.CanDragItems = false;
+        // Touch needs the list's own gesture recognizer: a vertical swipe still pans, while
+        // press-and-hold or a perpendicular swipe on a row becomes a drag. Mouse keeps the native path.
+        _items.AddHandler(UIElement.PointerEnteredEvent,
+            new PointerEventHandler((_, args) => _items.CanDragItems = IsContactPointer(args.Pointer)),
+            handledEventsToo: true);
+        _items.DragItemsStarting += OnTouchDragItemsStarting;
+        // A horizontal swipe on a row must reach the list's drag recognizer instead of panning the columns.
+        ScrollViewer.SetIsHorizontalScrollChainingEnabled(_items, false);
         _dragIntentTimer.Tick += (_, _) => CheckDragIntent();
         _dragProgressTimer.Tick += (_, _) => UpdateDragPreparationProgress();
+        _touchDragTracker.Tick += (_, _) => PollTouchDragContact();
         _items.AddHandler(UIElement.PointerMovedEvent,
             new PointerEventHandler((_, args) =>
             {
                 if (_dragSourceRow is not null) _dragPointer = args.GetCurrentPoint(_items);
                 CheckDragIntent();
             }), handledEventsToo: true);
+        // Capture the recognized touch on the window root. This keeps XAML pointer movement and
+        // lift routed back to the app even when the finger leaves the list or crosses into Explorer.
+        _root.AddHandler(UIElement.PointerMovedEvent,
+            new PointerEventHandler((_, args) => TrackTouchContact(args)), handledEventsToo: true);
+        _root.AddHandler(UIElement.PointerCaptureLostEvent,
+            new PointerEventHandler(OnTouchPointerCaptureLost), handledEventsToo: true);
+        _root.AddHandler(UIElement.PointerReleasedEvent,
+            new PointerEventHandler((_, args) => EndTouchContact(args.Pointer)), handledEventsToo: true);
+        _root.AddHandler(UIElement.PointerCanceledEvent,
+            new PointerEventHandler((_, args) => EndTouchContact(args.Pointer)), handledEventsToo: true);
         _items.AddHandler(UIElement.PointerPressedEvent,
             new PointerEventHandler(OnFileListPointerPressed), handledEventsToo: true);
         _items.AllowDrop = true;
@@ -711,7 +815,12 @@ internal sealed partial class MainWindow : Window
 
     private Grid BuildAddressBar()
     {
-        var bar = new Grid { ColumnSpacing = 8, Padding = new Thickness(10, 10, 16, 4) };
+        var bar = new Grid
+        {
+            Name = "CloudAddressBar",
+            ColumnSpacing = 8,
+            Padding = new Thickness(SurfaceInset, ToolbarTopPadding, SurfaceInset, ToolbarBottomPadding),
+        };
         bar.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
         bar.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
         bar.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
@@ -732,7 +841,8 @@ internal sealed partial class MainWindow : Window
         var addressContent = new Grid { Children = { _breadcrumbScroller, _loading } };
         var addressBox = new Border
         {
-            Height = 34,
+            Name = "CloudAddressBox",
+            MinHeight = ToolbarControlHeight,
             Padding = new Thickness(4, 0, 4, 0),
             Background = WinUiUiHost.GetBrushResource("ControlFillColorDefaultBrush"),
             BorderBrush = WinUiUiHost.GetBrushResource("ControlStrokeColorDefaultBrush"),
@@ -765,7 +875,8 @@ internal sealed partial class MainWindow : Window
 
         var host = new Grid
         {
-            Padding = new Thickness(6, 0, 12, 4),
+            Name = "CloudCommandBarHost",
+            Padding = new Thickness(SurfaceInset, 0, SurfaceInset, ToolbarBottomPadding),
             BorderThickness = new Thickness(0, 0, 0, 1),
             BorderBrush = WinUiUiHost.GetBrushResource("DividerStrokeColorDefaultBrush"),
             Margin = new Thickness(0, 0, 0, 8),
@@ -781,15 +892,17 @@ internal sealed partial class MainWindow : Window
         AddSortHeader(SortColumn.Name, "名称", 0, HorizontalAlignment.Left);
         var statusHeader = new TextBlock
         {
-            Text = "状态", VerticalAlignment = VerticalAlignment.Center,
+            Text = "状态", HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center,
             Style = WinUiUiHost.GetStyleResource("YuWangCaptionTextBlockStyle"),
         };
         Grid.SetColumn(statusHeader, 1);
         _columnsHeader.Children.Add(statusHeader);
-        AddFileColumnGrip("状态", 1);
         AddSortHeader(SortColumn.Modified, "修改时间", 2, HorizontalAlignment.Left);
         AddSortHeader(SortColumn.Type, "类型", 3, HorizontalAlignment.Left);
         AddSortHeader(SortColumn.Size, "大小", 4, HorizontalAlignment.Right);
+        // Keep resize hit targets above the adjacent sort buttons.
+        string[] columnLabels = ["名称", "状态", "修改时间", "类型", "大小"];
+        for (var index = 0; index < columnLabels.Length; index++) AddFileColumnGrip(columnLabels[index], index);
         UpdateSortHeaders();
     }
 
@@ -824,9 +937,14 @@ internal sealed partial class MainWindow : Window
             Style = WinUiUiHost.GetStyleResource("SubtleButtonStyle"),
             HorizontalAlignment = HorizontalAlignment.Stretch,
             HorizontalContentAlignment = alignment,
-            Padding = new Thickness(8, 4, 8, 4),
-            Margin = new Thickness(-8, 0, -8, 0),
+            BorderThickness = new Thickness(0),
+            Padding = new Thickness(FileColumnSpacing / 2 + (column == SortColumn.Name ? FileNameTextOffset : 0),
+                4, FileColumnSpacing / 2, 4),
+            // Expand the hit area into the gutter without shifting the text off the cell edge.
+            Margin = new Thickness(-FileColumnSpacing / 2, 0, -FileColumnSpacing / 2, 0),
         };
+        if (column == SortColumn.Name) _nameSortHeader = button;
+        if (column == SortColumn.Size) _sizeSortHeader = button;
         Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(button, $"按{text}排序");
         button.Click += (_, _) =>
         {
@@ -842,17 +960,17 @@ internal sealed partial class MainWindow : Window
         };
         Grid.SetColumn(button, gridColumn);
         _columnsHeader.Children.Add(button);
-        AddFileColumnGrip(text, gridColumn);
         _sortHeaders.Add(new SortHeader { Column = column, Chevron = chevron });
     }
 
     private void AddFileColumnGrip(string text, int gridColumn)
     {
+        const double gripWidth = 8;
         var grip = new ResizeGrip(InputSystemCursorShape.SizeWestEast)
         {
             Name = $"FileColumnResizeGrip{gridColumn}",
-            Width = 8,
-            Margin = new Thickness(0, 0, -6, 0),
+            Width = gripWidth,
+            Margin = new Thickness(0, 0, -(FileColumnSpacing + gripWidth) / 2, 0),
             HorizontalAlignment = HorizontalAlignment.Right,
             Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent),
             Children =
@@ -901,6 +1019,16 @@ internal sealed partial class MainWindow : Window
         }
     }
 
+    private double FileNameTextOffset => _systemFileIconMetrics.SizeDip + FileNameIconSpacing;
+
+    private void UpdateNameSortHeaderIndent()
+    {
+        if (_nameSortHeader is not { } button) return;
+        var padding = button.Padding;
+        button.Padding = new Thickness(FileColumnSpacing / 2 + FileNameTextOffset,
+            padding.Top, padding.Right, padding.Bottom);
+    }
+
     private void UpdateColumnsHeaderMargin()
     {
         var checkboxOffset = _items.SelectionMode == ListViewSelectionMode.Multiple ? MultiSelectContentOffset : 0;
@@ -912,13 +1040,14 @@ internal sealed partial class MainWindow : Window
 
     private void AddFileColumns(Grid grid)
     {
+        grid.ColumnSpacing = FileColumnSpacing;
         for (var index = 0; index < _fileColumnWidths.Length; index++)
             grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(EffectiveFileColumnWidth(index)) });
         if (!ReferenceEquals(grid, _columnsHeader)) _fileRows.Add(grid);
     }
 
     private double FileColumnChromeWidth => ListHorizontalMargin * 2 + ItemContentLeftPadding
-        + ItemContentRightPadding + _columnsHeader.ColumnSpacing * (_fileColumnWidths.Length - 1) + 20
+        + ItemContentRightPadding + FileColumnSpacing * (_fileColumnWidths.Length - 1) + 20
         + (_items.SelectionMode == ListViewSelectionMode.Multiple ? MultiSelectContentOffset : 0);
 
     private double EffectiveFileColumnWidth(int index) => index == 0 && _fileColumnWidths[0] == 0
@@ -944,13 +1073,11 @@ internal sealed partial class MainWindow : Window
         var bar = new Grid
         {
             ColumnSpacing = 12,
-            Padding = new Thickness(16, 6, 16, 8),
+            MinHeight = FooterMinHeight,
+            Padding = new Thickness(SurfaceInset, 0, SurfaceInset, 0),
             BorderThickness = new Thickness(0, 1, 0, 0),
             BorderBrush = WinUiUiHost.GetBrushResource("DividerStrokeColorDefaultBrush"),
         };
-        // Every item fits the permission badge height, so progress, long names or the cancel
-        // button never make the status bar taller than its idle height.
-        bar.RowDefinitions.Add(new RowDefinition { Height = new GridLength(StatusBarContentHeight) });
         // summary | status | progress | cancel | permission
         bar.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
         bar.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
@@ -1047,8 +1174,9 @@ internal sealed partial class MainWindow : Window
             Content = new FontIcon { Glyph = glyph, FontSize = glyphSize },
             Style = WinUiUiHost.GetStyleResource("SubtleButtonStyle"),
             Width = 36,
-            Height = 32,
+            Height = ToolbarControlHeight,
             Padding = new Thickness(0),
+            VerticalAlignment = VerticalAlignment.Center,
             KeyboardAcceleratorPlacementMode = KeyboardAcceleratorPlacementMode.Hidden,
         };
         ToolTipService.SetToolTip(button, tooltip);
@@ -1915,19 +2043,22 @@ internal sealed partial class MainWindow : Window
 
     private ListViewItem CreateGroupingRow(TreeViewNode node)
     {
-        var row = new Grid { ColumnSpacing = 12 };
+        var iconMetrics = _systemFileIconMetrics;
+        var row = new Grid { UseLayoutRounding = true };
         AddFileColumns(row);
         var namePanel = new Grid
         {
-            ColumnSpacing = 12,
+            ColumnSpacing = FileNameIconSpacing,
+            UseLayoutRounding = true,
             ColumnDefinitions =
             {
-                new ColumnDefinition { Width = new GridLength(20) },
+                new ColumnDefinition { Width = new GridLength(iconMetrics.SizeDip) },
                 new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) },
             },
             Children =
             {
-                new FontIcon { Glyph = _folderNodes.ContainsKey(node) ? "\uEDA2" : "\uE8F1", FontSize = 18 },
+                new FontIcon { Glyph = _folderNodes.ContainsKey(node) ? "\uEDA2" : "\uE8F1", FontSize = 18,
+                    UseLayoutRounding = true },
                 new TextBlock { Text = node.Content?.ToString() ?? "", VerticalAlignment = VerticalAlignment.Center,
                     TextTrimming = TextTrimming.CharacterEllipsis },
             },
@@ -1940,6 +2071,7 @@ internal sealed partial class MainWindow : Window
         {
             Content = row, Tag = node, MinHeight = 36,
             HorizontalContentAlignment = HorizontalAlignment.Stretch,
+            UseLayoutRounding = true,
         };
         container.ContextRequested += (_, args) =>
         {
@@ -1956,22 +2088,29 @@ internal sealed partial class MainWindow : Window
     private ListViewItem CreateItemRow(YuWangItem item)
     {
         var secondary = WinUiUiHost.GetBrushResource("TextFillColorSecondaryBrush");
-        var row = new Grid { ColumnSpacing = 12 };
+        var iconMetrics = _systemFileIconMetrics;
+        var row = new Grid { UseLayoutRounding = true };
         AddFileColumns(row);
 
+        var iconPixelTranslation = new TranslateTransform();
         var iconHost = new Border
         {
-            Width = 20,
-            Height = 20,
+            Width = iconMetrics.SizeDip,
+            Height = iconMetrics.SizeDip,
+            HorizontalAlignment = HorizontalAlignment.Center,
             VerticalAlignment = VerticalAlignment.Center,
+            UseLayoutRounding = true,
+            RenderTransform = iconPixelTranslation,
             Child = new FontIcon { Glyph = item.IsFolder ? FolderGlyph : FileGlyph, FontSize = 18 },
         };
+        iconHost.LayoutUpdated += (_, _) => SnapFileIconToPhysicalPixels(iconHost, iconPixelTranslation);
         var namePanel = new Grid
         {
-            ColumnSpacing = 12,
+            ColumnSpacing = FileNameIconSpacing,
+            UseLayoutRounding = true,
             ColumnDefinitions =
             {
-                new ColumnDefinition { Width = new GridLength(20) },
+                new ColumnDefinition { Width = new GridLength(iconMetrics.SizeDip) },
                 new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) },
             },
             VerticalAlignment = VerticalAlignment.Center,
@@ -1993,7 +2132,9 @@ internal sealed partial class MainWindow : Window
         AddRowCell(row, 2, item.UploadTime?.ToLocalTime().ToString("yyyy-MM-dd HH:mm") ?? "", secondary, TextAlignment.Left);
         var typeCell = AddRowCell(row, 3, GetTypeLabel(item), secondary, TextAlignment.Left);
         _ = LoadSystemIconIntoAsync(iconHost,
-            item.IsFolder ? GetSystemFolderIconAsync() : GetSystemFileIconAsync(item.Name), 20, item, typeCell, _fileRenderVersion);
+            item.IsFolder ? GetSystemFolderIconAsync(iconMetrics.PixelSize)
+                : GetSystemFileIconAsync(item.Name, iconMetrics.PixelSize),
+            iconMetrics.SizeDip, item, typeCell, _fileRenderVersion);
         AddRowCell(row, 4, item.IsFolder ? "" : FormatSize(item.Size), secondary, TextAlignment.Right);
 
         var listItem = new ListViewItem
@@ -2002,6 +2143,7 @@ internal sealed partial class MainWindow : Window
             Tag = item,
             MinHeight = 36,
             HorizontalContentAlignment = HorizontalAlignment.Stretch,
+            UseLayoutRounding = true,
         };
         ToolTipService.SetToolTip(listItem, item.Name);
         listItem.ContextRequested += (_, args) => OnItemContextRequested(listItem, args);
@@ -2014,6 +2156,7 @@ internal sealed partial class MainWindow : Window
         {
             Text = text,
             Foreground = foreground,
+            HorizontalAlignment = alignment == TextAlignment.Right ? HorizontalAlignment.Right : HorizontalAlignment.Stretch,
             TextAlignment = alignment,
             TextTrimming = TextTrimming.CharacterEllipsis,
             VerticalAlignment = VerticalAlignment.Center,
@@ -2062,7 +2205,7 @@ internal sealed partial class MainWindow : Window
         }
     }
 
-    private async Task LoadSystemIconIntoAsync(Border iconHost, Task<BitmapImage?> iconTask, double size,
+    private async Task LoadSystemIconIntoAsync(Border iconHost, Task<ImageSource?> iconTask, double size,
         YuWangItem item, TextBlock typeCell, int renderVersion)
     {
         var icon = await iconTask;
@@ -2076,14 +2219,16 @@ internal sealed partial class MainWindow : Window
             Width = size,
             Height = size,
             Stretch = Stretch.Uniform,
+            UseLayoutRounding = true,
         };
     }
 
-    private Task<BitmapImage?> GetSystemFileIconAsync(string fileName)
+    private Task<ImageSource?> GetSystemFileIconAsync(string fileName, int pixelSize)
     {
         var extension = SystemFileExtension(fileName);
-        if (!_systemFileIconTasks.TryGetValue(extension, out var task))
-            _systemFileIconTasks[extension] = task = CreateSystemFileIconAsync(extension);
+        var key = (extension, pixelSize);
+        if (!_systemFileIconTasks.TryGetValue(key, out var task))
+            _systemFileIconTasks[key] = task = CreateSystemFileIconAsync(extension, pixelSize);
         return task;
     }
 
@@ -2100,8 +2245,12 @@ internal sealed partial class MainWindow : Window
         if (_sortColumn == SortColumn.Type) QueueFileSort();
     }
 
-    private Task<BitmapImage?> GetSystemFolderIconAsync()
-        => _systemFolderIconTask ??= CreateSystemFolderIconAsync();
+    private Task<ImageSource?> GetSystemFolderIconAsync(int pixelSize)
+    {
+        if (!_systemFolderIconTasks.TryGetValue(pixelSize, out var task))
+            _systemFolderIconTasks[pixelSize] = task = CreateSystemFolderIconAsync(pixelSize);
+        return task;
+    }
 
     private static string SystemIconProbeDirectory()
     {
@@ -2110,7 +2259,47 @@ internal sealed partial class MainWindow : Window
         return probeDirectory;
     }
 
-    private async Task<BitmapImage?> CreateSystemFileIconAsync(string extension)
+    private async Task<ImageSource?> CreateSystemFileIconAsync(string extension, int pixelSize)
+    {
+        // Get the WinRT icon first; Shell remains available for the friendly type name and fallback pixels.
+        var storageIcon = await CreateSystemFileIconFromStorageAsync(extension, updateTypeName: true, pixelSize);
+        if (_isClosed) return null;
+
+        SystemFileAssociationInfo? fileInfo = null;
+        try
+        {
+            fileInfo = await SystemFileAssociation.QueryAsync(extension, pixelSize, includeIcon: storageIcon is null);
+        }
+        catch (Exception error)
+        {
+            Serilog.Log.Warning(error, "通过 Windows Shell 读取文件类型失败：{Extension}", extension);
+        }
+
+        // Let GetSystemFileIconAsync cache this task before a type-sort can rebuild the rows.
+        await Task.Yield();
+        if (_isClosed) return null;
+
+        var typeName = fileInfo.HasValue && !string.IsNullOrWhiteSpace(fileInfo.Value.TypeName)
+            ? fileInfo.Value.TypeName
+            : null;
+        if (typeName is not null)
+        {
+            _systemFileTypes[extension] = typeName;
+            QueueSystemTypeSort();
+        }
+
+        if (typeName is null && !_systemFileTypes.ContainsKey(extension))
+        {
+            _systemFileTypes[extension] = "文件";
+            QueueSystemTypeSort();
+        }
+
+        return storageIcon ?? await CreateShellIconImageAsync(fileInfo?.IconPixels, pixelSize,
+            $"文件类型 {extension}");
+    }
+
+    private async Task<ImageSource?> CreateSystemFileIconFromStorageAsync(string extension,
+        bool updateTypeName, int pixelSize)
     {
         string? probePath = null;
         try
@@ -2119,14 +2308,28 @@ internal sealed partial class MainWindow : Window
             if (!File.Exists(probePath)) await File.WriteAllBytesAsync(probePath, []);
             var probeFile = await StorageFile.GetFileFromPathAsync(probePath);
             if (_isClosed) return null;
-            _systemFileTypes[extension] = string.IsNullOrWhiteSpace(probeFile.DisplayType) ? "文件" : probeFile.DisplayType;
-            QueueSystemTypeSort();
-            using var thumbnail = await probeFile.GetThumbnailAsync(ThumbnailMode.ListView, 32);
+
+            if (updateTypeName)
+            {
+                _systemFileTypes[extension] = string.IsNullOrWhiteSpace(probeFile.DisplayType)
+                    ? "文件"
+                    : probeFile.DisplayType;
+                QueueSystemTypeSort();
+            }
+
+            using var thumbnail = await probeFile.GetThumbnailAsync(ThumbnailMode.ListView,
+                checked((uint)pixelSize), ThumbnailOptions.None);
             return await ToIconImageAsync(thumbnail);
         }
         catch (Exception error)
         {
-            Serilog.Log.Debug(error, "读取系统文件类型图标失败：{Extension}", extension);
+            Serilog.Log.Warning(error, "通过 WinRT 读取系统文件类型图标失败：{Extension}", extension);
+            if (updateTypeName && !_isClosed)
+            {
+                _systemFileTypes[extension] = "文件";
+                QueueSystemTypeSort();
+            }
+
             return null;
         }
         finally
@@ -2139,22 +2342,59 @@ internal sealed partial class MainWindow : Window
         }
     }
 
-    private async Task<BitmapImage?> CreateSystemFolderIconAsync()
+    private async Task<ImageSource?> CreateSystemFolderIconAsync(int pixelSize)
     {
+        string? probePath = null;
         try
         {
-            var probePath = Path.Combine(SystemIconProbeDirectory(), "folder");
+            probePath = Path.Combine(SystemIconProbeDirectory(), "folder");
             Directory.CreateDirectory(probePath);
             var probeFolder = await StorageFolder.GetFolderFromPathAsync(probePath);
             if (_isClosed) return null;
             _systemFolderType = string.IsNullOrWhiteSpace(probeFolder.DisplayType) ? "文件夹" : probeFolder.DisplayType;
             QueueSystemTypeSort();
-            using var thumbnail = await probeFolder.GetThumbnailAsync(ThumbnailMode.ListView, 32);
-            return await ToIconImageAsync(thumbnail);
+            using var thumbnail = await probeFolder.GetThumbnailAsync(ThumbnailMode.ListView,
+                checked((uint)pixelSize), ThumbnailOptions.None);
+            var image = await ToIconImageAsync(thumbnail);
+            if (image is not null) return image;
+            Serilog.Log.Debug("WinRT 未返回文件夹类型图标，改用 Shell 图标回退：{ThumbnailType}",
+                thumbnail?.Type.ToString() ?? "<null>");
         }
         catch (Exception error)
         {
-            Serilog.Log.Debug(error, "读取系统文件夹图标失败");
+            Serilog.Log.Warning(error, "通过 WinRT 读取系统文件夹图标失败");
+        }
+
+        if (_isClosed || probePath is null) return null;
+        try
+        {
+            var iconPixels = await SystemFileAssociation.QueryDirectoryIconAsync(probePath, pixelSize);
+            return await CreateShellIconImageAsync(iconPixels, pixelSize, "文件夹");
+        }
+        catch (Exception error)
+        {
+            Serilog.Log.Warning(error, "通过 Windows Shell 回退读取系统文件夹图标失败");
+            return null;
+        }
+    }
+
+    private static async Task<ImageSource?> CreateShellIconImageAsync(byte[]? iconPixels, int pixelSize,
+        string description)
+    {
+        if (iconPixels is null || iconPixels.Length != checked(pixelSize * pixelSize * 4)) return null;
+        try
+        {
+            using var writer = new DataWriter();
+            writer.WriteBytes(iconPixels);
+            var bitmap = SoftwareBitmap.CreateCopyFromBuffer(writer.DetachBuffer(),
+                BitmapPixelFormat.Bgra8, pixelSize, pixelSize, BitmapAlphaMode.Premultiplied);
+            var source = new SoftwareBitmapSource();
+            await source.SetBitmapAsync(bitmap);
+            return source;
+        }
+        catch (Exception error)
+        {
+            Serilog.Log.Warning(error, "转换 {Description} 图标失败", description);
             return null;
         }
     }
@@ -2586,12 +2826,18 @@ internal sealed partial class MainWindow : Window
         _dragSourceRow = null;
         if (_busyNow || _outboundDragActive || _isClosed) return;
         var point = args.GetCurrentPoint(_items);
-        if (!point.Properties.IsLeftButtonPressed) return;
+        var contact = IsContactPointer(args.Pointer);
+        if (contact) BeginTouchContact(args);
+        else NativeFileDrag.ClearTouchContact();
+        if (contact ? !point.IsInContact : !point.Properties.IsLeftButtonPressed) return;
         var row = FindContainerAt<ListViewItem>(_items, point.Position);
         if (row?.Tag is not YuWangItem) return;
         _dragSourceRow = row;
         _dragPointer = point;
         _dragPressPosition = NativeFileDrag.CursorPosition;
+        // A touch press may begin a pan; the list's drag recognizer decides (OnTouchDragItemsStarting),
+        // and a tap selects through the list itself.
+        if (contact) return;
         _dragIntentTimer.Start();
         // Preserve Ctrl/Shift click selection; starting a drag resolves its source separately.
         var modifiers = InputKeyboardSource.GetKeyStateForCurrentThread(VirtualKey.Control)

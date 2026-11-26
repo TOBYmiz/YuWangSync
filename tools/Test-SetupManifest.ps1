@@ -32,6 +32,7 @@ ${Using:StrFunc} StrRep
 !define PRODUCT_IDENTIFIER "YuWangCloudSync"
 !define PRODUCT_VERSION "1.0.2.0"
 Var PreviousInstallDirectory
+Var PreviousShellExtensionFileName
 Var IsInstalled
 Var NewInstalledFilesManifest
 Var NewInstalledDirectoriesManifest
@@ -46,6 +47,7 @@ Section
   InitPluginsDir
   StrCpy $INSTDIR "$EXEDIR\fixture"
   StrCpy $PreviousInstallDirectory $INSTDIR
+  StrCpy $PreviousShellExtensionFileName "YuWangCloudSyncShellExt-old.dll"
   StrCpy $IsInstalled "1"
   CopyFiles /SILENT "$EXEDIR\new-files.txt" "$PLUGINSDIR\installed-files.new.txt"
   StrCpy $NewInstalledFilesManifest "$PLUGINSDIR\installed-files.new.txt"
@@ -84,15 +86,15 @@ SectionEnd
         [System.IO.Directory]::CreateDirectory((Join-Path $installRoot 'ObsoleteDirectory')) | Out-Null
         Copy-Item -LiteralPath $testExecutable -Destination (Join-Path $scenarioRoot 'ManifestFixture.exe')
         $oldIcons = @($scenario.Icons | ForEach-Object { 'Assets\' + $_ })
-        foreach ($relative in ($appFiles + $oldIcons + @('obsolete.dll', 'user-owned.txt'))) {
+        foreach ($relative in ($appFiles + $oldIcons + @('obsolete.dll', 'user-owned.txt', 'YuWangCloudSyncShellExt-old.dll'))) {
             [System.IO.File]::WriteAllText((Join-Path $installRoot $relative), "sentinel:$relative")
         }
         Write-TestLines (Join-Path $scenarioRoot 'new-files.txt') $appFiles
         Write-TestLines (Join-Path $scenarioRoot 'new-directories.txt') @('Assets')
-        $previousFiles = $appFiles + $oldIcons + @('obsolete.dll')
+        $previousFiles = $appFiles + $oldIcons + @('obsolete.dll', 'YuWangCloudSyncShellExt-old.dll')
         if ($scenario.Corrupted) {
             # Reproduce the already-installed manifest reported with this crash.
-            $previousFiles = $oldIcons + @('qlite3.dll') + $appFiles[7..($appFiles.Count - 1)] + @('obsolete.dll')
+            $previousFiles = $oldIcons + @('qlite3.dll') + $appFiles[7..($appFiles.Count - 1)] + @('obsolete.dll', 'YuWangCloudSyncShellExt-old.dll')
         }
         Write-TestLines (Join-Path $installRoot 'installed-files.txt') $previousFiles
         Write-TestLines (Join-Path $installRoot 'installed-directories.txt') @('Assets', 'ObsoleteDirectory')
@@ -124,6 +126,9 @@ SectionEnd
             }
             if ([System.IO.File]::ReadAllText((Join-Path $installRoot 'user-owned.txt')) -ne 'sentinel:user-owned.txt') {
                 throw 'Upgrade changed an untracked user file.'
+            }
+            if (-not [IO.File]::Exists((Join-Path $installRoot 'YuWangCloudSyncShellExt-old.dll'))) {
+                throw 'Manifest cleanup deleted the old shell extension before the Explorer restart prompt.'
             }
         }
         Write-Output "PASS: $($scenario.Name); two upgrades preserve payload/SQLite DLL and icon entries, remove obsolete files, and keep user files."

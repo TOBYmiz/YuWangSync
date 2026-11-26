@@ -71,6 +71,7 @@ VIAddVersionKey "OriginalFilename" "@@SETUP_FILE_NAME@@"
 
 ; Variables used by the MUI finish-page reboot prompt must be declared before the page macros.
 Var ExplorerRestartDeferred
+Var ExplorerRestartStarted
 Var ExplorerInteractiveUser
 Var FinishRebootText
 Var FinishRebootNowText
@@ -120,6 +121,7 @@ Var PageDialog
 Var InstallDirectory
 Var PreviousInstallDirectory
 Var PreviousShellExtensionFileName
+Var PreviousShellExtensionCleanupPending
 Var PreviousVersion
 Var IsInstalled
 Var QuickUpdateRequested
@@ -509,11 +511,21 @@ Function FinishPagePre
 FunctionEnd
 
 Function .onInstSuccess
+  ${If} ${Silent}
+    Call SchedulePreviousShellExtensionCleanup
+  ${ElseIf} $QuickUpdateRequested == "1"
+  ${AndIf} $IsInstalled == "1"
+    Call SchedulePreviousShellExtensionCleanup
+  ${EndIf}
   ${If} $QuickUpdateRequested == "1"
   ${AndIf} $IsInstalled == "1"
     Push "--cleanup-update-temp -about"
     Call LaunchAppViaTask
   ${EndIf}
+FunctionEnd
+
+Function .onGUIEnd
+  Call SchedulePreviousShellExtensionCleanup
 FunctionEnd
 
 Function FailurePageShow
@@ -1319,6 +1331,7 @@ Function FinishPageLeave
     SendMessage $mui.FinishPage.RebootNow ${BM_GETCHECK} 0 0 $0
     ${If} $0 == ${BST_CHECKED}
       Call RestartExplorerNow
+      Call RemovePreviousShellExtension
       ; The remaining pending file operations finish at the next logoff/reboot; do not let MUI reboot now.
       SetRebootFlag false
       ; Upgrades stopped the running app, and the reboot prompt replaced the launch checkbox.
@@ -1400,6 +1413,7 @@ FunctionEnd
 ; from the elevated installer. cmd /c is required: Task Scheduler does not parse '&'.
 Function ${UN}RestartExplorerNow
   Push $0
+  StrCpy $ExplorerRestartStarted "0"
   Call ${UN}GetExplorerInteractiveUser
   ${If} $ExplorerInteractiveUser == ""
     DetailPrint "无法确定 Explorer 交互用户，跳过重启。"
@@ -1412,7 +1426,9 @@ Function ${UN}RestartExplorerNow
       nsExec::ExecToLog '"$SYSDIR\schtasks.exe" /run /tn "TempRestartExplorer"'
       Pop $0
       DetailPrint "Explorer 重启任务 /run 返回码：$0"
-      ${If} $0 != "0"
+      ${If} $0 == "0"
+        StrCpy $ExplorerRestartStarted "1"
+      ${Else}
         DetailPrint "Explorer 重启任务启动失败。"
       ${EndIf}
     ${Else}
@@ -1487,6 +1503,48 @@ FunctionEnd
 !macroend
 !insertmacro DEFINE_EXPLORER_RESTART_FUNCTIONS ""
 !insertmacro DEFINE_EXPLORER_RESTART_FUNCTIONS "un."
+
+; Keep the old DLL out of manifest cleanup until the user has decided whether to
+; restart Explorer. Task Scheduler /run returns before the old process releases it.
+Function RemovePreviousShellExtension
+  ${If} $PreviousShellExtensionCleanupPending != "1"
+    Return
+  ${EndIf}
+  Push $0
+  StrCpy $0 0
+  SetFileAttributes "$PreviousInstallDirectory\$PreviousShellExtensionFileName" NORMAL
+remove_previous_shell_retry:
+  ClearErrors
+  Delete "$PreviousInstallDirectory\$PreviousShellExtensionFileName"
+  IfErrors remove_previous_shell_locked
+  StrCpy $PreviousShellExtensionCleanupPending "0"
+  Goto remove_previous_shell_done
+remove_previous_shell_locked:
+  ${If} $ExplorerRestartStarted == "1"
+    IntOp $0 $0 + 1
+    ${If} $0 < 40
+      Sleep 250
+      Goto remove_previous_shell_retry
+    ${EndIf}
+  ${EndIf}
+  DetailPrint "旧版资源管理器扩展仍被占用或无法删除：$PreviousInstallDirectory\$PreviousShellExtensionFileName"
+remove_previous_shell_done:
+  ClearErrors
+  Pop $0
+FunctionEnd
+
+; On exit, defer any DLL still pending after direct deletion attempts. Waiting
+; until then lets the finish page restart Explorer and retry first.
+Function SchedulePreviousShellExtensionCleanup
+  ${If} $PreviousShellExtensionCleanupPending == "1"
+    ClearErrors
+    Delete /REBOOTOK "$PreviousInstallDirectory\$PreviousShellExtensionFileName"
+    ${IfNot} ${Errors}
+      StrCpy $PreviousShellExtensionCleanupPending "0"
+    ${EndIf}
+    ClearErrors
+  ${EndIf}
+FunctionEnd
 
 Function FinishPageShow
   ${NSD_OnClick} $mui.FinishPage.Run FinishPageLaunchClicked
@@ -1985,6 +2043,9 @@ upgrade_obsolete_files_loop:
   StrCmp $ManifestPathFound "-1" upgrade_obsolete_files_new_manifest_failed
   StrCmp $ManifestPathFound "1" upgrade_obsolete_files_loop
 
+  ; The registered old shell DLL is cleaned up after the Explorer restart prompt.
+  StrCmp $ManifestSearchPath $PreviousShellExtensionFileName upgrade_obsolete_files_loop
+
   System::Call 'kernel32::GetFileAttributesW(w "$RelativePathFull") i.R9'
   IntCmp $R9 -1 upgrade_obsolete_files_loop upgrade_obsolete_file_attributes upgrade_obsolete_file_attributes
 upgrade_obsolete_file_attributes:
@@ -2411,8 +2472,13 @@ install_shell_file_done:
   WriteRegStr HKLM "${UNINSTALL_KEY}" "ShellExtensionDll" "${SHELL_EXTENSION_FILE_NAME}"
   ${If} $IsInstalled == "1"
   ${AndIf} $PreviousShellExtensionFileName != "${SHELL_EXTENSION_FILE_NAME}"
-    SetFileAttributes "$PreviousInstallDirectory\$PreviousShellExtensionFileName" NORMAL
-    Delete /REBOOTOK "$PreviousInstallDirectory\$PreviousShellExtensionFileName"
+    StrCpy $PreviousShellExtensionCleanupPending "1"
+    Call RemovePreviousShellExtension
+    ${If} $PreviousShellExtensionCleanupPending == "1"
+    ${AndIf} $ExplorerRestartStarted != "1"
+      StrCpy $ExplorerRestartDeferred "1"
+      SetRebootFlag true
+    ${EndIf}
   ${EndIf}
 
   ; Preserve the user's shortcut name and contents during upgrades.

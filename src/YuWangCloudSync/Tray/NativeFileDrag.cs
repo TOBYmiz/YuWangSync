@@ -55,15 +55,83 @@ internal sealed unsafe partial class NativeFileDrag : IDisposable
         catch { Dispose(); throw; }
     }
 
-    internal static bool IsLeftButtonDown => (GetAsyncKeyState(1) & 0x8000) != 0;
+    // Touch and pen contacts drive neither VK_LBUTTON nor the cursor. While such a contact owns
+    // the gesture, the UI thread mirrors it here and onto the cursor, which OLE hit-tests.
+    private static readonly object TouchGate = new();
+    private static bool _touchActive, _touchDown, _touchDragBridgeActive;
+    private static (int X, int Y) _touchPosition;
+
+    internal static bool IsTouchContactActive { get { lock (TouchGate) return _touchActive; } }
+
+    internal static void BeginTouchContact((int X, int Y) position)
+    {
+        lock (TouchGate)
+        {
+            _touchActive = _touchDown = true;
+            _touchDragBridgeActive = false;
+            _touchPosition = position;
+        }
+    }
+
+    internal static void EnableTouchDragBridge()
+    { lock (TouchGate) _touchDragBridgeActive = true; }
+
+    // WH_GETMESSAGE observes WM_POINTER updates while DoDragDrop runs its nested message loop.
+    // Keep OLE's legacy mouse bridge synchronized even when the XAML dispatcher is suspended.
+    internal static void ObserveTouchPointer((int X, int Y) position, bool inContact)
+    {
+        bool moveCursor;
+        lock (TouchGate)
+        {
+            if (!_touchActive) return;
+            _touchPosition = position;
+            moveCursor = inContact && _touchDown && _touchDragBridgeActive;
+            if (!inContact) _touchDown = false;
+        }
+        if (moveCursor) SetCursorPos(position.X, position.Y);
+    }
+
+    internal static void MoveTouchContact((int X, int Y) position, bool moveCursor)
+    {
+        lock (TouchGate)
+        {
+            if (!_touchActive || !_touchDown) return;
+            _touchPosition = position;
+        }
+        if (moveCursor) SetCursorPos(position.X, position.Y);
+    }
+
+    /// <summary>The contact lifted; an active drag now sees the button released.</summary>
+    internal static void EndTouchContact() { lock (TouchGate) _touchDown = false; }
+    internal static void ClearTouchContact()
+    {
+        lock (TouchGate) _touchActive = _touchDown = _touchDragBridgeActive = false;
+    }
+
+    internal static bool IsLeftButtonDown
+    {
+        get
+        {
+            lock (TouchGate) if (_touchActive) return _touchDown;
+            return (GetAsyncKeyState(1) & 0x8000) != 0;
+        }
+    }
     internal static bool IsEscapeDown => (GetAsyncKeyState(27) & 0x8000) != 0;
     internal static (int X, int Y) CursorPosition
     {
         get
         {
+            lock (TouchGate) if (_touchActive) return _touchPosition;
             if (!GetCursorPos(out var point)) throw new Win32Exception(Marshal.GetLastWin32Error());
             return (point.X, point.Y);
         }
+    }
+
+    internal static (int X, int Y) ClientToScreen(nint window, double x, double y)
+    {
+        var origin = new Point();
+        ClientToScreen(window, ref origin);
+        return (origin.X + (int)Math.Round(x), origin.Y + (int)Math.Round(y));
     }
     internal static (int X, int Y) DragThreshold => (GetSystemMetrics(68), GetSystemMetrics(69));
 
@@ -275,6 +343,8 @@ internal sealed unsafe partial class NativeFileDrag : IDisposable
     [DllImport("kernel32.dll")] private static extern nint GlobalFree(nint memory);
     [DllImport("user32.dll")] private static extern short GetAsyncKeyState(int key);
     [DllImport("user32.dll", SetLastError = true)] private static extern bool GetCursorPos(out Point point);
+    [DllImport("user32.dll")] private static extern bool SetCursorPos(int x, int y);
+    [DllImport("user32.dll")] private static extern bool ClientToScreen(nint window, ref Point point);
     [DllImport("user32.dll")] private static extern int GetSystemMetrics(int index);
     [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)] private static extern nint CreateWindowExW(uint extendedStyle, string className, string title, uint style, int x, int y, int width, int height, nint parent, nint menu, nint instance, nint parameter);
     [DllImport("user32.dll")] private static extern bool DestroyWindow(nint window);
