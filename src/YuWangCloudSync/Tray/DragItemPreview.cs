@@ -12,7 +12,8 @@ using WinRT.Interop;
 namespace YuWangCloudSync.Tray;
 
 /// <summary>A live XAML card in its own non-activating, input-disabled window.</summary>
-internal sealed class DragItemPreview : IDisposable
+// CsWinRT also needs the containing type to be partial to project PreviewAcrylic under NativeAOT.
+internal sealed partial class DragItemPreview : IDisposable
 {
     private const int MaxWidthDip = 240, HeightDip = 36, CornerRadiusDip = 8;
     private const double Padding = 10, IconSize = 20, Spacing = 12;
