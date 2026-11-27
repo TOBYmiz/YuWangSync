@@ -107,13 +107,11 @@ internal sealed partial class MainWindow
         if (cell.Tag is ValueTuple<SyncRootAvailability, FileSyncError, CellActivity?> previous
             && previous == (state, error, activity)) return;
         cell.Tag = (state, error, activity);
-        var dark = _root.ActualTheme == ElementTheme.Dark;
         if (activity is { } active)
         {
-            SetCellActivity(cell, active, dark);
+            SetCellActivity(cell, active);
             return;
         }
-        var green = new SolidColorBrush(dark ? Microsoft.UI.Colors.LightGreen : Windows.UI.Color.FromArgb(255, 16, 124, 16));
         var description = error switch
         {
             FileSyncError.Download => "下载失败。可右键选择“下载”重试。",
@@ -130,25 +128,25 @@ internal sealed partial class MainWindow
         AutomationProperties.SetName(cell, description);
         if (error != FileSyncError.None)
         {
-            var red = new SolidColorBrush(dark ? Windows.UI.Color.FromArgb(255, 255, 112, 112) : Windows.UI.Color.FromArgb(255, 196, 43, 28));
             cell.Child = new Border
             {
-                Width = 15, Height = 15, CornerRadius = new CornerRadius(8), Background = red,
-                Child = new FontIcon { Glyph = "\uE711", FontSize = 8, Foreground = new SolidColorBrush(dark
-                    ? Microsoft.UI.Colors.Black : Microsoft.UI.Colors.White) },
+                Width = 15, Height = 15, CornerRadius = new CornerRadius(8), Style = WinUiUiHost.GetStyleResource("YuWangErrorStatusStyle"),
+                Child = new FontIcon { Glyph = "\uE711", FontSize = 8, Style = WinUiUiHost.GetStyleResource("YuWangOnStatusIconStyle") },
             };
             return;
         }
         cell.Child = state switch
         {
             SyncRootAvailability.OnlineOnly => new FontIcon { Glyph = "\uE753", FontSize = 15,
-                Foreground = new SolidColorBrush(dark ? Microsoft.UI.Colors.DeepSkyBlue : Windows.UI.Color.FromArgb(255, 0, 120, 212)) },
+                Style = WinUiUiHost.GetStyleResource("YuWangAccentIconStyle") },
             SyncRootAvailability.Local or SyncRootAvailability.Pinned => new Border
             {
                 Width = 15, Height = 15, CornerRadius = new CornerRadius(8), BorderThickness = new Thickness(1.4),
-                BorderBrush = green, Background = state == SyncRootAvailability.Pinned ? green : null,
-                Child = new FontIcon { Glyph = "\uE73E", FontSize = 8, Foreground = state == SyncRootAvailability.Pinned
-                    ? new SolidColorBrush(dark ? Microsoft.UI.Colors.Black : Microsoft.UI.Colors.White) : green },
+                Style = WinUiUiHost.GetStyleResource(state == SyncRootAvailability.Pinned
+                    ? "YuWangPinnedStatusStyle" : "YuWangAvailableOutlineStyle"),
+                Child = new FontIcon { Glyph = "\uE73E", FontSize = 8,
+                    Style = WinUiUiHost.GetStyleResource(state == SyncRootAvailability.Pinned
+                        ? "YuWangOnStatusIconStyle" : "YuWangSuccessIconStyle") },
             },
             _ => null,
         };
@@ -200,24 +198,22 @@ internal sealed partial class MainWindow
     }
 
     /// <summary>Progress ring around a stage glyph; reused across updates so the ring animates smoothly.</summary>
-    private static void SetCellActivity(Border cell, CellActivity activity, bool dark)
+    private static void SetCellActivity(Border cell, CellActivity activity)
     {
         ToolTipService.SetToolTip(cell, activity.Description);
         AutomationProperties.SetName(cell, activity.Description);
         if (cell.Child is not Grid { Tag: "transfer" } visual
             || visual.Children is not [ProgressRing ring, FontIcon icon])
         {
-            var accent = dark ? Microsoft.UI.Colors.DeepSkyBlue : Windows.UI.Color.FromArgb(255, 0, 120, 212);
             ring = new ProgressRing
             {
                 Width = 16, Height = 16, MinWidth = 16, MinHeight = 16, Minimum = 0, Maximum = 100,
                 IsActive = true, IsHitTestVisible = false,
-                Foreground = new SolidColorBrush(accent),
-                Background = new SolidColorBrush(Windows.UI.Color.FromArgb(56, accent.R, accent.G, accent.B)),
+                Style = WinUiUiHost.GetStyleResource("YuWangTransferRingStyle"),
             };
             icon = new FontIcon
             {
-                FontSize = 8, Foreground = new SolidColorBrush(accent),
+                FontSize = 8, Style = WinUiUiHost.GetStyleResource("YuWangAccentIconStyle"),
                 HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center,
             };
             visual = new Grid { Tag = "transfer", Width = 16, Height = 16 };

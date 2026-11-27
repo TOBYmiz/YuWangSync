@@ -575,9 +575,8 @@ internal sealed class SettingsWindow : Window
             PrimaryButtonText = "确认",
             CloseButtonText = "取消",
             DefaultButton = ContentDialogButton.Primary,
-            XamlRoot = Root.XamlRoot,
-            RequestedTheme = Root.ActualTheme,
         };
+        WinUiUiHost.AttachDialogToRoot(dialog, Root);
         dialog.Style = WinUiUiHost.GetStyleResource("DefaultContentDialogStyle");
         if (await dialog.ShowAsync() == ContentDialogResult.Primary)
         {
@@ -1116,9 +1115,8 @@ internal sealed class SettingsWindow : Window
             Content = message,
             CloseButtonText = "确定",
             DefaultButton = ContentDialogButton.Close,
-            XamlRoot = Root.XamlRoot,
-            RequestedTheme = Root.ActualTheme,
         };
+        WinUiUiHost.AttachDialogToRoot(dialog, Root);
         dialog.Style = WinUiUiHost.GetStyleResource("DefaultContentDialogStyle");
         await dialog.ShowAsync();
     }
@@ -1132,9 +1130,8 @@ internal sealed class SettingsWindow : Window
             PrimaryButtonText = "是",
             CloseButtonText = "否",
             DefaultButton = ContentDialogButton.Primary,
-            XamlRoot = Root.XamlRoot,
-            RequestedTheme = Root.ActualTheme,
         };
+        WinUiUiHost.AttachDialogToRoot(dialog, Root);
         dialog.Style = WinUiUiHost.GetStyleResource("DefaultContentDialogStyle");
         return await dialog.ShowAsync() == ContentDialogResult.Primary;
     }

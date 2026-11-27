@@ -3,21 +3,19 @@ using System.Runtime.InteropServices.Marshalling;
 
 namespace YuWangCloudSync.Tray;
 
-internal sealed record DragItemVisual(byte[] Pixels, int Width, int Height, int OffsetX, int OffsetY);
-
 internal sealed unsafe partial class NativeFileDrag
 {
     // Keep WinUI's dispatcher free to process captured touch movement and release while OLE
     // runs its nested loop on a dedicated STA. OleMouseInput bridges the contact to that loop.
-    internal static Task<bool> DropVirtualAsync(VirtualFileDataObject data, DragItemVisual? visual, Func<bool> canContinue,
-        Action<string>? diagnostic = null)
+    internal static Task<bool> DropVirtualAsync(VirtualFileDataObject data, Func<bool> canContinue,
+        Action<string>? diagnostic = null, Func<(int X, int Y), bool>? isOutsideSource = null)
     {
         var completion = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
         var thread = new Thread(() =>
         {
             try
             {
-                completion.TrySetResult(DropVirtualCore(data, visual, canContinue, diagnostic));
+                completion.TrySetResult(DropVirtualCore(data, canContinue, diagnostic, isOutsideSource));
             }
             catch (Exception error) { completion.TrySetException(error); }
             finally { data.Dispose(); }
@@ -28,28 +26,30 @@ internal sealed unsafe partial class NativeFileDrag
         return completion.Task;
     }
 
-    private static bool DropVirtualCore(VirtualFileDataObject data, DragItemVisual? visual, Func<bool> canContinue,
-        Action<string>? diagnostic)
+    private static bool DropVirtualCore(VirtualFileDataObject data, Func<bool> canContinue,
+        Action<string>? diagnostic, Func<(int X, int Y), bool>? isOutsideSource)
     {
-        using var drag = new NativeFileDrag(preparing: false);
-        Marshal.Release(drag._data);
-        drag._data = data.Pointer;
-        Marshal.AddRef(drag._data);
-        data.SetSourceThread();
-        if (visual is not null) drag.SetItemVisual(visual);
-        var source = new FileDropSource(canContinue, diagnostic);
-        var pointer = ComInterfaceMarshaller<IFileDropSource>.ConvertToUnmanaged(source);
+        // The UI owns the image for both input types. No Shell drag-image formats
+        // are attached to the virtual file data object.
+        Marshal.ThrowExceptionForHR(OleInitialize(0));
         try
         {
-            using var input = new OleMouseInput(canContinue, diagnostic);
-            diagnostic?.Invoke($"OLE mouse bridge ready; thread={Environment.CurrentManagedThreadId}");
-            var hr = DoDragDrop(drag._data, (nint)pointer, 1, out var effect);
-            input.ThrowIfFailed();
-            diagnostic?.Invoke($"OLE finished; HRESULT=0x{hr:X8}; effect={effect}");
-            if (hr < 0) throw new COMException($"启动系统拖放失败（HRESULT 0x{hr:X8}）。", hr);
-            return hr == 0x40100 && effect == 1;
+            data.SetSourceThread();
+            var source = new FileDropSource(canContinue, diagnostic);
+            var pointer = ComInterfaceMarshaller<IFileDropSource>.ConvertToUnmanaged(source);
+            try
+            {
+                using var input = new OleMouseInput(canContinue, diagnostic, isOutsideSource);
+                diagnostic?.Invoke($"OLE mouse bridge ready; thread={Environment.CurrentManagedThreadId}");
+                var hr = DoDragDrop(data.Pointer, (nint)pointer, 1, out var effect);
+                input.ThrowIfFailed();
+                diagnostic?.Invoke($"OLE finished; HRESULT=0x{hr:X8}; effect={effect}");
+                if (hr < 0) throw new COMException($"启动系统拖放失败（HRESULT 0x{hr:X8}）。", hr);
+                return hr == 0x40100 && effect == 1;
+            }
+            finally { ComInterfaceMarshaller<IFileDropSource>.Free(pointer); GC.KeepAlive(source); }
         }
-        finally { ComInterfaceMarshaller<IFileDropSource>.Free(pointer); GC.KeepAlive(source); }
+        finally { OleUninitialize(); }
     }
 
     private sealed class OleMouseInput : IDisposable
@@ -58,16 +58,18 @@ internal sealed unsafe partial class NativeFileDrag
         private readonly uint _thread = GetCurrentThreadId();
         private readonly Func<bool> _canContinue;
         private readonly Action<string>? _diagnostic;
+        private readonly Func<(int X, int Y), bool>? _isOutsideSource;
         private readonly System.Threading.Timer _timer;
         private Exception? _failure;
         private bool _stopped;
         private long _lastTouchLog;
         private bool? _lastTouchOutside;
 
-        internal OleMouseInput(Func<bool> canContinue, Action<string>? diagnostic)
+        internal OleMouseInput(Func<bool> canContinue, Action<string>? diagnostic, Func<(int X, int Y), bool>? isOutsideSource)
         {
             _canContinue = canContinue;
             _diagnostic = diagnostic;
+            _isOutsideSource = isOutsideSource;
             // OLE initialization waits for its first WM_MOUSE message before capture.
             // A worker has no such message, and WinUI sends WM_POINTER on the UI thread.
             PeekMessageW(out _, 0, 0, 0, 0);
@@ -102,9 +104,9 @@ internal sealed unsafe partial class NativeFileDrag
                 var cancel = IsEscapeDown || !_canContinue();
                 var down = IsLeftButtonDown;
                 var cursor = CursorPosition;
-                if (IsTouchContactActive)
+                if (IsTouchContactActive && _isOutsideSource is not null)
                 {
-                    var outside = TouchPointerHook.IsOutsideWindow(cursor);
+                    var outside = _isOutsideSource(cursor);
                     var now = Environment.TickCount64;
                     if (now - _lastTouchLog >= 500 || _lastTouchOutside != outside)
                     {
@@ -134,6 +136,12 @@ internal sealed unsafe partial class NativeFileDrag
             _timer.Dispose();
         }
     }
+
+    /* 原 Shell 位图与仅准备阶段显示的预览，暂时停用；保留供对照。
+    // DropVirtualCore 之前接收 visual：在 DoDragDrop 前，把位图写到 OLE 数据对象。
+    // if (visual is not null) drag.SetItemVisual(visual);
+    private sealed record DragItemVisual(byte[] Pixels, int Width, int Height, int OffsetX, int OffsetY);
+
     private void SetItemVisual(DragItemVisual visual)
     {
         var info = new BitmapInfo { Size = 40, Width = visual.Width, Height = -visual.Height, Planes = 1, BitCount = 32 };
@@ -190,6 +198,7 @@ internal sealed unsafe partial class NativeFileDrag
             DeleteObject(bitmap);
         }
     }
+    */
 
     internal static void ReleaseMouseCapture() => ReleaseCapture();
     [DllImport("user32.dll")] private static extern bool ReleaseCapture();

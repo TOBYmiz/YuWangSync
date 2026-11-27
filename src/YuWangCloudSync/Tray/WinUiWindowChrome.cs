@@ -5,6 +5,8 @@ using Microsoft.UI.Windowing;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Media;
+using Windows.UI.ViewManagement;
+using Color = Windows.UI.Color;
 
 namespace YuWangCloudSync.Tray;
 
@@ -20,9 +22,30 @@ internal static class WinUiWindowChrome
         internal required IntPtr Handle { get; init; }
         internal required DispatcherQueue Dispatcher { get; init; }
         internal bool Closed;
+        internal (bool Dark, bool HighContrast)? CaptionPalette;
     }
 
     private static readonly Dictionary<Window, State> States = new();
+    private static UISettings? _uiSettings;
+    internal static event Action? SystemColorsChanged;
+
+    private static void ObserveSystemColors(DispatcherQueue dispatcher)
+    {
+        if (_uiSettings is not null) return;
+        _uiSettings = new UISettings();
+        _uiSettings.ColorValuesChanged += (_, _) => dispatcher.TryEnqueue(() =>
+        {
+            foreach (var state in States.Values) EnqueueRefresh(state, updateInsets: false);
+            SystemColorsChanged?.Invoke();
+        });
+    }
+
+    internal static bool IsHighContrast()
+    {
+        var contrast = new HighContrast { Size = (uint)Marshal.SizeOf<HighContrast>() };
+        return SystemParametersInfoW(0x0042 /* SPI_GETHIGHCONTRAST */, contrast.Size, ref contrast, 0)
+            && (contrast.Flags & 1 /* HCF_HIGHCONTRASTON */) != 0;
+    }
 
     internal static Grid Attach(Window window, FrameworkElement content, string title, string glyph = "\uE753")
     {
@@ -63,7 +86,6 @@ internal static class WinUiWindowChrome
         Grid.SetRow(content, 1);
         layout.Children.Add(content);
         window.Content = layout;
-        content.RequestedTheme = ElementTheme.Default;
         window.ExtendsContentIntoTitleBar = true;
         window.SystemBackdrop = new MicaBackdrop();
         window.SetTitleBar(titleBar);
@@ -77,20 +99,21 @@ internal static class WinUiWindowChrome
         var state = new State
         {
             Window = window,
-            ThemeRoot = content,
+            ThemeRoot = layout,
             LeftInset = insetColumns[0],
             RightInset = insetColumns[2],
             Handle = handle,
             Dispatcher = dispatcher,
         };
         States.Add(window, state);
+        ObserveSystemColors(dispatcher);
 
         window.Activated += (_, args) =>
         {
             if (args.WindowActivationState != WindowActivationState.Deactivated)
                 EnqueueRefresh(state, updateInsets: true);
         };
-        content.ActualThemeChanged += (_, _) => EnqueueRefresh(state, updateInsets: false);
+        layout.ActualThemeChanged += (_, _) => EnqueueRefresh(state, updateInsets: false);
         window.AppWindow.Changed += (_, args) =>
         {
             if (args.DidSizeChange || args.DidPositionChange || args.DidPresenterChange)
@@ -103,7 +126,7 @@ internal static class WinUiWindowChrome
         };
 
         // The WinUI root keeps ElementTheme.Default. WinUI resources and Mica follow the
-        // Windows theme; native caption theme is synchronized only after activation.
+        // Windows theme; caption button colors also need to track the XAML backdrop.
         EnqueueRefresh(state, updateInsets: true);
         return layout;
     }
@@ -111,7 +134,7 @@ internal static class WinUiWindowChrome
     internal static bool IsConfigured(Window window) => States.ContainsKey(window)
         && window.ExtendsContentIntoTitleBar && window.SystemBackdrop is MicaBackdrop;
 
-    internal static bool CanUpdateTitleBar(Window window) => States.TryGetValue(window, out var state)
+    internal static bool CanUpdateTitleBarInsets(Window window) => States.TryGetValue(window, out var state)
         && !state.Closed && IsWindowVisible(state.Handle) && !IsIconic(state.Handle)
         && GetForegroundWindow() == state.Handle;
 
@@ -120,26 +143,50 @@ internal static class WinUiWindowChrome
         if (state.Closed) return;
         state.Dispatcher.TryEnqueue(() =>
         {
-            // AppWindow inset reads and DWM/titlebar writes can fail during minimize or
-            // while this tool window is behind another application. Recheck after dispatch.
-            if (!CanUpdateTitleBar(state.Window)) return;
+            // Never touch the caption or its insets from a minimize transition. Inset
+            // reads also remain foreground-only; inactive visible windows still need colors.
+            if (state.Closed || !IsWindowVisible(state.Handle) || IsIconic(state.Handle)) return;
 
-            ApplyNativeTheme(state);
-            if (updateInsets) UpdateInsets(state);
+            try
+            {
+                ApplyNativeTheme(state);
+                if (updateInsets && CanUpdateTitleBarInsets(state.Window)) UpdateInsets(state);
+            }
+            catch (COMException error)
+            {
+                // AppWindow can lose its native caption between the HWND check and the call.
+                Serilog.Log.Debug(error, "无法同步窗口标题栏主题");
+            }
         });
     }
 
     private static void ApplyNativeTheme(State state)
     {
         var dark = state.ThemeRoot.ActualTheme == ElementTheme.Dark;
-        var useDarkMode = dark ? 1 : 0;
+        var highContrast = IsHighContrast();
+        if (state.CaptionPalette == (dark, highContrast)) return;
+        var useDarkMode = dark && !highContrast ? 1 : 0;
         const uint DwmwaUseImmersiveDarkMode = 20;
         _ = DwmSetWindowAttribute(state.Handle, DwmwaUseImmersiveDarkMode,
             ref useDarkMode, sizeof(int));
 
-        // Let Windows choose caption colors for dark mode, accent colors, high contrast,
-        // inactive windows and the close button's distinct hover/pressed states.
-        // AppWindowTitleBar color properties stay at their default (null) values.
+        if (AppWindowTitleBar.IsCustomizationSupported())
+        {
+            var bar = state.Window.AppWindow.TitleBar;
+            // DWM immersive mode alone does not set the extended AppWindow button
+            // foreground. Match the Mica surface, but hand control back in high contrast.
+            Color? foreground = highContrast ? null : dark ? Colors.White : Color.FromArgb(255, 26, 26, 26);
+            Color? inactive = highContrast ? null : dark ? Color.FromArgb(255, 181, 181, 181) : Color.FromArgb(255, 92, 92, 92);
+            bar.ButtonBackgroundColor = highContrast ? null : Colors.Transparent;
+            bar.ButtonInactiveBackgroundColor = highContrast ? null : Colors.Transparent;
+            bar.ButtonForegroundColor = foreground;
+            bar.ButtonInactiveForegroundColor = inactive;
+            bar.ButtonHoverForegroundColor = foreground;
+            bar.ButtonPressedForegroundColor = foreground;
+            bar.ButtonHoverBackgroundColor = highContrast ? null : dark ? Color.FromArgb(22, 255, 255, 255) : Color.FromArgb(15, 0, 0, 0);
+            bar.ButtonPressedBackgroundColor = highContrast ? null : dark ? Color.FromArgb(34, 255, 255, 255) : Color.FromArgb(24, 0, 0, 0);
+        }
+        state.CaptionPalette = (dark, highContrast);
     }
 
     private static void UpdateInsets(State state)
@@ -149,6 +196,17 @@ internal static class WinUiWindowChrome
         state.LeftInset.Width = new GridLength(titleBar.LeftInset / scale);
         state.RightInset.Width = new GridLength(titleBar.RightInset / scale);
     }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct HighContrast
+    {
+        internal uint Size;
+        internal uint Flags;
+        internal nint Scheme;
+    }
+
+    [DllImport("user32.dll", ExactSpelling = true)]
+    private static extern bool SystemParametersInfoW(uint action, uint size, ref HighContrast value, uint flags);
 
     [DllImport("user32.dll")]
     private static extern IntPtr GetForegroundWindow();

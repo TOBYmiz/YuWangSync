@@ -24,8 +24,6 @@ internal static unsafe class VirtualFileDragSelfTest
         Marshal.ThrowExceptionForHR(initialized);
         try
         {
-            check(NativeFileDrag.CheckOriginalItemVisual(new DragItemVisual(new byte[32 * 16 * 4], 32, 16, 2, 2)),
-                "original item image initializes on the actual virtual data object without leaking GDI/USER resources");
             RunPrivateMedia(check);
             RunCompletionWithUnusedStream(check);
             var requested = 0; var disposed = 0;
@@ -216,7 +214,7 @@ internal static unsafe class VirtualFileDragSelfTest
             return ((delegate* unmanaged[Stdcall]<nint, VirtualFileDataObject.Format*, VirtualFileDataObject.Medium*, int, int>)(*(nint**)data)[7])
                 (data, &format, pointer, release);
     }
-    internal static Task<string> ReceiveAsync(nint data, string expectedName, string copyPath)
+    internal static Task ReceiveAsync(nint data, IReadOnlyDictionary<string, string> copyPaths)
     {
         var asyncId = new Guid("3D8B0590-F691-11d2-8EA9-006097DF5BD4");
         var dataId = new Guid("0000010E-0000-0000-C000-000000000046");
@@ -240,32 +238,43 @@ internal static unsafe class VirtualFileDragSelfTest
                 {
                     Marshal.ThrowExceptionForHR(CoGetInterfaceAndReleaseStream(packet, in dataId, out receiver));
                     Marshal.ThrowExceptionForHR(Marshal.QueryInterface(receiver, in asyncId, out asyncReceiver));
+                    var outputs = new string[copyPaths.Count];
                     var descriptor = GetData(receiver, F("FileGroupDescriptorW", 1, -1));
                     try
                     {
                         var memory = GlobalLock(descriptor.Value);
+                        if (memory == 0) throw new IOException("无法读取虚拟文件清单。");
                         try
                         {
-                            if (Marshal.ReadInt32(memory) != 1 || Marshal.PtrToStringUni(memory + 4 + 72) != expectedName)
-                                throw new IOException("接收方取得的虚拟文件描述不匹配。");
+                            if (Marshal.ReadInt32(memory) != outputs.Length)
+                                throw new IOException("接收方取得的虚拟文件数量不匹配。");
+                            var seen = new HashSet<string>(StringComparer.Ordinal);
+                            for (var i = 0; i < outputs.Length; i++)
+                            {
+                                var name = Marshal.PtrToStringUni(memory + 4 + i * 592 + 72);
+                                if (name is null || !copyPaths.TryGetValue(name, out var output) || !seen.Add(name))
+                                    throw new IOException("接收方取得了意外或重复的虚拟文件：" + name);
+                                outputs[i] = output;
+                            }
                         }
                         finally { GlobalUnlock(descriptor.Value); }
                     }
                     finally { ReleaseStgMedium(ref descriptor); }
-                    var medium = GetData(receiver, F("FileContents", 4, 0));
-                    try
+                    for (var i = 0; i < outputs.Length; i++)
                     {
-                        using var output = File.Create(copyPath);
-                        var buffer = new byte[64 * 1024];
-                        while (true)
+                        var medium = GetData(receiver, F("FileContents", 4, i));
+                        try
                         {
-                            var bytes = ReadPointer(medium.Value, buffer.Length);
-                            if (bytes.Length == 0) break;
-                            output.Write(bytes);
+                            using var output = File.Create(outputs[i]);
+                            while (true)
+                            {
+                                var bytes = ReadPointer(medium.Value, 64 * 1024);
+                                if (bytes.Length == 0) break;
+                                output.Write(bytes);
+                            }
                         }
+                        finally { ReleaseStgMedium(ref medium); }
                     }
-                    finally { ReleaseStgMedium(ref medium); }
-                    return File.ReadAllText(copyPath);
                 }
                 catch (Exception error) { result = Marshal.GetHRForException(error); throw; }
                 finally

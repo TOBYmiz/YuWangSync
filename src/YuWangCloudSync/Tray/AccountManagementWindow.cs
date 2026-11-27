@@ -134,9 +134,8 @@ internal sealed class AccountManagementWindow : Window
             PrimaryButtonText = "删除",
             CloseButtonText = "取消",
             DefaultButton = ContentDialogButton.Close,
-            XamlRoot = Root.XamlRoot,
-            RequestedTheme = Root.ActualTheme,
         };
+        WinUiUiHost.AttachDialogToRoot(dialog, Root);
         dialog.Style = WinUiUiHost.GetStyleResource("DefaultContentDialogStyle");
         if (await dialog.ShowAsync() != ContentDialogResult.Primary) return;
 
@@ -227,10 +226,9 @@ internal sealed class AccountManagementWindow : Window
             PrimaryButtonText = "登录并保存",
             CloseButtonText = "取消",
             DefaultButton = ContentDialogButton.Primary,
-            XamlRoot = Root.XamlRoot,
-            RequestedTheme = Root.ActualTheme,
             IsPrimaryButtonEnabled = false,
         };
+        WinUiUiHost.AttachDialogToRoot(dialog, Root);
         var dialogClosed = false;
         var isRefreshingCaptcha = false;
         var isAuthenticating = false;

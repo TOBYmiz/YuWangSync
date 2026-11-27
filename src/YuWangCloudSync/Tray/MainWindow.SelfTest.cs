@@ -170,6 +170,35 @@ internal sealed partial class MainWindow
             var accountFooter = (Grid)browser._root.FindName("CloudAccountFooter");
             var addressBox = (Border)browser._root.FindName("CloudAddressBox");
             var diskHeader = (Grid)browser._root.FindName("CloudDiskHeader");
+            var filePane = (Border)browser._root.FindName("CloudFilePane");
+            var typeCell = rowGrid!.Children.OfType<TextBlock>().Single(text => Grid.GetColumn(text) == 3);
+            var savedFolder = browser._currentFolder;
+            browser._currentFolder = savedFolder! with { Permission = DirectoryPermission.ReadOnly };
+            browser.UpdatePermissionBadge();
+            browser.RenderBreadcrumbs();
+            var breadcrumbIcon = browser._breadcrumbItems.Children.OfType<FontIcon>().First();
+            browser.ToggleFavorite(diskState);
+            var favoriteButton = browser._favoriteRows.Children.OfType<Button>().First();
+            var favoriteContent = (Grid)favoriteButton.Content;
+            var favoriteText = favoriteContent.Children.OfType<TextBlock>().Single();
+            var favoriteIcon = favoriteContent.Children.OfType<FontIcon>().Single();
+            var titleBar = browser.AppWindow.TitleBar;
+            checks.AddRange(await WinUiUiHost.CheckLiveThemeAsync((FrameworkElement)browser.Content,
+                ("File pane surface follows theme", () => WinUiUiHost.BrushColor(filePane.Background)),
+                ("Breadcrumb surface follows theme", () => WinUiUiHost.BrushColor(addressBox.Background)),
+                ("Breadcrumb glyph follows theme", () => WinUiUiHost.BrushColor(breadcrumbIcon.Foreground)),
+                ("Existing file type text follows theme", () => WinUiUiHost.BrushColor(typeCell.Foreground)),
+                ("Selected favorite surface follows theme", () => WinUiUiHost.BrushColor(favoriteButton.Background)),
+                ("Existing favorite name follows theme", () => WinUiUiHost.BrushColor(favoriteText.Foreground)),
+                ("Existing favorite glyph follows theme", () => WinUiUiHost.BrushColor(favoriteIcon.Foreground)),
+                ("Read-only badge follows theme", () => WinUiUiHost.BrushColor(browser._permissionBadge.Background)),
+                ("Read-only glyph follows theme", () => WinUiUiHost.BrushColor(browser._permissionGlyph.Foreground)),
+                ("Read-only text follows theme", () => WinUiUiHost.BrushColor(browser._permissionText.Foreground)),
+                ("Active caption buttons follow theme", () => titleBar.ButtonForegroundColor),
+                ("Inactive caption buttons follow theme", () => titleBar.ButtonInactiveForegroundColor)));
+            browser.ToggleFavorite(diskState);
+            browser._currentFolder = savedFolder;
+            browser.UpdatePermissionBadge();
             var commandHost = (Grid)browser._root.FindName("CloudCommandBarHost");
             var statusFooter = browser._statusBar!;
             var layoutScale = browser._root.XamlRoot?.RasterizationScale ?? 1;
@@ -516,10 +545,8 @@ internal sealed partial class MainWindow
             Check("Drag progress includes cached files", aggregate.Progress.Latest is
                 { CompletedBytes: 2048, TotalBytes: 4096, Percent: 50, CompletedFiles: 1, TotalFiles: 2 },
                 "Aggregate hydration progress counts already cached bytes and ready files before their streams are requested.");
-            var originalVisual = await browser.CaptureDragItemAsync(draggedRow);
-            Check("Drag keeps original item visual", originalVisual is { Width: > 0, Height: > 0 }
-                && NativeFileDrag.CheckOriginalItemVisual(originalVisual),
-                "The full selected row supplies OLE and metadata previews; repeated creation releases GDI/USER resources.");
+            var preview = DragItemPreview.CheckLayout();
+            Check("Live drag preview is rounded, compact and reuses the file-list image", preview.Passed, preview.Detail);
             browser.ShowDragPreparationProgress(new("正在下载文件", "精确进度.txt", 512, 2048, 1, 3));
             Check("Drag hydration progress UI", browser._transferProgress.Visibility == Microsoft.UI.Xaml.Visibility.Visible
                 && !browser._transferProgress.IsIndeterminate && browser._transferProgress.Value == 25
@@ -597,16 +624,23 @@ internal sealed partial class MainWindow
                 && !browser._transferProgress.IsIndeterminate && !browser._dragProgressTimer.IsEnabled
                 && browser._status.Text.Length == 0,
                 "Completion and cancellation hide progress; late samples from an old selection cannot change the UI.");
+            checks.AddRange(await DragItemPreview.CheckVisualsAsync(layoutScale));
             if (Environment.GetCommandLineArgs().Contains("--ui-selftest-pointer-drag", StringComparer.OrdinalIgnoreCase))
             {
                 var externalPointer = Environment.GetCommandLineArgs().Contains("--ui-selftest-external-pointer", StringComparer.OrdinalIgnoreCase);
                 var injectedTouch = Environment.GetCommandLineArgs().Contains("--ui-selftest-touch-ole", StringComparer.OrdinalIgnoreCase)
                     || Environment.GetCommandLineArgs().Contains("--ui-selftest-injected-touch", StringComparer.OrdinalIgnoreCase);
-                if (!externalPointer && !injectedTouch)
-                    checks.Add(await browser.CheckWinUiPointerDragAsync(draggedRow, path, testRoot, cancel: true));
+                if (!externalPointer)
+                    checks.Add(await browser.CheckWinUiPointerDragAsync(draggedRow, path, testRoot, cancel: true,
+                        injectedTouch: injectedTouch, additionalSelection: oldRow));
                 checks.Add(await browser.CheckWinUiPointerDragAsync(draggedRow, path, testRoot, injectedTouch: injectedTouch));
-                if (!externalPointer && !injectedTouch)
-                    checks.Add(await browser.CheckWinUiPointerDragAsync(draggedRow, path, testRoot, repeat: true));
+                if (!externalPointer)
+                {
+                    checks.Add(await browser.CheckWinUiPointerDragAsync(draggedRow, path, testRoot,
+                        injectedTouch: injectedTouch, additionalSelection: oldRow));
+                    checks.Add(await browser.CheckWinUiPointerDragAsync(draggedRow, path, testRoot, repeat: true,
+                        injectedTouch: injectedTouch, additionalSelection: oldRow));
+                }
             }
             if (browser._isClosed) return checks;
 

@@ -6,28 +6,6 @@ namespace YuWangCloudSync.Tray;
 
 internal sealed unsafe partial class NativeFileDrag
 {
-    internal static bool CheckOriginalItemVisual(DragItemVisual visual)
-    {
-        void Exercise()
-        {
-            using var data = new VirtualFileDataObject([new("外观测试.txt", false, 0, null)], CancellationToken.None);
-            using var drag = new NativeFileDrag(preparing: false);
-            Marshal.Release(drag._data);
-            drag._data = data.Pointer;
-            Marshal.AddRef(drag._data);
-            drag.SetItemVisual(visual);
-            drag.ShowItemPreview(visual);
-            drag.MovePreparationImage();
-            drag.HidePreparationImage();
-            if (!VirtualFileDragSelfTest.SupportsDescriptors(data.Pointer)) throw new IOException("拖拽图像覆盖了虚拟文件描述符。");
-        }
-        Exercise();
-        var process = GetCurrentProcess();
-        var gdi = GetGuiResources(process, 0); var user = GetGuiResources(process, 1);
-        for (var i = 0; i < 5; i++) Exercise();
-        return GetGuiResources(process, 0) <= gdi + 1 && GetGuiResources(process, 1) <= user + 1;
-    }
-
     // Exercises the actual Shell IDataObject and generated IDropSource ABI without entering OLE's loop.
     internal static bool CheckNativeDataObject(string path)
     {

@@ -277,10 +277,10 @@ internal sealed class AboutWindow : Window
             TextWrapping = TextWrapping.Wrap,
             TextAlignment = TextAlignment.Right,
             MaxWidth = 330,
-            Foreground = WinUiUiHost.GetBrushResource("TextFillColorPrimaryBrush"),
         };
         var link = new HyperlinkButton
         {
+            Name = "RepositoryLink",
             Content = linkText,
             NavigateUri = new Uri(RepositoryUrl),
             Padding = new Thickness(0),
@@ -289,16 +289,6 @@ internal sealed class AboutWindow : Window
             HorizontalAlignment = HorizontalAlignment.Right,
             VerticalAlignment = VerticalAlignment.Center,
             HorizontalContentAlignment = HorizontalAlignment.Right,
-        };
-        link.PointerEntered += (_, _) =>
-        {
-            linkText.Foreground = WinUiUiHost.GetBrushResource("AccentTextFillColorPrimaryBrush");
-            linkText.TextDecorations = Windows.UI.Text.TextDecorations.Underline;
-        };
-        link.PointerExited += (_, _) =>
-        {
-            linkText.Foreground = WinUiUiHost.GetBrushResource("TextFillColorPrimaryBrush");
-            linkText.TextDecorations = Windows.UI.Text.TextDecorations.None;
         };
         Grid.SetColumn(link, 1);
         row.Children.Add(link);
@@ -310,7 +300,7 @@ internal sealed class AboutWindow : Window
         panel.Children.Add(new Border
         {
             Height = 1,
-            Background = WinUiUiHost.GetBrushResource("CardStrokeColorDefaultBrush"),
+            Style = WinUiUiHost.GetStyleResource("YuWangCardDividerStyle"),
         });
     }
 
@@ -479,9 +469,8 @@ internal sealed class AboutWindow : Window
             PrimaryButtonStyle = WinUiUiHost.GetStyleResource("AccentButtonStyle"),
             CloseButtonText = "取消",
             DefaultButton = ContentDialogButton.Primary,
-            XamlRoot = _root.XamlRoot,
-            RequestedTheme = _root.ActualTheme,
         };
+        WinUiUiHost.AttachDialogToRoot(dialog, _root);
         dialog.Opened += (_, _) =>
         {
             _releaseDialogUpdateButton = FindPrimaryDialogButton(dialog);
@@ -704,7 +693,7 @@ internal sealed class AboutWindow : Window
                 panel.Children.Add(new Border
                 {
                     Height = 1,
-                    Background = WinUiUiHost.GetBrushResource("CardStrokeColorDefaultBrush"),
+                    Style = WinUiUiHost.GetStyleResource("YuWangCardDividerStyle"),
                 });
                 index++;
                 continue;
@@ -869,10 +858,7 @@ internal sealed class AboutWindow : Window
                 && TryReadMarkdownLink(text, index, out var linkEnd, out var label, out var linkUri))
             {
                 FlushPlain();
-                var link = new Hyperlink
-                {
-                    Foreground = WinUiUiHost.GetBrushResource("AccentTextFillColorPrimaryBrush"),
-                };
+                var link = new Hyperlink();
                 link.Click += (_, _) => OpenExternalLink(linkUri);
                 AppendMarkdownInlines(link.Inlines, label, depth + 1);
                 inlines.Add(link);
@@ -883,10 +869,7 @@ internal sealed class AboutWindow : Window
             if (TryReadBareLink(text, index, out var bareLinkEnd, out var bareLinkUri))
             {
                 FlushPlain();
-                var link = new Hyperlink
-                {
-                    Foreground = WinUiUiHost.GetBrushResource("AccentTextFillColorPrimaryBrush"),
-                };
+                var link = new Hyperlink();
                 link.Click += (_, _) => OpenExternalLink(bareLinkUri);
                 link.Inlines.Add(new Run { Text = bareLinkUri.AbsoluteUri });
                 inlines.Add(link);
@@ -1010,9 +993,8 @@ internal sealed class AboutWindow : Window
             Content = message,
             CloseButtonText = "确定",
             DefaultButton = ContentDialogButton.Close,
-            XamlRoot = _root.XamlRoot,
-            RequestedTheme = _root.ActualTheme,
         };
+        WinUiUiHost.AttachDialogToRoot(dialog, _root);
         dialog.Style = WinUiUiHost.GetStyleResource("DefaultContentDialogStyle");
         try { await dialog.ShowAsync(); }
         catch (Exception error) { Serilog.Log.Warning(error, "无法显示更新失败信息"); }

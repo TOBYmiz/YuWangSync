@@ -26,6 +26,94 @@
             <Style x:Key="YuWangImageFrameStyle" TargetType="Border" BasedOn="{StaticResource YuWangCardStyle}">
                 <Setter Property="Padding" Value="8" />
             </Style>
+
+            <!-- Programmatically created visuals set a style rather than a local brush value.
+                 ThemeResource setters are resolved in the element's theme and track later changes. -->
+            <Style x:Key="YuWangDividerStyle" TargetType="Border">
+                <Setter Property="Background" Value="{ThemeResource DividerStrokeColorDefaultBrush}" />
+            </Style>
+            <Style x:Key="YuWangCardDividerStyle" TargetType="Border">
+                <Setter Property="Background" Value="{ThemeResource CardStrokeColorDefaultBrush}" />
+            </Style>
+            <Style x:Key="YuWangDividedGridStyle" TargetType="Grid">
+                <Setter Property="BorderBrush" Value="{ThemeResource DividerStrokeColorDefaultBrush}" />
+            </Style>
+            <Style x:Key="YuWangAccountAvatarStyle" TargetType="Border">
+                <Setter Property="Background" Value="{ThemeResource AccentFillColorDefaultBrush}" />
+            </Style>
+            <Style x:Key="YuWangOnAccentIconStyle" TargetType="FontIcon">
+                <Setter Property="Foreground" Value="{ThemeResource TextOnAccentFillColorPrimaryBrush}" />
+            </Style>
+            <Style x:Key="YuWangMutedIconStyle" TargetType="FontIcon">
+                <Setter Property="Foreground" Value="{ThemeResource TextFillColorTertiaryBrush}" />
+            </Style>
+            <Style x:Key="YuWangSecondaryIconStyle" TargetType="FontIcon">
+                <Setter Property="Foreground" Value="{ThemeResource TextFillColorSecondaryBrush}" />
+            </Style>
+            <Style x:Key="YuWangAccentIconStyle" TargetType="FontIcon">
+                <Setter Property="Foreground" Value="{ThemeResource AccentTextFillColorPrimaryBrush}" />
+            </Style>
+            <Style x:Key="YuWangDropTargetStyle" TargetType="Border">
+                <Setter Property="BorderBrush" Value="{ThemeResource AccentFillColorDefaultBrush}" />
+                <Setter Property="Background" Value="{ThemeResource SubtleFillColorSecondaryBrush}" />
+            </Style>
+            <Style x:Key="YuWangDropLabelStyle" TargetType="TextBlock" BasedOn="{StaticResource BodyStrongTextBlockStyle}">
+                <Setter Property="Foreground" Value="{ThemeResource AccentTextFillColorPrimaryBrush}" />
+            </Style>
+            <Style x:Key="YuWangFilePaneStyle" TargetType="Border">
+                <Setter Property="Background" Value="{ThemeResource LayerFillColorDefaultBrush}" />
+                <Setter Property="BorderBrush" Value="{ThemeResource CardStrokeColorDefaultBrush}" />
+            </Style>
+            <Style x:Key="YuWangAddressBoxStyle" TargetType="Border">
+                <Setter Property="Background" Value="{ThemeResource ControlFillColorDefaultBrush}" />
+                <Setter Property="BorderBrush" Value="{ThemeResource ControlStrokeColorDefaultBrush}" />
+            </Style>
+            <Style x:Key="YuWangSecondaryTextStyle" TargetType="TextBlock">
+                <Setter Property="Foreground" Value="{ThemeResource TextFillColorSecondaryBrush}" />
+            </Style>
+            <Style x:Key="YuWangReadOnlyBadgeStyle" TargetType="Border">
+                <Setter Property="Background" Value="{ThemeResource SystemFillColorCautionBackgroundBrush}" />
+            </Style>
+            <Style x:Key="YuWangReadOnlyIconStyle" TargetType="FontIcon">
+                <Setter Property="Foreground" Value="{ThemeResource SystemFillColorCautionBrush}" />
+            </Style>
+            <Style x:Key="YuWangWritableBadgeStyle" TargetType="Border">
+                <Setter Property="Background" Value="{ThemeResource SystemFillColorSuccessBackgroundBrush}" />
+            </Style>
+            <Style x:Key="YuWangSuccessIconStyle" TargetType="FontIcon">
+                <Setter Property="Foreground" Value="{ThemeResource SystemFillColorSuccessBrush}" />
+            </Style>
+            <Style x:Key="YuWangUnconfirmedBadgeStyle" TargetType="Border">
+                <Setter Property="Background" Value="{ThemeResource SubtleFillColorSecondaryBrush}" />
+            </Style>
+            <Style x:Key="YuWangFavoriteUnavailableStyle" TargetType="Button" BasedOn="{StaticResource SubtleButtonStyle}">
+                <Setter Property="Foreground" Value="{ThemeResource TextFillColorSecondaryBrush}" />
+            </Style>
+            <Style x:Key="YuWangFavoriteSelectedStyle" TargetType="Button" BasedOn="{StaticResource SubtleButtonStyle}">
+                <Setter Property="Background" Value="{ThemeResource SubtleFillColorSecondaryBrush}" />
+            </Style>
+            <Style x:Key="YuWangFavoriteSelectedUnavailableStyle" TargetType="Button" BasedOn="{StaticResource YuWangFavoriteUnavailableStyle}">
+                <Setter Property="Background" Value="{ThemeResource SubtleFillColorSecondaryBrush}" />
+            </Style>
+            <Style x:Key="YuWangSuccessCountdownStyle" TargetType="Border">
+                <Setter Property="Background" Value="{ThemeResource SystemFillColorSuccessBrush}" />
+            </Style>
+            <Style x:Key="YuWangAvailableOutlineStyle" TargetType="Border">
+                <Setter Property="BorderBrush" Value="{ThemeResource SystemFillColorSuccessBrush}" />
+            </Style>
+            <Style x:Key="YuWangPinnedStatusStyle" TargetType="Border" BasedOn="{StaticResource YuWangAvailableOutlineStyle}">
+                <Setter Property="Background" Value="{ThemeResource SystemFillColorSuccessBrush}" />
+            </Style>
+            <Style x:Key="YuWangErrorStatusStyle" TargetType="Border">
+                <Setter Property="Background" Value="{ThemeResource SystemFillColorCriticalBrush}" />
+            </Style>
+            <Style x:Key="YuWangOnStatusIconStyle" TargetType="FontIcon">
+                <Setter Property="Foreground" Value="{ThemeResource SolidBackgroundFillColorBaseBrush}" />
+            </Style>
+            <Style x:Key="YuWangTransferRingStyle" TargetType="ProgressRing">
+                <Setter Property="Foreground" Value="{ThemeResource AccentTextFillColorPrimaryBrush}" />
+                <Setter Property="Background" Value="{ThemeResource SubtleFillColorSecondaryBrush}" />
+            </Style>
         </ResourceDictionary>
     </Application.Resources>
 </Application>

@@ -13,25 +13,57 @@ internal sealed partial class MainWindow
     // Opt-in desktop integration test. Inject an input contact from this isolated
     // browser into a separate STA drop target and verify complete virtual-file extraction.
     private async Task<UiSelfTestCheck> CheckWinUiPointerDragAsync(ListViewItem source, string path, string testRoot,
-        bool cancel = false, bool repeat = false, bool injectedTouch = false)
+        bool cancel = false, bool repeat = false, bool injectedTouch = false, ListViewItem? additionalSelection = null)
     {
         NativeVirtualFileReceiverWindow? receiverWindow = null;
-        var dropped = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var dropped = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var oleStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var touchDragRecognized = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var touchReleasedObserved = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var allowManifest = new TaskCompletionSource<DragManifest>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var previewReady = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var cancelIssued = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        Func<Task>? cancelGesture = cancel ? () =>
+        {
+            cancelIssued.TrySetResult();
+            return CancelPointerTestAsync();
+        } : null;
+        nint previewHandle = 0;
+        var previewBeforeOle = false;
+        var previewCountMatched = false;
+        string? previewCountLabel = null;
+        var expectedPreviewMode = injectedTouch ? "touch" : "mouse";
+        string? previewMode = null;
+        var previewAtGap = false;
+        var previewOverReceiver = false;
+        var previewPassedHitTest = false;
+        var previewStayedVisible = true;
+        var previewMoved = false;
         var overCount = 0;
         var firstX = double.NaN;
         var lastX = double.NaN;
         var coordinates = "";
-        var suffix = cancel ? "-cancel" : repeat ? "-repeat" : "";
+        var suffix = (additionalSelection is null ? "" : "-multi") + (cancel ? "-cancel" : repeat ? "-repeat" : "");
+        var inputMode = injectedTouch ? "Touch" : "Mouse";
+        var caseName = additionalSelection is null ? $"{inputMode} single-file drag copies the complete file"
+            : cancel ? $"{inputMode} multi-file drag cancels without extracting files"
+            : repeat ? $"{inputMode} multi-file drag repeats without losing selected files"
+            : $"{inputMode} multi-file drag copies all selected files";
         var tracePath = Path.Combine(testRoot, $"pointer-drag{suffix}-trace.txt");
-        var copiedPath = Path.Combine(testRoot, $"pointer-drag{suffix}-copied.txt");
+        var sourcePaths = new Dictionary<string, string>(StringComparer.Ordinal) { [Path.GetFileName(path)] = path };
+        if (additionalSelection?.Tag is YuWangItem additionalItem)
+            sourcePaths.Add(additionalItem.Name, Path.Combine(testRoot, additionalItem.Name));
+        var copyPaths = sourcePaths.Keys.Select((name, index) => (name,
+                path: Path.Combine(testRoot, $"pointer-drag{suffix}-copied-{index}.bin")))
+            .ToDictionary(file => file.name, file => file.path, StringComparer.Ordinal);
+        var expectedCountLabel = sourcePaths.Count > 1 ? $"等 {sourcePaths.Count} 项" : null;
         var pointerRoot = (UIElement)Content;
         var traceGate = new object();
         void Trace(string message)
         {
             if (message.Contains("OLE mouse bridge ready", StringComparison.Ordinal)) oleStarted.TrySetResult();
+            if (message.StartsWith("Drag preview shown; mode=", StringComparison.Ordinal))
+                previewMode = message.Contains("mode=touch;", StringComparison.Ordinal) ? "touch" : "mouse";
             if (message.Contains("Touch drag recognised", StringComparison.Ordinal)) touchDragRecognized.TrySetResult();
             if (message.Contains("Touch pointer contact ended", StringComparison.Ordinal)
                 || message.Contains("Touch contact ended", StringComparison.Ordinal)
@@ -58,10 +90,12 @@ internal sealed partial class MainWindow
         var previousDiagnostic = _dragDiagnostic;
         _dragDiagnostic = Trace;
         var externalInput = Environment.GetCommandLineArgs().Contains("--ui-selftest-external-pointer", StringComparer.OrdinalIgnoreCase);
-        var statusMonitor = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(100) };
+        var statusMonitor = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(16) };
+        Action? observePreview = null;
         var lastStatus = "";
         statusMonitor.Tick += (_, _) =>
         {
+            observePreview?.Invoke();
             var status = $"Status={_status.Text}; banner={_infoBar.IsOpen}: {_infoBar.Title} {_infoBar.Message}";
             if (status == lastStatus) return;
             lastStatus = status;
@@ -93,10 +127,10 @@ internal sealed partial class MainWindow
             }
             Task ReceiveFile(nint data)
             {
-                var extraction = VirtualFileDragSelfTest.ReceiveAsync(data, Path.GetFileName(path), copiedPath);
+                var extraction = VirtualFileDragSelfTest.ReceiveAsync(data, copyPaths);
                 _ = extraction.ContinueWith(task =>
                 {
-                    if (task.IsCompletedSuccessfully) dropped.TrySetResult(task.Result);
+                    if (task.IsCompletedSuccessfully) dropped.TrySetResult();
                     else if (task.IsCanceled) dropped.TrySetCanceled();
                     else dropped.TrySetException(task.Exception!.GetBaseException());
                 }, TaskScheduler.Default);
@@ -128,13 +162,22 @@ internal sealed partial class MainWindow
                 }
             _dragBackendAvailable = static () => true;
             _items.SelectedItem = source;
+            if (additionalSelection is not null)
+            {
+                SetCheckboxSelectionEnabled(true);
+                if (!source.IsSelected) _items.SelectedItems.Add(source);
+                _items.SelectedItems.Add(additionalSelection);
+                _root.UpdateLayout();
+            }
             QueueDragPreparation();
             var warmup = _dragWarmup ?? throw new InvalidOperationException("没有提前准备的拖放对象。");
             var ready = await warmup.WaitAsync(TimeSpan.FromSeconds(5));
-            if (ready.Entries.Count != 1 || ready.Entries[0].Name != Path.GetFileName(path))
+            if (ready.Entries.Count != sourcePaths.Count || !sourcePaths.Keys.ToHashSet(StringComparer.Ordinal)
+                .SetEquals(ready.Entries.Select(entry => entry.Name)))
                 throw new InvalidOperationException("已就绪文件的系统拖放数据不正确。");
-            Trace("Selection preparation is ready");
-            statusMonitor.Start();
+            Trace($"Selection preparation is ready; selected={sourcePaths.Count}");
+            // Keep the manifest pending until a real preview window has appeared.
+            if (!externalInput) _dragWarmup = allowManifest.Task;
             // The chrome wrapper adds a caption above _root; screen coordinates must
             // include that wrapper or the injected click lands in the command bar.
             var point = source.TransformToVisual((UIElement)Content)
@@ -176,10 +219,64 @@ internal sealed partial class MainWindow
                 throw new InvalidOperationException("拖放测试起点被其他进程遮挡。");
             if (targetHitWindow == 0 || targetHitProcessId != (uint)Environment.ProcessId)
                 throw new InvalidOperationException("拖放测试目标点被其他进程遮挡。");
+            var gapX = (sourceBounds.Right + targetBounds.Left) / 2;
+            (int Left, int Top) initialPreview = default;
+            observePreview = () =>
+            {
+                // Esc can close the preview while OLE is still returning and the button
+                // is down. Only require continuity before the injected cancellation.
+                if (externalInput || cancelIssued.Task.IsCompleted || !NativeFileDrag.IsLeftButtonDown || NativeFileDrag.IsEscapeDown
+                    || _dragCancellation is not { IsCancellationRequested: false }) return;
+                var handle = _dragItemPreview?.Handle ?? 0;
+                if (handle == 0 || !PointerTestIsWindowVisible(handle) || !PointerTestGetWindowRect(handle, out var bounds))
+                {
+                    if (previewHandle != 0) previewStayedVisible = false;
+                    return;
+                }
+                if (previewHandle == 0)
+                {
+                    previewHandle = handle;
+                    previewCountLabel = _dragItemPreview?.DisplayedItemCount;
+                    previewCountMatched = previewCountLabel == expectedCountLabel;
+                    initialPreview = (bounds.Left, bounds.Top);
+                    previewBeforeOle = !oleStarted.Task.IsCompleted;
+                    Trace($"Preview shown during manifest wait={previewBeforeOle}; hwnd={handle:X}");
+                    allowManifest.TrySetResult(ready);
+                    previewReady.TrySetResult();
+                }
+                else if (previewHandle != handle) previewStayedVisible = false;
+                previewMoved |= initialPreview != (bounds.Left, bounds.Top);
+                var (x, y) = NativeFileDrag.CursorPosition;
+                if (!previewAtGap && x >= sourceBounds.Right && x < targetBounds.Left && oleStarted.Task.IsCompleted)
+                {
+                    previewAtGap = true;
+                    Trace($"Preview in gap outside both windows; hwnd={handle:X}; pointer={x},{y}");
+                }
+                if (!previewOverReceiver && x >= targetBounds.Left && x < targetBounds.Right
+                    && y >= targetBounds.Top && y < targetBounds.Bottom)
+                {
+                    previewOverReceiver = true;
+                    // The preview is offset from the pointer. Check the real OLE
+                    // hotspot, not a point at the center of the acrylic window.
+                    var hit = PointerTestWindowFromPoint(new PointerTestPoint { X = x, Y = y });
+                    var cursorOutsideCard = x < bounds.Left || x >= bounds.Right || y < bounds.Top || y >= bounds.Bottom;
+                    previewPassedHitTest = cursorOutsideCard && PointerTestGetAncestor(hit, 2) == target
+                        && PointerTestGetForegroundWindow() != handle;
+                    Trace($"Preview over receiver; hwnd={handle:X}; hit at pointer={hit:X}; pointer={x},{y}; outside card={cursorOutsideCard}");
+                }
+            };
+            bool PreviewWasKeptAndDestroyed() => externalInput || (previewMode == expectedPreviewMode && previewCountMatched
+                && previewBeforeOle && previewAtGap
+                && previewOverReceiver && previewPassedHitTest && previewStayedVisible && previewMoved
+                && _dragItemPreview is null && !PointerTestIsWindow(previewHandle));
+            string PreviewDetail() => $"Preview: mode={previewMode}, count={previewCountLabel ?? "none"}, before OLE={previewBeforeOle}, gap={previewAtGap}, receiver={previewOverReceiver}, "
+                + $"drop hotspot unobstructed={previewPassedHitTest}, same and visible={previewStayedVisible}, moved={previewMoved}, "
+                + $"destroyed={previewHandle != 0 && !PointerTestIsWindow(previewHandle)}.";
+            statusMonitor.Start();
             if (injectedTouch)
             {
-                input = Task.Run(() => InjectTouchDragAsync((startX, startY), (endX, endY), touchDragRecognized.Task,
-                    oleStarted.Task, Trace));
+                input = Task.Run(() => InjectTouchDragAsync((startX, startY), (gapX, endY), (endX, endY), cancelGesture,
+                    touchDragRecognized.Task, previewReady.Task, oleStarted.Task, Trace));
             }
             else if (!externalInput) input = Task.Run(async () =>
             {
@@ -192,20 +289,25 @@ internal sealed partial class MainWindow
                     PointerTestMouseEvent(2); // left down
                     await Task.Delay(180);
                     coordinates += $"; cursor={NativeFileDrag.CursorPosition}; down={NativeFileDrag.IsLeftButtonDown}";
-                    for (var step = 1; step <= 40; step++)
+                    var dragX = Math.Min(startX + 32, sourceBounds.Right - 1);
+                    PointerTestMoveMouse(dragX, startY);
+                    await previewReady.Task.WaitAsync(TimeSpan.FromSeconds(5));
+                    await Task.Delay(160);
+                    if (oleStarted.Task.IsCompleted) throw new InvalidOperationException("鼠标尚在文件列表内时进入了 OLE。");
+                    for (var step = 1; step <= 24; step++)
                     {
-                        PointerTestMoveMouse(startX + (endX - startX) * step / 40,
-                            startY + (endY - startY) * step / 40);
+                        PointerTestMoveMouse(dragX + (gapX - dragX) * step / 24, startY + (endY - startY) * step / 24);
+                        await Task.Delay(25);
+                    }
+                    await oleStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+                    await Task.Delay(150);
+                    for (var step = 1; step <= 16; step++)
+                    {
+                        PointerTestMoveMouse(gapX + (endX - gapX) * step / 16, endY);
                         await Task.Delay(25);
                     }
                     await Task.Delay(180);
-                    if (cancel)
-                    {
-                        PointerTestKeyboardEvent(27, 0, 0, 0);
-                        await Task.Delay(80);
-                        PointerTestKeyboardEvent(27, 0, 2, 0);
-                        await Task.Delay(120);
-                    }
+                    if (cancelGesture is not null) await cancelGesture();
                     PointerTestMouseEvent(4); // left up
                     await Task.Delay(600);
                     if (!dropped.Task.IsCompleted)
@@ -225,29 +327,36 @@ internal sealed partial class MainWindow
             {
                 var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(5);
                 while (_outboundDragActive && DateTime.UtcNow < deadline) await Task.Delay(25);
-                return new UiSelfTestCheck("Pointer drag cancellation releases OLE", !_outboundDragActive
-                    && !dropped.Task.IsCompleted && !File.Exists(copiedPath) && overCount >= 2
-                    && _status.Text == "已取消拖放", $"Target events={overCount}; active={_outboundDragActive}; status={_status.Text}; no content extracted.");
+                return new UiSelfTestCheck(caseName, !_outboundDragActive
+                    && !dropped.Task.IsCompleted && copyPaths.Values.All(file => !File.Exists(file)) && overCount >= 2
+                    && _status.Text == "已取消拖放" && PreviewWasKeptAndDestroyed(),
+                    $"Target events={overCount}; active={_outboundDragActive}; status={_status.Text}; no content extracted. {PreviewDetail()}");
             }
-            var text = await dropped.Task.WaitAsync(TimeSpan.FromSeconds(externalInput ? 300 : injectedTouch ? 30 : 5));
+            await dropped.Task.WaitAsync(TimeSpan.FromSeconds(externalInput ? 300 : injectedTouch ? 30 : 5));
             if (injectedTouch) await touchReleasedObserved.Task.WaitAsync(TimeSpan.FromSeconds(5));
             var finished = DateTime.UtcNow + TimeSpan.FromSeconds(5);
             while (_outboundDragActive && DateTime.UtcNow < finished) await Task.Delay(25);
-            return new UiSelfTestCheck(injectedTouch ? "Injected touch drag reaches native receiver"
-                : repeat ? "Pointer drag repeats after copy" : "Pointer to virtual-file OLE real copy", text == await File.ReadAllTextAsync(path)
-                && !_outboundDragActive
+            var copiedFiles = 0;
+            foreach (var (name, file) in sourcePaths)
+            {
+                var actual = await File.ReadAllBytesAsync(copyPaths[name]);
+                var expected = await File.ReadAllBytesAsync(file);
+                if (actual.AsSpan().SequenceEqual(expected)) copiedFiles++;
+            }
+            return new UiSelfTestCheck(caseName, copiedFiles == sourcePaths.Count && !_outboundDragActive
                 && (!injectedTouch || touchReleasedObserved.Task.IsCompleted)
-                && overCount >= 2 && Math.Abs(lastX - firstX) > 10,
-                $"Target drag-over events={overCount}; X={firstX:F1} → {lastX:F1}; copied complete file contents; actual pointer release observed={(!injectedTouch || touchReleasedObserved.Task.IsCompleted)}; pointer source={(injectedTouch ? "Windows touch injection" : "mouse injection")}.");
+                && overCount >= 2 && Math.Abs(lastX - firstX) > 10 && PreviewWasKeptAndDestroyed(),
+                $"Target drag-over events={overCount}; X={firstX:F1} → {lastX:F1}; complete file contents={copiedFiles}/{sourcePaths.Count}; touch release observed={(injectedTouch ? touchReleasedObserved.Task.IsCompleted.ToString() : "n/a")}; pointer source={(externalInput ? "external" : injectedTouch ? "Windows touch injection" : "mouse injection")}. {PreviewDetail()}");
         }
         catch (Exception error)
         {
             var detail = $"{coordinates}; presses={presses}; moves={moves}; root presses={rootPresses}; root moves={rootMoves}; over={overCount}; X={firstX} → {lastX}; {lastStatus}; {error}";
             Trace(detail);
-            return new UiSelfTestCheck(injectedTouch ? "Injected touch drag reaches native receiver" : "WinUI pointer to OLE real copy", false, detail);
+            return new UiSelfTestCheck(caseName, false, detail);
         }
         finally
         {
+            allowManifest.TrySetCanceled();
             if (input is not null)
             {
                 try { await input; }
@@ -262,14 +371,23 @@ internal sealed partial class MainWindow
             pointerRoot.RemoveHandler(UIElement.PointerPressedEvent, rootPressed);
             pointerRoot.RemoveHandler(UIElement.PointerMovedEvent, rootMoved);
             pointerRoot.RemoveHandler(UIElement.PointerCaptureLostEvent, captureLost);
+            if (additionalSelection is not null && !_isClosed) SetCheckboxSelectionEnabled(false);
             CancelDragWarmup();
             StopTouchDragTracking();
             receiverWindow?.Dispose();
         }
     }
 
-    private static async Task InjectTouchDragAsync((int X, int Y) source, (int X, int Y) target,
-        Task touchDragRecognized, Task oleStarted, Action<string> trace)
+    private static async Task CancelPointerTestAsync()
+    {
+        PointerTestKeyboardEvent(27, 0, 0, 0);
+        await Task.Delay(80);
+        PointerTestKeyboardEvent(27, 0, 2, 0);
+        await Task.Delay(120);
+    }
+
+    private static async Task InjectTouchDragAsync((int X, int Y) source, (int X, int Y) gap,
+        (int X, int Y) target, Func<Task>? cancelGesture, Task touchDragRecognized, Task previewReady, Task oleStarted, Action<string> trace)
     {
         using var touch = new InjectedTouchContact();
         touch.Down(source);
@@ -300,25 +418,41 @@ internal sealed partial class MainWindow
             await touchDragRecognized.WaitAsync(TimeSpan.FromSeconds(1));
             trace("Windows touch injection reached ListView drag recognition");
 
-            var oleDeadline = DateTime.UtcNow + TimeSpan.FromSeconds(10);
-            while (!oleStarted.IsCompleted && DateTime.UtcNow < oleDeadline)
+            var previewDeadline = DateTime.UtcNow + TimeSpan.FromSeconds(5);
+            while (!previewReady.IsCompleted && DateTime.UtcNow < previewDeadline)
             {
                 touch.Move(dragStart);
                 await Task.Delay(40);
             }
-            await oleStarted.WaitAsync(TimeSpan.FromSeconds(1));
-            for (var step = 1; step <= 40; step++)
+            await previewReady.WaitAsync(TimeSpan.FromSeconds(1));
+            for (var frame = 0; frame < 4; frame++)
             {
-                var last = (dragStart.X + (target.X - dragStart.X) * step / 40,
-                    dragStart.Y + (target.Y - dragStart.Y) * step / 40);
-                touch.Move(last);
-                await Task.Delay(25);
+                touch.Move(dragStart);
+                await Task.Delay(40);
             }
+            if (oleStarted.IsCompleted) throw new InvalidOperationException("触点尚在文件列表内时进入了 OLE。");
+            async Task MoveBetween((int X, int Y) from, (int X, int Y) to, int steps)
+            {
+                for (var step = 1; step <= steps; step++)
+                {
+                    touch.Move((from.X + (to.X - from.X) * step / steps, from.Y + (to.Y - from.Y) * step / steps));
+                    await Task.Delay(25);
+                }
+            }
+            await MoveBetween(dragStart, gap, 24);
+            for (var frame = 0; frame < 4; frame++)
+            {
+                touch.Move(gap);
+                await Task.Delay(40);
+            }
+            await oleStarted.WaitAsync(TimeSpan.FromSeconds(1));
+            await MoveBetween(gap, target, 16);
             for (var frame = 0; frame < 5; frame++)
             {
                 touch.Move(target);
                 await Task.Delay(50);
             }
+            if (cancelGesture is not null) await cancelGesture();
             touch.Up(); // Same point as the previous injected frame.
             trace($"Windows touch injection UP; target={target}");
         }
@@ -361,6 +495,10 @@ internal sealed partial class MainWindow
     [DllImport("user32.dll", EntryPoint = "GetSystemMetrics")] private static extern int PointerTestGetSystemMetrics(int index);
     [DllImport("user32.dll", EntryPoint = "SendInput", SetLastError = true)] private static extern uint PointerTestSendInput(uint count, [In] PointerTestInput[] inputs, int size);
     [DllImport("user32.dll", EntryPoint = "WindowFromPoint")] private static extern nint PointerTestWindowFromPoint(PointerTestPoint point);
+    [DllImport("user32.dll", EntryPoint = "IsWindow")]
+    [return: MarshalAs(UnmanagedType.Bool)] private static extern bool PointerTestIsWindow(nint window);
+    [DllImport("user32.dll", EntryPoint = "IsWindowVisible")]
+    [return: MarshalAs(UnmanagedType.Bool)] private static extern bool PointerTestIsWindowVisible(nint window);
     [DllImport("user32.dll", EntryPoint = "GetWindowThreadProcessId")]
     private static extern uint PointerTestGetWindowThreadProcessId(nint window, out uint processId);
     [DllImport("user32.dll", EntryPoint = "GetWindowRect", SetLastError = true)]

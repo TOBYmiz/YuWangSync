@@ -68,7 +68,7 @@ internal sealed partial class MainWindow
         {
             Height = 1,
             VerticalAlignment = VerticalAlignment.Center,
-            Background = WinUiUiHost.GetBrushResource("DividerStrokeColorDefaultBrush"),
+            Style = WinUiUiHost.GetStyleResource("YuWangDividerStyle"),
         });
         AutomationProperties.SetName(_favoritesGrip, "调整收藏区域高度");
         var dragging = false;
@@ -292,7 +292,6 @@ internal sealed partial class MainWindow
                 Style = WinUiUiHost.GetStyleResource("YuWangCaptionTextBlockStyle"),
                 TextWrapping = TextWrapping.Wrap,
                 Margin = new Thickness(12, 4, 12, 8),
-                Foreground = WinUiUiHost.GetBrushResource("TextFillColorSecondaryBrush"),
             });
         }
         foreach (var favorite in _savedState.Favorites)
@@ -330,12 +329,9 @@ internal sealed partial class MainWindow
             {
                 Content = content,
                 Tag = favorite,
-                Style = WinUiUiHost.GetStyleResource("SubtleButtonStyle"),
                 HorizontalAlignment = HorizontalAlignment.Stretch,
                 HorizontalContentAlignment = HorizontalAlignment.Stretch,
                 Padding = new Thickness(SidebarInset, 6, SidebarInset, 6),
-                Foreground = WinUiUiHost.GetBrushResource(unavailable
-                    ? "TextFillColorSecondaryBrush" : "TextFillColorPrimaryBrush"),
             };
             AutomationProperties.SetName(button, favorite.Name + (unavailable ? "，目录暂不可用" : "，收藏文件夹"));
             ToolTipService.SetToolTip(button, unavailable
@@ -364,11 +360,19 @@ internal sealed partial class MainWindow
         foreach (var button in _favoriteRows.Children.OfType<Button>())
         {
             button.IsEnabled = !_busyNow;
-            var selected = button.Tag is FavoriteFolderState favorite && _currentFolder is { } current
+            if (button.Tag is not FavoriteFolderState favorite) continue;
+            var selected = _currentFolder is { } current
                 && favorite.DiskId == current.Disk.Id && favorite.FolderId == current.Id;
-            button.Background = selected
-                ? WinUiUiHost.GetBrushResource("SubtleFillColorSecondaryBrush")
-                : new SolidColorBrush(Microsoft.UI.Colors.Transparent);
+            var key = (favorite.DiskId, favorite.FolderId);
+            var unavailable = _unavailableFavorites.Contains(key)
+                || (_navigationTree.RootNodes.Count > 0 && !_folderNodesByKey.ContainsKey((favorite.DiskId, 0)));
+            button.Style = WinUiUiHost.GetStyleResource((selected, unavailable) switch
+            {
+                (true, true) => "YuWangFavoriteSelectedUnavailableStyle",
+                (true, false) => "YuWangFavoriteSelectedStyle",
+                (false, true) => "YuWangFavoriteUnavailableStyle",
+                _ => "SubtleButtonStyle",
+            });
         }
     }
 

@@ -215,7 +215,7 @@ internal sealed partial class MainWindow
     private void StartInfoBarCountdown()
     {
         if (_isClosed || !_uiSettings.AnimationsEnabled) return;
-        _infoBarCountdown.Background = WinUiUiHost.GetBrushResource("SystemFillColorSuccessBrush");
+        _infoBarCountdown.Style ??= WinUiUiHost.GetStyleResource("YuWangSuccessCountdownStyle");
         _infoBarCountdown.Visibility = Visibility.Visible;
         var compositor = CompositionTarget.GetCompositorForCurrentThread();
         var scale = compositor.CreateVector3KeyFrameAnimation();

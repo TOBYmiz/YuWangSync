@@ -2,10 +2,7 @@ using System.Globalization;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Input;
-using Microsoft.UI.Xaml.Media;
-using Microsoft.UI.Xaml.Media.Imaging;
 using Microsoft.UI.Input;
-using Windows.Security.Cryptography;
 using YuWangCloudSync.CloudFiles;
 using YuWangCloudSync.Core;
 using YuWangCloudSync.Net;
@@ -20,6 +17,7 @@ internal sealed partial class MainWindow
     private bool _outboundDragActive;
     private bool _dragCancelledByUser;
     private CancellationTokenSource? _dragCancellation;
+    private DragItemPreview? _dragItemPreview;
     private CancellationTokenSource? _dragWarmupCancellation;
     private Task<DragManifest>? _dragWarmup;
     private RemoteFolder? _dragWarmupFolder;
@@ -225,6 +223,7 @@ internal sealed partial class MainWindow
     {
         _dragCancelledByUser = true;
         _dragCancellation?.Cancel();
+        CloseDragItemPreview();
         _cancelDragPreparation.IsEnabled = false;
         SetProgressStatus("正在取消文件准备…");
     }
@@ -337,6 +336,7 @@ internal sealed partial class MainWindow
         if (!_touchDragging) { NativeFileDrag.ClearTouchContact(); return; }
         ReportDragDiagnostic($"Touch contact {pointer.PointerId} released (pointer event)");
         NativeFileDrag.EndTouchContact(); // Released: OLE drops; before OLE the drag cancels, as with a mouse.
+        CloseDragItemPreview();
     }
 
     // Capture on the window root keeps XAML updates and lift routed back to this window after the
@@ -386,6 +386,7 @@ internal sealed partial class MainWindow
             _touchPointer = null;
             ReleaseTouchPointerCapture();
             NativeFileDrag.EndTouchContact();
+            CloseDragItemPreview();
         }
     }
 
@@ -433,6 +434,53 @@ internal sealed partial class MainWindow
 
     #endregion
 
+    private void ShowDragItemPreview(ListViewItem row, int itemCount, bool touch, CancellationToken cancellation)
+    {
+        if (row.Tag is not YuWangItem item || _isClosed || cancellation.IsCancellationRequested
+            || !NativeFileDrag.IsLeftButtonDown || NativeFileDrag.IsEscapeDown) return;
+        try
+        {
+            var scale = _root.XamlRoot?.RasterizationScale ?? 1;
+            // Use exactly what is already loaded in the row, with no second icon lookup.
+            var icon = row.Content is Grid { Children.Count: > 0 } grid
+                && grid.Children[0] is Grid { Children.Count: > 0 } namePanel
+                && namePanel.Children[0] is Border { Child: Image image } ? image.Source : null;
+            var preview = new DragItemPreview(item.Name, item.IsFolder ? FolderGlyph : FileGlyph, scale, touch, icon, itemCount);
+            _dragItemPreview = preview;
+            ReportDragDiagnostic($"Drag preview shown; mode={(touch ? "touch" : "mouse")}; "
+                + $"items={itemCount}; size={preview.Width}x{preview.Height}; scale={scale:F2}; rowIcon={preview.UsesRowIcon}; backdrop={preview.MaterialDescription}");
+        }
+        catch (Exception error) { Serilog.Log.Debug(error, "显示拖放预览失败"); }
+    }
+
+    private bool IsPointerInsideDragList()
+    {
+        var root = (UIElement)Content;
+        var hwnd = WinRT.Interop.WindowNative.GetWindowHandle(this);
+        var origin = NativeFileDrag.ClientToScreen(hwnd, 0, 0);
+        var scale = _root.XamlRoot?.RasterizationScale ?? 1;
+        var cursor = NativeFileDrag.CursorPosition;
+        var point = new Windows.Foundation.Point((cursor.X - origin.X) / scale, (cursor.Y - origin.Y) / scale);
+        static bool Contains(FrameworkElement element, UIElement root, Windows.Foundation.Point point)
+        {
+            var bounds = element.TransformToVisual(root).TransformBounds(
+                new Windows.Foundation.Rect(0, 0, element.ActualWidth, element.ActualHeight));
+            return bounds.Contains(point);
+        }
+        // Horizontal scrolling can make the ListView wider than its visible viewport.
+        return Contains(_items, root, point) && Contains(_fileScroller, root, point);
+    }
+
+    private void CloseDragItemPreview()
+    {
+        _dragItemPreview?.Dispose();
+        _dragItemPreview = null;
+    }
+
+    /* 原整行位图捕获与向 Shell 交接的路径暂时停用；保留供对照。
+    // var visual = await CaptureDragItemAsync(row);
+    // 等待清单时调用 metadataPreview.ShowItemPreview(visual)，进入 OLE 前关闭该窗口。
+    // var copied = await NativeFileDrag.DropVirtualAsync(data, visual, canContinue, ReportDragDiagnostic);
     private async Task<DragItemVisual?> CaptureDragItemAsync(ListViewItem row)
     {
         try
@@ -471,6 +519,8 @@ internal sealed partial class MainWindow
         catch (Exception error) { Serilog.Log.Debug(error, "读取原项目拖放外观"); return null; }
     }
 
+    */
+
     private async Task StartVirtualDragAsync(RemoteFolder folder, YuWangItem[] items, ListViewItem row)
     {
         if (_outboundDragActive || _busyNow || _isClosed || items.Length == 0) return;
@@ -486,7 +536,7 @@ internal sealed partial class MainWindow
         _cancelDragPreparation.IsEnabled = true;
         var session = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var monitor = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(16) };
-        NativeFileDrag? metadataPreview = null;
+        var manifestReady = false;
         var enteredOle = false;
         try
         {
@@ -499,20 +549,29 @@ internal sealed partial class MainWindow
                 if (_isClosed || !_dragBackendAvailable()) cancellation.Cancel();
                 if (!enteredOle && (!NativeFileDrag.IsLeftButtonDown || NativeFileDrag.IsEscapeDown))
                 { _dragCancelledByUser = true; cancellation.Cancel(); }
-                try { metadataPreview?.MovePreparationImage(); }
-                catch (Exception error) { Serilog.Log.Debug(error, "移动项目预览"); cancellation.Cancel(); }
+                if (cancellation.IsCancellationRequested || !NativeFileDrag.IsLeftButtonDown || NativeFileDrag.IsEscapeDown)
+                {
+                    CloseDragItemPreview();
+                    return;
+                }
+                try { _dragItemPreview?.Move(); }
+                catch (Exception error)
+                {
+                    Serilog.Log.Debug(error, "移动拖放预览失败");
+                    CloseDragItemPreview();
+                }
             };
             monitor.Start();
-            var visual = await CaptureDragItemAsync(row);
-            if (!warmup.IsCompleted && visual is not null)
-            {
-                metadataPreview = new NativeFileDrag(preparing: false);
-                metadataPreview.ShowItemPreview(visual);
-            }
+            ShowDragItemPreview(row, items.Length, _touchDragging, cancellation.Token);
             var manifest = await warmup.WaitAsync(cancellation.Token);
-            metadataPreview?.Dispose(); metadataPreview = null;
+            manifestReady = true;
             _dragProgressState = manifest.Progress;
             manifest.Progress.Report(new("拖到目标位置后松开"));
+            // While still over the list, show only our card. Starting OLE here can
+            // make our own WinUI drop target display a second, native drag preview.
+            while (!cancellation.IsCancellationRequested && !_isClosed && NativeFileDrag.IsLeftButtonDown
+                && !NativeFileDrag.IsEscapeDown && IsPointerInsideDragList())
+                await Task.Delay(16, cancellation.Token);
             EnsureDragBackendAvailable(); cancellation.Token.ThrowIfCancellationRequested();
             if (!NativeFileDrag.IsLeftButtonDown || NativeFileDrag.IsEscapeDown) throw new OperationCanceledException();
             using var data = new VirtualFileDataObject(manifest.Entries, cancellation.Token);
@@ -527,7 +586,8 @@ internal sealed partial class MainWindow
             // Keep the UI dispatcher available for PointerReleased after the finger leaves
             // the source window. The worker's OLE loop receives the mirrored touch through
             // OleMouseInput, while the source window retains touch pointer capture.
-            var copied = await NativeFileDrag.DropVirtualAsync(data, visual, canContinue, ReportDragDiagnostic);
+            var copied = await NativeFileDrag.DropVirtualAsync(data, canContinue, ReportDragDiagnostic, TouchPointerHook.IsOutsideWindow);
+            CloseDragItemPreview();
             ReportDragDiagnostic($"OLE returned; copied={copied}; async extraction={data.InAsyncOperation}; streams={data.OpenStreams}; ended={data.OperationEnded.IsCompleted}");
             if (copied)
             {
@@ -546,7 +606,7 @@ internal sealed partial class MainWindow
         {
             if (!_isClosed)
             {
-                SetStatus("已取消文件准备");
+                SetStatus(manifestReady ? "已取消拖放" : "已取消文件准备");
                 if (!_dragBackendAvailable()) ShowInfo(InfoBarSeverity.Error, "拖放失败", "同步已停止，无法继续。");
                 else if (!_dragCancelledByUser && !Program.ApplicationCancellationToken.IsCancellationRequested && cancellation.IsCancellationRequested)
                     ShowInfo(InfoBarSeverity.Error, "拖放失败", "准备文件超时，请检查网络后重试。");
@@ -559,7 +619,7 @@ internal sealed partial class MainWindow
         }
         finally
         {
-            cancellation.Cancel(); session.TrySetResult(); monitor.Stop(); metadataPreview?.Dispose(); StopDragPreparationProgress();
+            cancellation.Cancel(); session.TrySetResult(); monitor.Stop(); CloseDragItemPreview(); StopDragPreparationProgress();
             metadataCancellation?.Cancel(); metadataCancellation?.Dispose(); _dragCancellation = null;
             _outboundDragActive = _busyNow = false;
             StopTouchDragTracking();

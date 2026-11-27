@@ -440,6 +440,7 @@ internal sealed partial class MainWindow : Window
             _fileStatusTimer.Stop();
             _syncTransferCancellation?.Cancel();
             _dragCancellation?.Cancel();
+            CloseDragItemPreview();
             CancelDragWarmup();
             StopTouchDragTracking();
             TouchPointerHook.Uninstall(WinRT.Interop.WindowNative.GetWindowHandle(this));
@@ -524,7 +525,7 @@ internal sealed partial class MainWindow : Window
                 new Border
                 {
                     Width = 1,
-                    Background = WinUiUiHost.GetBrushResource("DividerStrokeColorDefaultBrush"),
+                    Style = WinUiUiHost.GetStyleResource("YuWangDividerStyle"),
                     HorizontalAlignment = HorizontalAlignment.Center,
                 },
             },
@@ -635,7 +636,7 @@ internal sealed partial class MainWindow : Window
             MinHeight = FooterMinHeight,
             Padding = new Thickness(SidebarInset, 0, 0, 0),
             BorderThickness = new Thickness(0, 1, 0, 0),
-            BorderBrush = WinUiUiHost.GetBrushResource("DividerStrokeColorDefaultBrush"),
+            Style = WinUiUiHost.GetStyleResource("YuWangDividedGridStyle"),
         };
         footer.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
         footer.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
@@ -646,13 +647,13 @@ internal sealed partial class MainWindow : Window
             Width = 32,
             Height = 32,
             CornerRadius = new CornerRadius(16),
-            Background = WinUiUiHost.GetBrushResource("AccentFillColorDefaultBrush"),
+            Style = WinUiUiHost.GetStyleResource("YuWangAccountAvatarStyle"),
             VerticalAlignment = VerticalAlignment.Center,
             Child = new FontIcon
             {
                 Glyph = "\uE77B",
                 FontSize = 14,
-                Foreground = WinUiUiHost.GetBrushResource("TextOnAccentFillColorPrimaryBrush"),
+                Style = WinUiUiHost.GetStyleResource("YuWangOnAccentIconStyle"),
             },
         };
         footer.Children.Add(avatar);
@@ -767,7 +768,7 @@ internal sealed partial class MainWindow : Window
         Grid.SetRowSpan(_fileScroller, 2);
         grid.Children.Add(_fileScroller);
 
-        _emptyGlyph.Foreground = WinUiUiHost.GetBrushResource("TextFillColorTertiaryBrush");
+        _emptyGlyph.Style = WinUiUiHost.GetStyleResource("YuWangMutedIconStyle");
         _emptyTitle.Style = WinUiUiHost.GetStyleResource("BodyStrongTextBlockStyle");
         _emptyDetail.Style = WinUiUiHost.GetStyleResource("YuWangCaptionTextBlockStyle");
         _emptyState.Children.Add(_emptyGlyph);
@@ -776,10 +777,8 @@ internal sealed partial class MainWindow : Window
         Grid.SetRow(_emptyState, 4);
         grid.Children.Add(_emptyState);
 
-        _dropOverlay.BorderBrush = WinUiUiHost.GetBrushResource("AccentFillColorDefaultBrush");
-        _dropOverlay.Background = WinUiUiHost.GetBrushResource("SubtleFillColorSecondaryBrush");
-        _dropText.Style = WinUiUiHost.GetStyleResource("BodyStrongTextBlockStyle");
-        _dropText.Foreground = WinUiUiHost.GetBrushResource("AccentTextFillColorPrimaryBrush");
+        _dropOverlay.Style = WinUiUiHost.GetStyleResource("YuWangDropTargetStyle");
+        _dropText.Style = WinUiUiHost.GetStyleResource("YuWangDropLabelStyle");
         _dropOverlay.Child = new StackPanel
         {
             Spacing = 8,
@@ -791,7 +790,7 @@ internal sealed partial class MainWindow : Window
                 {
                     Glyph = "\uE898",
                     FontSize = 36,
-                    Foreground = WinUiUiHost.GetBrushResource("AccentTextFillColorPrimaryBrush"),
+                    Style = WinUiUiHost.GetStyleResource("YuWangAccentIconStyle"),
                 },
                 _dropText,
             },
@@ -805,8 +804,8 @@ internal sealed partial class MainWindow : Window
 
         return new Border
         {
-            Background = WinUiUiHost.GetBrushResource("LayerFillColorDefaultBrush"),
-            BorderBrush = WinUiUiHost.GetBrushResource("CardStrokeColorDefaultBrush"),
+            Name = "CloudFilePane",
+            Style = WinUiUiHost.GetStyleResource("YuWangFilePaneStyle"),
             BorderThickness = new Thickness(1, 1, 0, 0),
             CornerRadius = new CornerRadius(8, 0, 0, 0),
             Child = grid,
@@ -844,8 +843,7 @@ internal sealed partial class MainWindow : Window
             Name = "CloudAddressBox",
             MinHeight = ToolbarControlHeight,
             Padding = new Thickness(4, 0, 4, 0),
-            Background = WinUiUiHost.GetBrushResource("ControlFillColorDefaultBrush"),
-            BorderBrush = WinUiUiHost.GetBrushResource("ControlStrokeColorDefaultBrush"),
+            Style = WinUiUiHost.GetStyleResource("YuWangAddressBoxStyle"),
             BorderThickness = new Thickness(1),
             CornerRadius = new CornerRadius(4),
             VerticalAlignment = VerticalAlignment.Center,
@@ -878,7 +876,7 @@ internal sealed partial class MainWindow : Window
             Name = "CloudCommandBarHost",
             Padding = new Thickness(SurfaceInset, 0, SurfaceInset, ToolbarBottomPadding),
             BorderThickness = new Thickness(0, 0, 0, 1),
-            BorderBrush = WinUiUiHost.GetBrushResource("DividerStrokeColorDefaultBrush"),
+            Style = WinUiUiHost.GetStyleResource("YuWangDividedGridStyle"),
             Margin = new Thickness(0, 0, 0, 8),
         };
         host.Children.Add(_commandBar);
@@ -978,7 +976,7 @@ internal sealed partial class MainWindow : Window
                 new Border
                 {
                     Width = 1, Margin = new Thickness(0, 6, 0, 6),
-                    Background = WinUiUiHost.GetBrushResource("DividerStrokeColorDefaultBrush"),
+                    Style = WinUiUiHost.GetStyleResource("YuWangDividerStyle"),
                 },
             },
         };
@@ -1076,7 +1074,7 @@ internal sealed partial class MainWindow : Window
             MinHeight = FooterMinHeight,
             Padding = new Thickness(SurfaceInset, 0, SurfaceInset, 0),
             BorderThickness = new Thickness(0, 1, 0, 0),
-            BorderBrush = WinUiUiHost.GetBrushResource("DividerStrokeColorDefaultBrush"),
+            Style = WinUiUiHost.GetStyleResource("YuWangDividedGridStyle"),
         };
         // summary | status | progress | cancel | permission
         bar.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
@@ -1513,7 +1511,7 @@ internal sealed partial class MainWindow : Window
             FontSize = 14,
             Margin = new Thickness(6, 0, 2, 0),
             VerticalAlignment = VerticalAlignment.Center,
-            Foreground = WinUiUiHost.GetBrushResource("TextFillColorSecondaryBrush"),
+            Style = WinUiUiHost.GetStyleResource("YuWangSecondaryIconStyle"),
         });
 
         for (var index = 0; index < segments.Count; index++)
@@ -1528,7 +1526,7 @@ internal sealed partial class MainWindow : Window
                     FontSize = 9,
                     Margin = new Thickness(2, 1, 2, 0),
                     VerticalAlignment = VerticalAlignment.Center,
-                    Foreground = WinUiUiHost.GetBrushResource("TextFillColorTertiaryBrush"),
+                    Style = WinUiUiHost.GetStyleResource("YuWangMutedIconStyle"),
                 });
             }
 
@@ -1543,7 +1541,7 @@ internal sealed partial class MainWindow : Window
             if (isLast || node is null)
             {
                 label.Margin = new Thickness(6, 0, 6, 0);
-                if (!isLast) label.Foreground = WinUiUiHost.GetBrushResource("TextFillColorSecondaryBrush");
+                if (!isLast) label.Style = WinUiUiHost.GetStyleResource("YuWangSecondaryTextStyle");
                 ToolTipService.SetToolTip(label, name);
                 _breadcrumbItems.Children.Add(label);
                 continue;
@@ -2065,8 +2063,7 @@ internal sealed partial class MainWindow : Window
         };
         Grid.SetColumn((FrameworkElement)namePanel.Children[1], 1);
         row.Children.Add(namePanel);
-        AddRowCell(row, 3, _folderNodes.ContainsKey(node) ? "云端磁盘" : "磁盘分组",
-            WinUiUiHost.GetBrushResource("TextFillColorSecondaryBrush"), TextAlignment.Left);
+        AddRowCell(row, 3, _folderNodes.ContainsKey(node) ? "云端磁盘" : "磁盘分组", TextAlignment.Left);
         var container = new ListViewItem
         {
             Content = row, Tag = node, MinHeight = 36,
@@ -2087,7 +2084,6 @@ internal sealed partial class MainWindow : Window
 
     private ListViewItem CreateItemRow(YuWangItem item)
     {
-        var secondary = WinUiUiHost.GetBrushResource("TextFillColorSecondaryBrush");
         var iconMetrics = _systemFileIconMetrics;
         var row = new Grid { UseLayoutRounding = true };
         AddFileColumns(row);
@@ -2129,13 +2125,13 @@ internal sealed partial class MainWindow : Window
         row.Children.Add(namePanel);
 
         AddAvailabilityCell(row, item);
-        AddRowCell(row, 2, item.UploadTime?.ToLocalTime().ToString("yyyy-MM-dd HH:mm") ?? "", secondary, TextAlignment.Left);
-        var typeCell = AddRowCell(row, 3, GetTypeLabel(item), secondary, TextAlignment.Left);
+        AddRowCell(row, 2, item.UploadTime?.ToLocalTime().ToString("yyyy-MM-dd HH:mm") ?? "", TextAlignment.Left);
+        var typeCell = AddRowCell(row, 3, GetTypeLabel(item), TextAlignment.Left);
         _ = LoadSystemIconIntoAsync(iconHost,
             item.IsFolder ? GetSystemFolderIconAsync(iconMetrics.PixelSize)
                 : GetSystemFileIconAsync(item.Name, iconMetrics.PixelSize),
             iconMetrics.SizeDip, item, typeCell, _fileRenderVersion);
-        AddRowCell(row, 4, item.IsFolder ? "" : FormatSize(item.Size), secondary, TextAlignment.Right);
+        AddRowCell(row, 4, item.IsFolder ? "" : FormatSize(item.Size), TextAlignment.Right);
 
         var listItem = new ListViewItem
         {
@@ -2150,12 +2146,12 @@ internal sealed partial class MainWindow : Window
         return listItem;
     }
 
-    private static TextBlock AddRowCell(Grid row, int column, string text, Brush? foreground, TextAlignment alignment)
+    private static TextBlock AddRowCell(Grid row, int column, string text, TextAlignment alignment)
     {
         var cell = new TextBlock
         {
             Text = text,
-            Foreground = foreground,
+            Style = WinUiUiHost.GetStyleResource("YuWangSecondaryTextStyle"),
             HorizontalAlignment = alignment == TextAlignment.Right ? HorizontalAlignment.Right : HorizontalAlignment.Stretch,
             TextAlignment = alignment,
             TextTrimming = TextTrimming.CharacterEllipsis,
@@ -2486,22 +2482,22 @@ internal sealed partial class MainWindow : Window
         }
 
         _permissionBadge.Visibility = Visibility.Visible;
-        var (glyph, text, background, foreground, tooltip) = folder.Permission switch
+        var (glyph, text, badgeStyle, iconStyle, tooltip) = folder.Permission switch
         {
             DirectoryPermission.FullAccess => ("\uE70F", "可写",
-                "SystemFillColorSuccessBackgroundBrush", "SystemFillColorSuccessBrush",
+                "YuWangWritableBadgeStyle", "YuWangSuccessIconStyle",
                 "可上传、新建、重命名、移动和删除。"),
             DirectoryPermission.ReadOnly => ("\uE72E", "只读",
-                "SystemFillColorCautionBackgroundBrush", "SystemFillColorCautionBrush",
+                "YuWangReadOnlyBadgeStyle", "YuWangReadOnlyIconStyle",
                 "此文件夹为只读，仅可浏览和下载。"),
             _ => ("\uE9CE", "权限未确认",
-                "SubtleFillColorSecondaryBrush", "TextFillColorSecondaryBrush",
+                "YuWangUnconfirmedBadgeStyle", "YuWangSecondaryIconStyle",
                 "无法确认权限，暂不能修改。"),
         };
         _permissionGlyph.Glyph = glyph;
-        _permissionGlyph.Foreground = WinUiUiHost.GetBrushResource(foreground);
+        _permissionGlyph.Style = WinUiUiHost.GetStyleResource(iconStyle);
         _permissionText.Text = text;
-        _permissionBadge.Background = WinUiUiHost.GetBrushResource(background);
+        _permissionBadge.Style = WinUiUiHost.GetStyleResource(badgeStyle);
         ToolTipService.SetToolTip(_permissionBadge, tooltip);
     }
 
@@ -2806,7 +2802,17 @@ internal sealed partial class MainWindow : Window
 
     private void OnDragOver(object sender, DragEventArgs args)
     {
-        var canDrop = !_outboundDragActive && CanWrite && !args.DataView.Properties.ContainsKey(BrowserDragSource)
+        if (_outboundDragActive)
+        {
+            args.AcceptedOperation = DataPackageOperation.None;
+            args.DragUIOverride.IsContentVisible = false;
+            args.DragUIOverride.IsCaptionVisible = false;
+            args.DragUIOverride.IsGlyphVisible = false;
+            args.Handled = true;
+            _dropOverlay.Visibility = Visibility.Collapsed;
+            return;
+        }
+        var canDrop = CanWrite && !args.DataView.Properties.ContainsKey(BrowserDragSource)
             && args.DataView.Contains(StandardDataFormats.StorageItems);
         args.AcceptedOperation = canDrop ? DataPackageOperation.Copy : DataPackageOperation.None;
         if (!canDrop)
@@ -3397,9 +3403,8 @@ internal sealed partial class MainWindow : Window
             PrimaryButtonText = primary,
             CloseButtonText = "取消",
             DefaultButton = ContentDialogButton.Primary,
-            XamlRoot = _root.XamlRoot,
-            RequestedTheme = _root.ActualTheme,
         };
+        WinUiUiHost.AttachDialogToRoot(dialog, _root);
         dialog.Style = WinUiUiHost.GetStyleResource("DefaultContentDialogStyle");
         return await dialog.ShowAsync();
     }
@@ -3413,9 +3418,8 @@ internal sealed partial class MainWindow : Window
             PrimaryButtonText = primary,
             CloseButtonText = "取消",
             DefaultButton = ContentDialogButton.Close,
-            XamlRoot = _root.XamlRoot,
-            RequestedTheme = _root.ActualTheme,
         };
+        WinUiUiHost.AttachDialogToRoot(dialog, _root);
         dialog.Style = WinUiUiHost.GetStyleResource("DefaultContentDialogStyle");
         return await dialog.ShowAsync();
     }

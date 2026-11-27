@@ -75,6 +75,18 @@ internal static class WinUiUiHost
     internal static DataTemplate? GetDataTemplateResource(string key)
         => GetResource<DataTemplate>(key);
 
+    internal static void AttachDialogToRoot(ContentDialog dialog, FrameworkElement owner)
+    {
+        dialog.XamlRoot = owner.XamlRoot;
+        // A popup is a separate branch of the visual tree. Bind the request (Default
+        // follows Windows), not an ActualTheme snapshot taken when the dialog opens.
+        dialog.SetBinding(FrameworkElement.RequestedThemeProperty, new Microsoft.UI.Xaml.Data.Binding
+        {
+            Source = owner,
+            Path = new PropertyPath(nameof(FrameworkElement.RequestedTheme)),
+        });
+    }
+
     private static T? GetResource<T>(string key) where T : class
     {
         try
@@ -536,20 +548,34 @@ internal static class WinUiUiHost
                 $"DialogShown={dialogShown}; selection is empty after the probe cancels it: {string.IsNullOrEmpty(pickedFolder)}.");
         }
         checks.AddRange(await CheckSystemControlStylesAsync(settings.Root));
+        var dialogText = new TextBlock { Text = "主题自测", Style = GetStyleResource("YuWangSecondaryTextStyle") };
+        var themeDialog = new ContentDialog { Content = dialogText, CloseButtonText = "确定" };
+        AttachDialogToRoot(themeDialog, settings.Root);
+        var opened = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        themeDialog.Opened += (_, _) => opened.TrySetResult();
+        var dialogOperation = themeDialog.ShowAsync();
+        try
+        {
+            await opened.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            checks.AddRange(await CheckLiveThemeAsync(settings.Root,
+                ("Open settings dialog follows owner theme without reopening", () => BrushColor(dialogText.Foreground))));
+        }
+        finally { themeDialog.Hide(); }
+        await dialogOperation;
         ShowWindow(settingsHandle, 6); // SW_MINIMIZE
         await Task.Delay(120);
-        Check("Title bar skips minimized window", !WinUiWindowChrome.CanUpdateTitleBar(settings),
+        Check("Title bar skips minimized window", !WinUiWindowChrome.CanUpdateTitleBarInsets(settings),
             "Native title bar and inset refreshes are gated while the window is minimized.");
         ActivateWindow(settings);
         await Task.Delay(120);
-        Check("Title bar resumes after restore", WinUiWindowChrome.CanUpdateTitleBar(settings),
+        Check("Title bar resumes after restore", WinUiWindowChrome.CanUpdateTitleBarInsets(settings),
             "Title bar refresh resumes after the window returns to the foreground.");
         var backgroundProbe = new CaptchaWindow(captchaPath);
         backgroundProbe.Activate();
         await backgroundProbe.LoadedTask.WaitAsync(TimeSpan.FromSeconds(10));
-        Check("Title bar skips background window", !WinUiWindowChrome.CanUpdateTitleBar(settings)
-            && WinUiWindowChrome.CanUpdateTitleBar(backgroundProbe),
-            "Only the foreground WinUI window is eligible for title bar refresh.");
+        Check("Title bar skips background window", !WinUiWindowChrome.CanUpdateTitleBarInsets(settings)
+            && WinUiWindowChrome.CanUpdateTitleBarInsets(backgroundProbe),
+            "Inset reads are allowed only for the foreground WinUI window.");
         backgroundProbe.CancelForSelfTest();
         await Task.Delay(100);
         ActivateWindow(settings);
@@ -578,6 +604,14 @@ internal static class WinUiUiHost
             "The Win32 PopupMenu about item opens the WinUI about window.");
         Check("About downloaded update action", about?.ValidateDownloadedUpdateForSelfTest() == true,
             "A downloaded update displays the enabled restart update action without launching an installer.");
+        if (about?.Content is FrameworkElement aboutRoot &&
+            aboutRoot.FindName("RepositoryLink") is HyperlinkButton { Content: TextBlock linkText } link)
+        {
+            checks.AddRange(await CheckLiveThemeAsync(aboutRoot,
+                ("About repository link follows theme", () => BrushColor(link.Foreground)),
+                ("About repository link text follows theme", () => BrushColor(linkText.Foreground))));
+        }
+        else Check("About repository link follows theme", false, "Repository link was not realized.");
         try { about?.Close(); } catch { }
         await Task.Delay(100);
 
@@ -674,6 +708,32 @@ internal static class WinUiUiHost
         TrayHost.Shutdown();
         await Task.Run(() => TrayHost.Join(TimeSpan.FromSeconds(3)));
         return checks;
+    }
+
+    internal static Windows.UI.Color? BrushColor(Brush? brush)
+        => brush is SolidColorBrush solid ? solid.Color : null;
+
+    internal static async Task<IReadOnlyList<UiSelfTestCheck>> CheckLiveThemeAsync(FrameworkElement root,
+        params (string Name, Func<Windows.UI.Color?> ReadColor)[] probes)
+    {
+        var previous = root.RequestedTheme;
+        var values = new List<Windows.UI.Color?[]>();
+        try
+        {
+            foreach (var theme in new[] { ElementTheme.Light, ElementTheme.Dark, ElementTheme.Light })
+            {
+                root.RequestedTheme = theme;
+                root.UpdateLayout();
+                await Task.Delay(120);
+                values.Add(probes.Select(probe => probe.ReadColor()).ToArray());
+            }
+        }
+        finally { root.RequestedTheme = previous; }
+        return probes.Select((probe, i) => new UiSelfTestCheck(probe.Name,
+            values[0][i] is not null && values[1][i] is not null
+                && values[0][i] != values[1][i] && values[0][i] == values[2][i],
+            $"Same visual, Light → Dark → Light: {values[0][i]} → {values[1][i]} → {values[2][i]}."))
+            .ToArray();
     }
 
     private static async Task<IReadOnlyList<UiSelfTestCheck>> CheckSystemControlStylesAsync(Grid root)
